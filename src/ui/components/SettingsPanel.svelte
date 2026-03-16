@@ -43,6 +43,8 @@
   let selectedActorFolders = $state<string[]>([]);
   let selectedSceneFolders = $state<string[]>([]);
   let selectedMacroFolders = $state<string[]>([]);
+  let contextSummarizeThreshold = $state(75);
+  let summarizeKeepMessages = $state(10);
 
   let chatModels = $state<ModelInfo[]>([]);
   let embeddingModels = $state<ModelInfo[]>([]);
@@ -96,6 +98,8 @@
       selectedActorFolders = getSetting('actorFolders') || [];
       selectedSceneFolders = getSetting('sceneFolders') || [];
       selectedMacroFolders = getSetting('macroFolders') || [];
+      contextSummarizeThreshold = getSetting('contextSummarizeThreshold') ?? 75;
+      summarizeKeepMessages = getSetting('summarizeKeepMessages') ?? 10;
     } catch { /* settings not registered yet */ }
 
     // Load available folders
@@ -195,6 +199,8 @@
       await setSetting('actorFolders', selectedActorFolders);
       await setSetting('sceneFolders', selectedSceneFolders);
       await setSetting('macroFolders', selectedMacroFolders);
+      await setSetting('contextSummarizeThreshold', contextSummarizeThreshold);
+      await setSetting('summarizeKeepMessages', summarizeKeepMessages);
 
       // Reconfigure the service with all model settings
       openRouterService.configure({ apiKey, defaultModel: chatModel, embeddingModel, imageModel, ttsModel });
@@ -583,6 +589,37 @@
           rows="6"
           placeholder="Custom system prompt (optional)..."
         ></textarea>
+      </div>
+    </section>
+
+    <!-- Context Management -->
+    <section class="settings-section">
+      <h2><i class="fas fa-compress-arrows-alt"></i> Context Management</h2>
+      <p class="section-hint">Control how conversation context is managed to prevent quality degradation in long chats.</p>
+
+      <div class="field">
+        <label for="ctx-threshold">Auto-summarize prompt threshold: {contextSummarizeThreshold}%</label>
+        <input
+          id="ctx-threshold"
+          type="range"
+          min="0"
+          max="95"
+          step="5"
+          bind:value={contextSummarizeThreshold}
+        />
+        <span class="field-hint">{contextSummarizeThreshold === 0 ? 'Disabled — never auto-prompt' : `Prompt to summarize when context exceeds ${contextSummarizeThreshold}%`}</span>
+      </div>
+
+      <div class="field">
+        <label for="ctx-keep">Messages to keep when summarizing</label>
+        <input
+          id="ctx-keep"
+          type="number"
+          min="4"
+          max="30"
+          bind:value={summarizeKeepMessages}
+        />
+        <span class="field-hint">Recent messages preserved during summarization (older messages are replaced with a summary)</span>
       </div>
     </section>
   </div>

@@ -169,6 +169,51 @@ nav.tabs [data-tab='foundry-ai'] {
 	}
 }
 
+// ---- Context Summarize Banner ----
+.foundry-ai {
+	.summarize-banner {
+		background: rgba(251, 191, 36, 0.15);
+		border-color: rgba(251, 191, 36, 0.25);
+		color: #fcd34d;
+		gap: 6px;
+		flex-wrap: wrap;
+	}
+
+	.banner-btn {
+		background: rgba(251, 191, 36, 0.25);
+		border: 1px solid rgba(251, 191, 36, 0.4);
+		color: #fde68a;
+		padding: 2px 10px;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 0.85em;
+		font-family: 'Signika', sans-serif;
+		transition: all 0.15s;
+
+		&:hover {
+			background: rgba(251, 191, 36, 0.4);
+			color: #fff;
+		}
+
+		&.dismiss {
+			background: transparent;
+			border-color: rgba(255, 255, 255, 0.15);
+			color: rgba(255, 255, 255, 0.5);
+
+			&:hover {
+				background: rgba(255, 255, 255, 0.08);
+				color: rgba(255, 255, 255, 0.8);
+			}
+		}
+	}
+
+	// Context indicator colors (CSS vars for the SVG component)
+	--ctx-green: #4ade80;
+	--ctx-yellow: #fbbf24;
+	--ctx-orange: #fb923c;
+	--ctx-red: #f87171;
+}
+
 .foundry-ai .message-bubble {
 	animation: foundry-ai-fade-in 0.2s ease-out;
 }

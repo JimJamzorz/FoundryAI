@@ -44,6 +44,8 @@ export interface FoundryAISettings {
 	enableImageTools: boolean
 	enableTTS: boolean
 	ttsVoice: string
+	contextSummarizeThreshold: number
+	summarizeKeepMessages: number
 }
 
 export function registerSettings(): void {
@@ -390,6 +392,28 @@ export function registerSettings(): void {
 		config: false,
 		type: String,
 		default: 'nova',
+	})
+
+	// ---- Context Management ----
+
+	game.settings.register(MODULE_ID, 'contextSummarizeThreshold', {
+		name: 'Context Summarize Threshold',
+		hint: 'When context usage exceeds this percentage, prompt to summarize older messages (0 = never auto-prompt)',
+		scope: 'world',
+		config: false,
+		type: Number,
+		default: 75,
+		range: { min: 0, max: 95, step: 5 },
+	})
+
+	game.settings.register(MODULE_ID, 'summarizeKeepMessages', {
+		name: 'Messages to Keep When Summarizing',
+		hint: 'Number of recent messages to preserve when summarizing older context',
+		scope: 'world',
+		config: false,
+		type: Number,
+		default: 10,
+		range: { min: 4, max: 30, step: 1 },
 	})
 
 	// ---- Settings Menu ----

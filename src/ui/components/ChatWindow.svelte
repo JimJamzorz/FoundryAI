@@ -1,15 +1,18 @@
 <script lang="ts">
   import MessageBubble from './MessageBubble.svelte';
   import SessionList from './SessionList.svelte';
-  import { openRouterService, type LLMMessage, type StreamCallback } from '@core/openrouter-service';
+  import { openRouterService, type LLMMessage, type StreamCallback, type ModelInfo } from '@core/openrouter-service';
   import { chatSessionManager } from '@core/chat-session-manager';
   import { sessionRecapManager, type RecapProgress } from '@core/session-recap-manager';
   import { embeddingService } from '@core/embedding-service';
   import { getEnabledTools, executeTool } from '@core/tool-system';
   import { buildSystemPrompt, buildActorRoleplayPrompt, type ActorRoleplayContext } from '@core/system-prompt';
+  import { estimateTokens, getModelContextLimit } from '@core/token-estimator';
+  import { summarizeConversation } from '@core/context-summarizer';
   import { getSetting } from '../../settings';
   import { openSettingsDialog } from '../svelte-application';
   import SettingsPanel from './SettingsPanel.svelte';
+  import ContextIndicator from './ContextIndicator.svelte';
 
   interface Props {
     isSidebar?: boolean;
@@ -39,6 +42,13 @@
   let currentActorId = $state<string | null>(null);
   let currentActorName = $state<string | null>(null);
   let showActorPicker = $state(false);
+
+  // Context tracking state
+  let lastPromptTokens = $state<number | null>(null);
+  let modelContextLength = $state<number>(200_000);
+  let isSummarizing = $state(false);
+  let showSummarizeBanner = $state(false);
+  let summarizeBannerDismissed = $state(false);
 
   // ---- Derived ----
 
@@ -101,6 +111,27 @@
     }
   });
 
+  // Context usage: use actual API-reported tokens when available, else estimate
+  const contextUsed = $derived.by(() => {
+    if (lastPromptTokens !== null) return lastPromptTokens;
+    return estimateTokens(messages);
+  });
+
+  const contextIsEstimate = $derived(lastPromptTokens === null);
+
+  // Auto-prompt for summarization when threshold is exceeded
+  $effect(() => {
+    if (summarizeBannerDismissed || isSummarizing || isGenerating) return;
+    try {
+      const threshold = getSetting('contextSummarizeThreshold');
+      if (threshold <= 0 || modelContextLength <= 0) return;
+      const pct = (contextUsed / modelContextLength) * 100;
+      if (pct >= threshold && messages.length > 10) {
+        showSummarizeBanner = true;
+      }
+    } catch { /* settings not ready */ }
+  });
+
   // ---- Lifecycle ----
   $effect(() => {
     // Reference reactive state so this effect re-runs when they change
@@ -116,6 +147,24 @@
     }
   });
 
+  // Fetch model context length on mount and when model changes
+  $effect(() => {
+    try {
+      const model = getSetting('chatModel');
+      // Try fallback map first (instant)
+      const fallback = getModelContextLimit(model);
+      if (fallback) modelContextLength = fallback;
+
+      // Then try fetching from API for exact value
+      openRouterService.listChatModels().then((models: ModelInfo[]) => {
+        const match = models.find((m: ModelInfo) => m.id === model);
+        if (match?.context_length) {
+          modelContextLength = match.context_length;
+        }
+      }).catch(() => { /* use fallback */ });
+    } catch { /* settings not ready */ }
+  });
+
   // ---- Session Management ----
   let editingIndex = $state<number | null>(null);
   let editText = $state('');
@@ -128,6 +177,9 @@
     currentActorName = null;
     messages = [];
     streamingContent = '';
+    lastPromptTokens = null;
+    showSummarizeBanner = false;
+    summarizeBannerDismissed = false;
     viewMode = 'chat';
     inputEl?.focus();
   }
@@ -250,6 +302,9 @@ IMPORTANT: You already have all the information you need about this character fr
     currentActorName = session.actorName || null;
     messages = session.messages;
     streamingContent = '';
+    lastPromptTokens = null;
+    showSummarizeBanner = false;
+    summarizeBannerDismissed = false;
     viewMode = 'chat';
   }
 
@@ -431,6 +486,7 @@ IMPORTANT: You already have all the information you need about this character fr
     signal?: AbortSignal,
   ) {
     let fullContent = '';
+    let streamUsage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | undefined;
 
     // Accumulated tool calls — streaming sends deltas by index
     const accumulatedToolCalls: Map<number, { id: string; type: 'function'; function: { name: string; arguments: string } }> = new Map();
@@ -442,6 +498,9 @@ IMPORTANT: You already have all the information you need about this character fr
       if (chunk.content) {
         fullContent += chunk.content;
         streamingContent = fullContent;
+      }
+      if (chunk.usage) {
+        streamUsage = chunk.usage;
       }
       if (chunk.toolCalls) {
         // Accumulate tool call deltas by index
@@ -508,6 +567,11 @@ IMPORTANT: You already have all the information you need about this character fr
       const msg: LLMMessage = { role: 'assistant', content: fullContent };
       messages = [...messages, msg];
     }
+
+    // Update token tracking from streaming usage
+    if (streamUsage) {
+      lastPromptTokens = streamUsage.prompt_tokens;
+    }
   }
 
   async function handleNonStreamingResponse(
@@ -543,6 +607,11 @@ IMPORTANT: You already have all the information you need about this character fr
     } else {
       const msg: LLMMessage = { role: 'assistant', content: assistantMessage?.content || '' };
       messages = [...messages, msg];
+    }
+
+    // Update token tracking from response usage
+    if (response.usage) {
+      lastPromptTokens = response.usage.prompt_tokens;
     }
   }
 
@@ -785,6 +854,41 @@ IMPORTANT: You already have all the information you need about this character fr
     }
   }
 
+  // ---- Context Summarization ----
+  async function handleSummarize() {
+    if (isSummarizing || messages.length <= 10) return;
+
+    isSummarizing = true;
+    showSummarizeBanner = false;
+
+    try {
+      const model = getSetting('chatModel');
+      const keepCount = getSetting('summarizeKeepMessages');
+
+      const result = await summarizeConversation(messages, model, keepCount);
+      if (!result) {
+        ui.notifications.warn('Not enough messages to summarize.');
+        return;
+      }
+
+      messages = result.messages;
+      lastPromptTokens = null; // Reset to re-estimate since context changed
+      summarizeBannerDismissed = false;
+
+      // Save updated conversation
+      if (currentSessionId) {
+        await chatSessionManager.saveFullConversation(currentSessionId, messages, model);
+      }
+
+      ui.notifications.info(`Context summarized — saved ~${result.tokensSaved.toLocaleString()} tokens.`);
+    } catch (error: any) {
+      console.error('FoundryAI | Summarization failed:', error);
+      ui.notifications.error(`Summarization failed: ${error.message}`);
+    } finally {
+      isSummarizing = false;
+    }
+  }
+
   // ---- Input Handling ----
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -854,6 +958,15 @@ IMPORTANT: You already have all the information you need about this character fr
     </span>
 
     <div class="toolbar-right">
+      <ContextIndicator used={contextUsed} total={modelContextLength} isEstimate={contextIsEstimate} />
+      <button
+        class="toolbar-btn"
+        onclick={handleSummarize}
+        disabled={isSummarizing || messages.length <= 10}
+        title="Summarize older messages to free context"
+      >
+        <i class="fas fa-compress-arrows-alt"></i>
+      </button>
       <button
         class="toolbar-btn"
         class:active={showActorPicker}
@@ -897,6 +1010,24 @@ IMPORTANT: You already have all the information you need about this character fr
     <div class="progress-banner index-banner">
       <i class="fas fa-database"></i>
       {indexProgress}
+    </div>
+  {/if}
+
+  <!-- Summarize Banner (auto-prompt at threshold) -->
+  {#if showSummarizeBanner && !isSummarizing}
+    <div class="progress-banner summarize-banner">
+      <i class="fas fa-exclamation-triangle"></i>
+      <span>Context is {((contextUsed / modelContextLength) * 100).toFixed(0)}% full. Summarize older messages?</span>
+      <button class="banner-btn" onclick={handleSummarize}>Summarize</button>
+      <button class="banner-btn dismiss" onclick={() => { showSummarizeBanner = false; summarizeBannerDismissed = true; }}>Dismiss</button>
+    </div>
+  {/if}
+
+  <!-- Summarizing Progress Banner -->
+  {#if isSummarizing}
+    <div class="progress-banner summarize-banner">
+      <i class="fas fa-spinner fa-spin"></i>
+      Summarizing conversation...
     </div>
   {/if}
 
