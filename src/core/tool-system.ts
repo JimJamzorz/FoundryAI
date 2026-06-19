@@ -935,24 +935,24 @@ const SPATIAL_TOOLS: ToolDefinition[] = [
 	{
 		type: 'function',
 		function: {
-			name: 'create_measured_template',
-			description: 'Place a measured template on the canvas (for spell areas, etc.).',
+			name: 'create_scene_region',
+			description: 'Place a shaped scene region on the canvas (for spell areas, zones of effect, etc.).',
 			parameters: {
 				type: 'object',
 				properties: {
 					type: {
 						type: 'string',
 						enum: ['circle', 'cone', 'ray', 'rect'],
-						description: 'Template shape',
+						description: 'Region shape',
 					},
-					x: { type: 'number', description: 'X position' },
-					y: { type: 'number', description: 'Y position' },
+					x: { type: 'number', description: 'X position (canvas pixels)' },
+					y: { type: 'number', description: 'Y position (canvas pixels)' },
 					distance: { type: 'number', description: 'Size/distance in grid units (e.g. 20 for 20ft radius)' },
 					direction: {
 						type: 'number',
-						description: 'Direction in degrees (for cone/ray). 0=right, 90=down, 180=left, 270=up',
+						description: 'Direction in degrees for cone/ray. 0=right, 90=down, 180=left, 270=up',
 					},
-					width: { type: 'number', description: 'Width for ray templates (default: 5)' },
+					width: { type: 'number', description: 'Width in grid units for ray shapes (default: 5)' },
 					color: { type: 'string', description: 'Fill color hex (default: "#FF0000")' },
 				},
 				required: ['type', 'x', 'y', 'distance'],
@@ -1514,8 +1514,8 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return handleMeasureDistance(args)
 			case 'tokens_in_range':
 				return handleTokensInRange(args)
-			case 'create_measured_template':
-				return await handleCreateMeasuredTemplate(args)
+			case 'create_scene_region':
+				return await handleCreateSceneRegion(args)
 
 			// Actor tools
 			case 'create_actor':
@@ -2804,31 +2804,75 @@ function handleTokensInRange(args: Record<string, any>): string {
 	})
 }
 
-async function handleCreateMeasuredTemplate(args: Record<string, any>): Promise<string> {
-	console.log(`FoundryAI | create_measured_template: args=${JSON.stringify(args)}`)
+async function handleCreateSceneRegion(args: Record<string, any>): Promise<string> {
+	console.log(`FoundryAI | create_scene_region: args=${JSON.stringify(args)}`)
 	const scene = getActiveScene()
 	if (!scene) return JSON.stringify({ error: 'No active scene' })
 
-	const templateData: Record<string, any> = {
-		t: args.type,
-		x: args.x,
-		y: args.y,
-		distance: args.distance,
-		direction: args.direction ?? 0,
-		angle: args.type === 'cone' ? 53.13 : 360,
-		width: args.width ?? 5,
-		fillColor: args.color || '#FF0000',
+	const gridSize: number = scene.grid?.size || 100
+	const gridDistance: number = scene.grid?.distance || 5
+	const distancePx = (args.distance / gridDistance) * gridSize
+	const x: number = args.x
+	const y: number = args.y
+	const dirRad = ((args.direction ?? 0) * Math.PI) / 180
+
+	let shape: Record<string, any>
+
+	switch (args.type) {
+		case 'circle':
+			shape = { type: 'circle', x, y, radius: distancePx }
+			break
+		case 'rect':
+			shape = { type: 'rectangle', x: x - distancePx / 2, y: y - distancePx / 2, width: distancePx, height: distancePx, rotation: 0 }
+			break
+		case 'cone': {
+			// Standard D&D cone: 53.13° arc (26.565° half-angle)
+			const halfAngle = (53.13 / 2) * (Math.PI / 180)
+			shape = {
+				type: 'polygon',
+				points: [
+					x, y,
+					x + distancePx * Math.cos(dirRad - halfAngle), y + distancePx * Math.sin(dirRad - halfAngle),
+					x + distancePx * Math.cos(dirRad + halfAngle), y + distancePx * Math.sin(dirRad + halfAngle),
+				],
+			}
+			break
+		}
+		case 'ray': {
+			const widthPx = (((args.width ?? 5) / gridDistance) * gridSize) / 2
+			const perpRad = dirRad + Math.PI / 2
+			const ex = x + distancePx * Math.cos(dirRad)
+			const ey = y + distancePx * Math.sin(dirRad)
+			shape = {
+				type: 'polygon',
+				points: [
+					x  + widthPx * Math.cos(perpRad), y  + widthPx * Math.sin(perpRad),
+					ex + widthPx * Math.cos(perpRad), ey + widthPx * Math.sin(perpRad),
+					ex - widthPx * Math.cos(perpRad), ey - widthPx * Math.sin(perpRad),
+					x  - widthPx * Math.cos(perpRad), y  - widthPx * Math.sin(perpRad),
+				],
+			}
+			break
+		}
+		default:
+			return JSON.stringify({ error: `Unknown shape type: ${args.type}` })
 	}
 
-	const created = await scene.createEmbeddedDocuments('MeasuredTemplate', [templateData])
+	const regionData = {
+		name: `${args.type.charAt(0).toUpperCase() + args.type.slice(1)} Area`,
+		color: args.color || '#FF0000',
+		shapes: [shape],
+	}
+
+	const created = await scene.createEmbeddedDocuments('Region', [regionData])
 
 	return JSON.stringify({
 		success: true,
-		template_id: created[0]?.id,
+		region_id: created[0]?.id,
 		type: args.type,
-		position: { x: args.x, y: args.y },
+		position: { x, y },
 		distance: args.distance,
-		message: `Created ${args.type} template (${args.distance}${scene.grid?.units || 'ft'}) at (${args.x}, ${args.y})`,
+		message: `Created ${args.type} region (${args.distance}${scene.grid?.units || 'ft'}) at (${x}, ${y})`,
 	})
 }
 

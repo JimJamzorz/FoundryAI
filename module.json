@@ -7,12 +7,16 @@
 		{
 			"name": "Derek Hearst",
 			"discord": "derekhearst"
+		},
+		{
+			"name": "James Weygandt",
+			"discord": "jimjamzorz"
 		}
 	],
 	"compatibility": {
 		"minimum": "13",
 		"verified": "13",
-		"maximum": "13"
+		"maximum": "14"
 	},
 	"esmodules": [
 		"module.js"
