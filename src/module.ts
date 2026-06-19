@@ -39,17 +39,8 @@ Hooks.once('ready', async () => {
 		return
 	}
 
-	// Configure OpenRouter service
-	const apiKey = getSetting('apiKey')
-	if (apiKey) {
-		openRouterService.configure({
-			apiKey,
-			defaultModel: getSetting('chatModel'),
-			embeddingModel: getSetting('embeddingModel'),
-			imageModel: getSetting('imageModel'),
-			ttsModel: getSetting('ttsModel'),
-		})
-	}
+	// Configure OpenRouter service from saved providers
+	configureServiceFromSettings()
 
 	// Initialize embedding service
 	try {
@@ -61,7 +52,7 @@ Hooks.once('ready', async () => {
 	}
 
 	// Auto-index if configured
-	if (apiKey && getSetting('autoIndex')) {
+	if (openRouterService.isConfigured && getSetting('autoIndex')) {
 		const journalFolders = getSetting('journalFolders') || []
 		const actorFolders = getSetting('actorFolders') || []
 
@@ -89,17 +80,7 @@ Hooks.once('ready', async () => {
 
 	// Listen for settings changes
 	Hooks.on(`${MODULE_ID}.settingsChanged`, (key: string) => {
-		if (key === 'apiKey') {
-			const newKey = getSetting('apiKey')
-			if (newKey)
-				openRouterService.configure({
-					apiKey: newKey,
-					defaultModel: getSetting('chatModel'),
-					embeddingModel: getSetting('embeddingModel'),
-					imageModel: getSetting('imageModel'),
-					ttsModel: getSetting('ttsModel'),
-				})
-		}
+		if (key === 'apiProviders' || key === 'chatProvider') configureServiceFromSettings()
 	})
 
 	// Ensure standard journal folders exist
@@ -111,6 +92,26 @@ Hooks.once('ready', async () => {
 	// Notification
 	ui.notifications.info('FoundryAI is ready! Use the hotbar macro or scene controls brain icon to chat.')
 })
+
+// ---- Service Configuration ----
+
+function configureServiceFromSettings() {
+	const providers = (getSetting('apiProviders') || []) as import('./settings').ApiProvider[]
+	const find = (id: string) => providers.find(p => p.id === id)
+	const toConfig = (p: import('./settings').ApiProvider | undefined) =>
+		p ? { baseUrl: p.baseUrl, apiKey: p.apiKey } : { baseUrl: '', apiKey: '' }
+
+	openRouterService.configure({
+		chat: toConfig(find(getSetting('chatProvider'))),
+		embedding: toConfig(find(getSetting('embeddingProvider'))),
+		image: toConfig(find(getSetting('imageProvider'))),
+		tts: toConfig(find(getSetting('ttsProvider'))),
+		defaultModel: getSetting('chatModel'),
+		embeddingModel: getSetting('embeddingModel'),
+		imageModel: getSetting('imageModel'),
+		ttsModel: getSetting('ttsModel'),
+	})
+}
 
 // ---- Macro Creation ----
 
@@ -201,8 +202,7 @@ function registerSceneControlButton() {
 // ---- Public API Implementation ----
 
 async function publicChat(message: string): Promise<string> {
-	const apiKey = getSetting('apiKey')
-	if (!apiKey) throw new Error('OpenRouter API key not configured.')
+	if (!openRouterService.isConfigured) throw new Error('No API provider configured.')
 
 	const response = await openRouterService.chatCompletion({
 		model: getSetting('chatModel'),

@@ -2,7 +2,7 @@
   import { openRouterService, type ModelInfo } from '@core/openrouter-service';
   import { embeddingService } from '@core/embedding-service';
   import { collectionReader } from '@core/collection-reader';
-  import { getSetting, setSetting } from '../../settings';
+  import { getSetting, setSetting, type ApiProvider } from '../../settings';
 
   interface Props {
     application?: any;
@@ -11,7 +11,14 @@
   let { application }: Props = $props();
 
   // ---- State ----
-  let apiKey = $state('');
+  let providers = $state<ApiProvider[]>([]);
+  let chatProvider = $state('');
+  let embeddingProvider = $state('');
+  let imageProvider = $state('');
+  let ttsProvider = $state('');
+  let providerTesting = $state<Record<string, boolean>>({});
+  let providerTestResults = $state<Record<string, {success: boolean; message: string} | null>>({});
+
   let chatModel = $state('');
   let embeddingModel = $state('');
   let temperature = $state(0.8);
@@ -50,14 +57,19 @@
   let embeddingModels = $state<ModelInfo[]>([]);
   let imageModels = $state<ModelInfo[]>([]);
   let ttsModels = $state<ModelInfo[]>([]);
+  let chatModelFilter = $state('');
+  let embeddingModelFilter = $state('');
+  let imageModelFilter = $state('');
+  let ttsModelFilter = $state('');
+  let loadingChatModels = $state(false);
+  let loadingEmbeddingModels = $state(false);
+  let loadingImageModels = $state(false);
+  let loadingTtsModels = $state(false);
   let macroFolders = $state<Array<{ id: string; name: string; path: string }>>([]);
   let journalFolders = $state<Array<{ id: string; name: string; path: string }>>([]);
   let actorFolders = $state<Array<{ id: string; name: string; path: string }>>([]);
   let sceneFolders = $state<Array<{ id: string; name: string; path: string }>>([]);
 
-  let isLoadingModels = $state(false);
-  let isTesting = $state(false);
-  let testResult = $state<{ success: boolean; message: string } | null>(null);
   let isSaving = $state(false);
   let indexStats = $state<{ totalVectors: number; documents: number } | null>(null);
   let isIndexing = $state(false);
@@ -66,7 +78,11 @@
   // ---- Load current settings ----
   $effect(() => {
     try {
-      apiKey = getSetting('apiKey') || '';
+      providers = (getSetting('apiProviders') || []) as ApiProvider[];
+      chatProvider = getSetting('chatProvider') || '';
+      embeddingProvider = getSetting('embeddingProvider') || '';
+      imageProvider = getSetting('imageProvider') || '';
+      ttsProvider = getSetting('ttsProvider') || '';
       chatModel = getSetting('chatModel') || 'anthropic/claude-sonnet-4';
       embeddingModel = getSetting('embeddingModel') || 'openai/text-embedding-3-small';
       temperature = getSetting('temperature') ?? 0.8;
@@ -114,52 +130,76 @@
     });
   });
 
-  // ---- Model Loading ----
-  async function loadModels() {
-    if (!apiKey) {
-      ui.notifications.warn('Enter your API key first.');
-      return;
-    }
+  // ---- Provider Management ----
+  function addProvider() {
+    providers = [...providers, { id: crypto.randomUUID(), name: 'New Provider', baseUrl: '', apiKey: '' }];
+  }
 
-    isLoadingModels = true;
+  function removeProvider(id: string) {
+    providers = providers.filter(p => p.id !== id);
+    if (chatProvider === id) chatProvider = '';
+    if (embeddingProvider === id) embeddingProvider = '';
+    if (imageProvider === id) imageProvider = '';
+    if (ttsProvider === id) ttsProvider = '';
+  }
+
+  async function testProvider(provider: ApiProvider) {
+    providerTesting = { ...providerTesting, [provider.id]: true };
+    providerTestResults = { ...providerTestResults, [provider.id]: null };
     try {
-      openRouterService.configure({ apiKey, embeddingModel });
-      const allModels = await openRouterService.listModels();
-      chatModels = allModels.filter(m =>
-        m.architecture?.modality?.includes('text') &&
-        !m.id.includes('embedding')
-      ).sort((a, b) => a.name.localeCompare(b.name));
-      embeddingModels = allModels.filter(m =>
-        m.id.includes('embedding')
-      ).sort((a, b) => a.name.localeCompare(b.name));
-      imageModels = await openRouterService.listImageModels();
-      ttsModels = await openRouterService.listTTSModels();
+      const result = await openRouterService.testConnection({ baseUrl: provider.baseUrl, apiKey: provider.apiKey });
+      providerTestResults = { ...providerTestResults, [provider.id]: result };
     } catch (err: any) {
-      ui.notifications.error(`Failed to load models: ${err.message}`);
+      providerTestResults = { ...providerTestResults, [provider.id]: { success: false, message: `❌ ${err.message}` } };
     } finally {
-      isLoadingModels = false;
+      providerTesting = { ...providerTesting, [provider.id]: false };
     }
   }
 
-  // ---- Connection Test ----
-  async function testConnection() {
-    if (!apiKey) {
-      testResult = { success: false, message: 'API key is required.' };
+  // ---- Model Loading (auto on provider change) ----
+  const byName = (a: ModelInfo, b: ModelInfo) => (a.name ?? a.id).localeCompare(b.name ?? b.id);
+
+  async function loadModelsForType(type: 'chat' | 'embedding' | 'image' | 'tts', providerId: string) {
+    const provider = providers.find(p => p.id === providerId);
+    if (!provider) {
+      if (type === 'chat') chatModels = [];
+      else if (type === 'embedding') embeddingModels = [];
+      else if (type === 'image') imageModels = [];
+      else ttsModels = [];
       return;
     }
 
-    isTesting = true;
-    testResult = null;
+    if (type === 'chat') loadingChatModels = true;
+    else if (type === 'embedding') loadingEmbeddingModels = true;
+    else if (type === 'image') loadingImageModels = true;
+    else loadingTtsModels = true;
+
     try {
-      openRouterService.configure({ apiKey, embeddingModel });
-      const ok = await openRouterService.testConnection();
-      testResult = ok
-        ? { success: true, message: '✅ Connection successful!' }
-        : { success: false, message: '❌ Connection failed.' };
+      const all = await openRouterService.listModels({ baseUrl: provider.baseUrl, apiKey: provider.apiKey });
+      if (type === 'chat') {
+        chatModels = all.filter(m => (!m.architecture?.modality || m.architecture.modality.includes('text')) && !m.id.includes('embedding')).sort(byName);
+        chatModelFilter = '';
+        if (chatModels.length === 0) chatModel = '';
+      } else if (type === 'embedding') {
+        embeddingModels = all.filter(m => m.id.includes('embed') || m.architecture?.modality === 'embedding').sort(byName);
+        embeddingModelFilter = '';
+        if (embeddingModels.length === 0) embeddingModel = '';
+      } else if (type === 'image') {
+        imageModels = all.filter(m => m.architecture?.modality?.includes('image') || m.id.includes('dall-e') || m.id.includes('flux') || m.id.includes('image')).sort(byName);
+        imageModelFilter = '';
+        if (imageModels.length === 0) imageModel = '';
+      } else {
+        ttsModels = all.filter(m => m.id.includes('tts') || m.id.includes('audio') || m.architecture?.modality?.includes('audio')).sort(byName);
+        ttsModelFilter = '';
+        if (ttsModels.length === 0) ttsModel = '';
+      }
     } catch (err: any) {
-      testResult = { success: false, message: `❌ ${err.message}` };
+      ui.notifications.error(`Failed to load ${type} models: ${err.message}`);
     } finally {
-      isTesting = false;
+      if (type === 'chat') loadingChatModels = false;
+      else if (type === 'embedding') loadingEmbeddingModels = false;
+      else if (type === 'image') loadingImageModels = false;
+      else loadingTtsModels = false;
     }
   }
 
@@ -167,7 +207,11 @@
   async function handleSave() {
     isSaving = true;
     try {
-      await setSetting('apiKey', apiKey);
+      await setSetting('apiProviders', providers);
+      await setSetting('chatProvider', chatProvider);
+      await setSetting('embeddingProvider', embeddingProvider);
+      await setSetting('imageProvider', imageProvider);
+      await setSetting('ttsProvider', ttsProvider);
       await setSetting('chatModel', chatModel);
       await setSetting('embeddingModel', embeddingModel);
       await setSetting('temperature', temperature);
@@ -203,7 +247,15 @@
       await setSetting('summarizeKeepMessages', summarizeKeepMessages);
 
       // Reconfigure the service with all model settings
-      openRouterService.configure({ apiKey, defaultModel: chatModel, embeddingModel, imageModel, ttsModel });
+      const findProvider = (id: string) => providers.find(p => p.id === id);
+      const toConfig = (p: ApiProvider | undefined) => ({ baseUrl: p?.baseUrl ?? '', apiKey: p?.apiKey ?? '' });
+      openRouterService.configure({
+        chat: toConfig(findProvider(chatProvider)),
+        embedding: toConfig(findProvider(embeddingProvider)),
+        image: toConfig(findProvider(imageProvider)),
+        tts: toConfig(findProvider(ttsProvider)),
+        defaultModel: chatModel, embeddingModel, imageModel, ttsModel,
+      });
 
       // Refresh stats display
       await refreshStats();
@@ -250,7 +302,11 @@
 
     try {
       // Make sure service is configured
-      openRouterService.configure({ apiKey, defaultModel: chatModel, embeddingModel });
+      const embProv = providers.find(p => p.id === embeddingProvider);
+      openRouterService.configure({
+        embedding: { baseUrl: embProv?.baseUrl ?? '', apiKey: embProv?.apiKey ?? '' },
+        defaultModel: chatModel, embeddingModel,
+      });
 
       // Ensure embedding service is initialized
       if (!embeddingService.isInitialized) {
@@ -283,89 +339,116 @@
   <div class="settings-scroll">
     <!-- API Configuration -->
     <section class="settings-section">
-      <h2><i class="fas fa-key"></i> API Configuration</h2>
+      <h2><i class="fas fa-key"></i> API Providers</h2>
 
-      <div class="field">
-        <label for="api-key">OpenRouter API Key</label>
-        <div class="input-group">
-          <input
-            id="api-key"
-            type="password"
-            bind:value={apiKey}
-            placeholder="sk-or-v1-..."
-          />
-          <button class="inline-btn" onclick={testConnection} disabled={isTesting}>
-            {isTesting ? 'Testing...' : 'Test'}
-          </button>
-        </div>
-        {#if testResult}
-          <span class="field-result" class:success={testResult.success} class:error={!testResult.success}>
-            {testResult.message}
-          </span>
-        {/if}
-      </div>
+      {#if providers.length === 0}
+        <p class="section-hint">No providers configured. Add one below.</p>
+      {:else}
+        <table class="provider-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Base URL</th>
+              <th>API Key</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each providers as provider (provider.id)}
+              <tr>
+                <td><input type="text" bind:value={provider.name} placeholder="e.g. OpenRouter" /></td>
+                <td><input type="text" bind:value={provider.baseUrl} placeholder="blank = OpenRouter" /></td>
+                <td><input type="password" bind:value={provider.apiKey} placeholder="API key (optional)" /></td>
+                <td class="provider-actions">
+                  <button class="inline-btn" onclick={() => testProvider(provider)} disabled={providerTesting[provider.id]}>
+                    {providerTesting[provider.id] ? '…' : 'Test'}
+                  </button>
+                  <button class="inline-btn danger" onclick={() => removeProvider(provider.id)}>×</button>
+                </td>
+              </tr>
+              {#if providerTestResults[provider.id]}
+                <tr class="test-result-row">
+                  <td colspan="4">
+                    <span class="field-result" class:success={providerTestResults[provider.id]?.success} class:error={!providerTestResults[provider.id]?.success}>
+                      {providerTestResults[provider.id]?.message}
+                    </span>
+                  </td>
+                </tr>
+              {/if}
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+
+      <button class="add-provider-btn" onclick={addProvider}>
+        <i class="fas fa-plus"></i> Add Provider
+      </button>
     </section>
 
     <!-- Model Selection -->
     <section class="settings-section">
       <h2><i class="fas fa-robot"></i> Models</h2>
 
-      <button class="load-models-btn" onclick={loadModels} disabled={isLoadingModels}>
-        <i class="fas" class:fa-download={!isLoadingModels} class:fa-spinner={isLoadingModels} class:fa-spin={isLoadingModels}></i>
-        {isLoadingModels ? 'Loading...' : 'Load Available Models'}
-      </button>
+      {#snippet modelProviderSelect(label: string, modelId: string, providerId: string, loading: boolean, models: ModelInfo[], filter: string, placeholder: string, onProviderChange: (id: string) => void, onModelChange: (v: string) => void, onFilterChange: (v: string) => void)}
+        <div class="model-row">
+          <div class="model-provider-field">
+            <label>{label}</label>
+            <select value={providerId} onchange={(e) => onProviderChange((e.target as HTMLSelectElement).value)}>
+              <option value="">— Provider —</option>
+              {#each providers as p (p.id)}
+                <option value={p.id}>{p.name}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="model-id-field">
+            <label>&nbsp;</label>
+            {#if loading}
+              <div class="model-loading"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
+            {:else if models.length > 0}
+              <input class="model-filter" type="text" value={filter} oninput={(e) => onFilterChange((e.target as HTMLInputElement).value)} placeholder="Filter models..." />
+              <select value={modelId} onchange={(e) => onModelChange((e.target as HTMLSelectElement).value)}>
+                {#each models.filter(m => !filter || m.id === modelId || (m.name ?? '').toLowerCase().includes(filter.toLowerCase()) || m.id.toLowerCase().includes(filter.toLowerCase())) as m (m.id)}
+                  <option value={m.id}>{m.name ?? m.id} {m.name ? `(${m.id})` : ''}</option>
+                {/each}
+              </select>
+            {:else}
+              <input type="text" value={modelId} oninput={(e) => onModelChange((e.target as HTMLInputElement).value)} placeholder={placeholder} />
+            {/if}
+          </div>
+        </div>
+      {/snippet}
 
-      <div class="field">
-        <label for="chat-model">Chat Model</label>
-        {#if chatModels.length > 0}
-          <select id="chat-model" bind:value={chatModel}>
-            {#each chatModels as model (model.id)}
-              <option value={model.id}>{model.name} ({model.id})</option>
-            {/each}
-          </select>
-        {:else}
-          <input id="chat-model" type="text" bind:value={chatModel} placeholder="e.g. anthropic/claude-sonnet-4" />
-        {/if}
-      </div>
+      {@render modelProviderSelect(
+        'Chat Model', chatModel, chatProvider, loadingChatModels, chatModels, chatModelFilter,
+        'e.g. anthropic/claude-sonnet-4',
+        (id) => { chatProvider = id; loadModelsForType('chat', id); },
+        (v) => { chatModel = v; },
+        (v) => { chatModelFilter = v; }
+      )}
 
-      <div class="field">
-        <label for="image-model">Image Generation Model</label>
-        {#if imageModels.length > 0}
-          <select id="image-model" bind:value={imageModel}>
-            {#each imageModels as model (model.id)}
-              <option value={model.id}>{model.name} ({model.id})</option>
-            {/each}
-          </select>
-        {:else}
-          <input id="image-model" type="text" bind:value={imageModel} placeholder="e.g. openai/dall-e-3" />
-        {/if}
-      </div>
+      {@render modelProviderSelect(
+        'Embedding Model', embeddingModel, embeddingProvider, loadingEmbeddingModels, embeddingModels, embeddingModelFilter,
+        'e.g. openai/text-embedding-3-small',
+        (id) => { embeddingProvider = id; loadModelsForType('embedding', id); },
+        (v) => { embeddingModel = v; },
+        (v) => { embeddingModelFilter = v; }
+      )}
 
-      <div class="field">
-        <label for="tts-model">Text-to-Speech Model</label>
-        {#if ttsModels.length > 0}
-          <select id="tts-model" bind:value={ttsModel}>
-            {#each ttsModels as model (model.id)}
-              <option value={model.id}>{model.name} ({model.id})</option>
-            {/each}
-          </select>
-        {:else}
-          <input id="tts-model" type="text" bind:value={ttsModel} placeholder="e.g. openai/tts-1" />
-        {/if}
-      </div>
+      {@render modelProviderSelect(
+        'Image Model', imageModel, imageProvider, loadingImageModels, imageModels, imageModelFilter,
+        'e.g. openai/dall-e-3',
+        (id) => { imageProvider = id; loadModelsForType('image', id); },
+        (v) => { imageModel = v; },
+        (v) => { imageModelFilter = v; }
+      )}
 
-      <div class="field">
-        <label for="embedding-model">Embedding Model</label>
-        {#if embeddingModels.length > 0}
-          <select id="embedding-model" bind:value={embeddingModel}>
-            {#each embeddingModels as model (model.id)}
-              <option value={model.id}>{model.name} ({model.id})</option>
-            {/each}
-          </select>
-        {:else}
-          <input id="embedding-model" type="text" bind:value={embeddingModel} placeholder="e.g. openai/text-embedding-3-small" />
-        {/if}
-      </div>
+      {@render modelProviderSelect(
+        'TTS Model', ttsModel, ttsProvider, loadingTtsModels, ttsModels, ttsModelFilter,
+        'e.g. openai/gpt-4o-mini-tts',
+        (id) => { ttsProvider = id; loadModelsForType('tts', id); },
+        (v) => { ttsModel = v; },
+        (v) => { ttsModelFilter = v; }
+      )}
     </section>
 
     <!-- LLM Parameters -->
@@ -783,6 +866,156 @@
 
   .field-result.success { color: #4ade80; }
   .field-result.error { color: #f87171; }
+
+  /* ---- Provider Table ---- */
+  .provider-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82em;
+    margin-bottom: 8px;
+  }
+
+  .provider-table th {
+    text-align: left;
+    padding: 4px 6px;
+    color: rgba(255,255,255,0.4);
+    font-weight: 500;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .provider-table td {
+    padding: 4px 4px;
+    vertical-align: top;
+  }
+
+  .provider-table td input {
+    width: 100%;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    color: inherit;
+    padding: 5px 8px;
+    font-family: inherit;
+    font-size: 1em;
+    outline: none;
+    box-sizing: border-box;
+  }
+
+  .provider-table td input:focus {
+    border-color: rgba(139,92,246,0.5);
+  }
+
+  .provider-actions {
+    white-space: nowrap;
+    width: 1%;
+    display: flex;
+    gap: 4px;
+    align-items: flex-start;
+    padding-top: 5px;
+  }
+
+  .inline-btn.danger {
+    background: rgba(239,68,68,0.2);
+    border-color: rgba(239,68,68,0.35);
+    color: #fca5a5;
+  }
+
+  .inline-btn.danger:hover:not(:disabled) {
+    background: rgba(239,68,68,0.35);
+    color: #fff;
+  }
+
+  .test-result-row td {
+    padding: 0 6px 6px 6px;
+  }
+
+  .add-provider-btn {
+    width: 100%;
+    background: rgba(255,255,255,0.04);
+    border: 1px dashed rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.5);
+    padding: 7px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.82em;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+
+  .add-provider-btn:hover {
+    border-color: rgba(139,92,246,0.4);
+    color: #c4b5fd;
+  }
+
+  /* ---- Model Rows ---- */
+  .model-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+    align-items: flex-start;
+  }
+
+  .model-provider-field {
+    flex: 0 0 160px;
+  }
+
+  .model-provider-field label,
+  .model-id-field label {
+    display: block;
+    font-size: 0.82em;
+    font-weight: 500;
+    margin-bottom: 4px;
+    opacity: 0.8;
+  }
+
+  .model-provider-field select {
+    width: 100%;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+    color: inherit;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 0.88em;
+    outline: none;
+    box-sizing: border-box;
+  }
+
+  .model-id-field {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .model-loading {
+    padding: 8px 10px;
+    font-size: 0.82em;
+    color: rgba(255,255,255,0.4);
+  }
+
+  .model-filter {
+    width: 100%;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    color: inherit;
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 0.82em;
+    outline: none;
+    box-sizing: border-box;
+  }
+
+  .model-filter:focus {
+    border-color: rgba(139, 92, 246, 0.5);
+  }
+
+  .model-filter + select {
+    border-radius: 0 0 6px 6px;
+  }
 
   .load-models-btn {
     width: 100%;

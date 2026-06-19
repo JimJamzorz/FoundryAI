@@ -8,6 +8,8 @@
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
+
+
 // ---- Types ----
 
 export interface LLMMessage {
@@ -131,6 +133,13 @@ export interface ModelsResponse {
 	data: ModelInfo[]
 }
 
+// ---- Provider Config ----
+
+export interface ProviderConfig {
+	baseUrl: string
+	apiKey: string
+}
+
 // ---- Streaming Callback ----
 export type StreamCallback = (chunk: {
 	content?: string
@@ -142,44 +151,60 @@ export type StreamCallback = (chunk: {
 
 // ---- Service Class ----
 
+const DEFAULT_PROVIDER: ProviderConfig = { baseUrl: OPENROUTER_BASE, apiKey: '' }
+
 export class OpenRouterService {
-	private apiKey: string = ''
+	private chat: ProviderConfig = DEFAULT_PROVIDER
+	private embedding: ProviderConfig = DEFAULT_PROVIDER
+	private image: ProviderConfig = DEFAULT_PROVIDER
+	private tts: ProviderConfig = DEFAULT_PROVIDER
 	private defaultModel: string = ''
 	private embeddingModel: string = ''
 	private imageModel: string = ''
 	private ttsModel: string = ''
 
 	configure(options: {
-		apiKey: string
+		chat?: ProviderConfig
+		embedding?: ProviderConfig
+		image?: ProviderConfig
+		tts?: ProviderConfig
 		defaultModel?: string
 		embeddingModel?: string
 		imageModel?: string
 		ttsModel?: string
 	}): void {
-		this.apiKey = options.apiKey
+		if (options.chat !== undefined) this.chat = this.resolve(options.chat)
+		if (options.embedding !== undefined) this.embedding = this.resolve(options.embedding)
+		if (options.image !== undefined) this.image = this.resolve(options.image)
+		if (options.tts !== undefined) this.tts = this.resolve(options.tts)
 		if (options.defaultModel) this.defaultModel = options.defaultModel
 		if (options.embeddingModel) this.embeddingModel = options.embeddingModel
 		if (options.imageModel) this.imageModel = options.imageModel
 		if (options.ttsModel) this.ttsModel = options.ttsModel
 	}
 
-	get isConfigured(): boolean {
-		return !!this.apiKey
+	private resolve(p: ProviderConfig): ProviderConfig {
+		return { baseUrl: p.baseUrl?.trim() || OPENROUTER_BASE, apiKey: p.apiKey || '' }
 	}
 
-	private get headers(): Record<string, string> {
-		return {
-			Authorization: `Bearer ${this.apiKey}`,
-			'Content-Type': 'application/json',
-			'HTTP-Referer': 'https://foundryvtt.com',
-			'X-Title': 'FoundryAI',
+	get isConfigured(): boolean {
+		return !!(this.chat.apiKey || this.chat.baseUrl !== OPENROUTER_BASE)
+	}
+
+	private headersFor(provider: ProviderConfig): Record<string, string> {
+		const h: Record<string, string> = { 'Content-Type': 'application/json' }
+		if (provider.apiKey) h['Authorization'] = `Bearer ${provider.apiKey}`
+		if (provider.baseUrl === OPENROUTER_BASE) {
+			h['HTTP-Referer'] = 'https://foundryvtt.com'
+			h['X-Title'] = 'FoundryAI'
 		}
+		return h
 	}
 
 	// ---- Chat Completions ----
 
 	async chatCompletion(request: ChatCompletionRequest, signal?: AbortSignal): Promise<ChatCompletionResponse> {
-		if (!this.apiKey) throw new Error('OpenRouter API key not configured')
+		if (!this.isConfigured) throw new Error('No API provider configured')
 
 		const body: ChatCompletionRequest = {
 			...request,
@@ -191,9 +216,9 @@ export class OpenRouterService {
 			`FoundryAI | API chatCompletion — model: ${body.model}, messages: ${body.messages.length}, tools: ${body.tools?.length || 0}`,
 		)
 
-		const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+		const response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
 			method: 'POST',
-			headers: this.headers,
+			headers: this.headersFor(this.chat),
 			body: JSON.stringify(body),
 			signal,
 		})
@@ -201,9 +226,7 @@ export class OpenRouterService {
 		if (!response.ok) {
 			const error = await response.json().catch(() => ({ message: response.statusText }))
 			console.error(`FoundryAI | API error (${response.status}):`, error)
-			throw new Error(
-				`OpenRouter API error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`,
-			)
+			throw new Error(`API error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`)
 		}
 
 		const result = await response.json()
@@ -222,7 +245,7 @@ export class OpenRouterService {
 		onChunk: StreamCallback,
 		signal?: AbortSignal,
 	): Promise<void> {
-		if (!this.apiKey) throw new Error('OpenRouter API key not configured')
+		if (!this.isConfigured) throw new Error('No API provider configured')
 
 		const body: ChatCompletionRequest = {
 			...request,
@@ -234,9 +257,9 @@ export class OpenRouterService {
 			`FoundryAI | API stream — model: ${body.model}, messages: ${body.messages.length}, tools: ${body.tools?.length || 0}`,
 		)
 
-		const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+		const response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
 			method: 'POST',
-			headers: this.headers,
+			headers: this.headersFor(this.chat),
 			body: JSON.stringify(body),
 			signal,
 		})
@@ -244,14 +267,10 @@ export class OpenRouterService {
 		if (!response.ok) {
 			const error = await response.json().catch(() => ({ message: response.statusText }))
 			console.error(`FoundryAI | Stream API error (${response.status}):`, error)
-			throw new Error(
-				`OpenRouter API error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`,
-			)
+			throw new Error(`API error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`)
 		}
 
-		if (!response.body) {
-			throw new Error('No response body for streaming request')
-		}
+		if (!response.body) throw new Error('No response body for streaming request')
 
 		const reader = response.body.getReader()
 		const decoder = new TextDecoder()
@@ -268,14 +287,11 @@ export class OpenRouterService {
 
 				for (const line of lines) {
 					const trimmed = line.trim()
-					if (!trimmed || trimmed.startsWith(':')) continue // skip empty lines and comments
+					if (!trimmed || trimmed.startsWith(':')) continue
 					if (!trimmed.startsWith('data: ')) continue
 
 					const data = trimmed.slice(6)
-					if (data === '[DONE]') {
-						onChunk({ done: true })
-						return
-					}
+					if (data === '[DONE]') { onChunk({ done: true }); return }
 
 					try {
 						const chunk: StreamingChunk = JSON.parse(data)
@@ -287,7 +303,6 @@ export class OpenRouterService {
 							return
 						}
 
-						// Log tool call deltas for debugging
 						if (choice?.delta?.tool_calls?.length) {
 							console.debug('FoundryAI | Stream tool_call delta:', JSON.stringify(choice.delta.tool_calls))
 						}
@@ -307,7 +322,6 @@ export class OpenRouterService {
 			reader.releaseLock()
 		}
 
-		// If we exited without [DONE], signal completion
 		console.debug('FoundryAI | Stream ended (no [DONE] received)')
 		onChunk({ done: true })
 	}
@@ -315,24 +329,25 @@ export class OpenRouterService {
 	// ---- Embeddings ----
 
 	async generateEmbeddings(input: string | string[], model?: string): Promise<EmbeddingResponse> {
-		if (!this.apiKey) throw new Error('OpenRouter API key not configured')
+		if (!this.isConfigured) throw new Error('No API provider configured')
 
-		const body: EmbeddingRequest = {
-			model: model || this.embeddingModel,
-			input,
-		}
+		const body: EmbeddingRequest = { model: model || this.embeddingModel, input }
 
-		const response = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+		const response = await fetch(`${this.embedding.baseUrl}/embeddings`, {
 			method: 'POST',
-			headers: this.headers,
+			headers: this.headersFor(this.embedding),
 			body: JSON.stringify(body),
 		})
 
 		if (!response.ok) {
-			const error = await response.json().catch(() => ({ message: response.statusText }))
-			throw new Error(
-				`OpenRouter Embeddings error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`,
-			)
+			const rawText = await response.text().catch(() => response.statusText)
+			console.error('FoundryAI | Embeddings error response body:', rawText)
+			let message = response.statusText
+			try {
+				const error = JSON.parse(rawText)
+				message = error.message || error.error?.message || error.detail || rawText
+			} catch { message = rawText }
+			throw new Error(`Embeddings error (${response.status}): ${message}`)
 		}
 
 		return response.json()
@@ -340,57 +355,20 @@ export class OpenRouterService {
 
 	// ---- Models ----
 
-	async listModels(): Promise<ModelInfo[]> {
-		const response = await fetch(`${OPENROUTER_BASE}/models`, {
-			headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
-		})
+	async listModels(provider: ProviderConfig): Promise<ModelInfo[]> {
+		const p = this.resolve(provider)
+		const response = await fetch(`${p.baseUrl}/models`, { headers: this.headersFor(p) })
 
-		if (!response.ok) {
-			throw new Error(`Failed to fetch models: ${response.statusText}`)
-		}
+		if (!response.ok) throw new Error(`Failed to fetch models: ${response.statusText}`)
 
 		const data: ModelsResponse = await response.json()
 		return data.data
 	}
 
-	async listChatModels(): Promise<ModelInfo[]> {
-		const models = await this.listModels()
-		return models.filter(
-			(m) => m.architecture?.modality?.includes('text') || !m.architecture?.modality, // include models without modality info
-		)
-	}
-
-	async listEmbeddingModels(): Promise<ModelInfo[]> {
-		// OpenRouter doesn't have a separate embedding models endpoint via the
-		// generic /models route, so we filter or use known embedding model IDs
-		const models = await this.listModels()
-		return models.filter((m) => m.id.includes('embed') || m.architecture?.modality === 'embedding')
-	}
-
-	async listImageModels(): Promise<ModelInfo[]> {
-		const models = await this.listModels()
-		return models.filter(
-			(m) =>
-				m.architecture?.modality?.includes('image') ||
-				m.id.includes('dall-e') ||
-				m.id.includes('stable-diffusion') ||
-				m.id.includes('flux') ||
-				m.id.includes('midjourney') ||
-				m.id.includes('image'),
-		)
-	}
-
-	async listTTSModels(): Promise<ModelInfo[]> {
-		const models = await this.listModels()
-		return models.filter(
-			(m) => m.id.includes('tts') || m.id.includes('audio') || m.architecture?.modality?.includes('audio'),
-		)
-	}
-
 	// ---- Image Generation ----
 
 	async generateImage(prompt: string, model?: string, size?: string): Promise<{ url?: string; b64_json?: string }> {
-		if (!this.apiKey) throw new Error('OpenRouter API key not configured')
+		if (!this.isConfigured) throw new Error('No API provider configured')
 
 		const body = {
 			model: model || this.imageModel || 'openai/dall-e-3',
@@ -399,11 +377,12 @@ export class OpenRouterService {
 			size: size || '1024x1024',
 		}
 
-		console.log(`FoundryAI | API generateImage — model: ${body.model}, prompt: "${prompt.slice(0, 100)}..."`)
+		const imageUrl = `${this.image.baseUrl}/images/generations`
+		console.log(`FoundryAI | API generateImage — url: ${imageUrl}, model: ${body.model}, prompt: "${prompt.slice(0, 100)}..."`)
 
-		const response = await fetch(`${OPENROUTER_BASE}/images/generations`, {
+		const response = await fetch(imageUrl, {
 			method: 'POST',
-			headers: this.headers,
+			headers: this.headersFor(this.image),
 			body: JSON.stringify(body),
 		})
 
@@ -417,22 +396,16 @@ export class OpenRouterService {
 
 		const result = await response.json()
 		const imageData = result.data?.[0]
-
-		if (!imageData) {
-			throw new Error('No image data in response')
-		}
+		if (!imageData) throw new Error('No image data in response')
 
 		console.log(`FoundryAI | Image generated successfully`)
-		return {
-			url: imageData.url,
-			b64_json: imageData.b64_json,
-		}
+		return { url: imageData.url, b64_json: imageData.b64_json }
 	}
 
 	// ---- Text-to-Speech ----
 
 	async generateSpeech(input: string, voice?: string, model?: string): Promise<ArrayBuffer> {
-		if (!this.apiKey) throw new Error('OpenRouter API key not configured')
+		if (!this.isConfigured) throw new Error('No API provider configured')
 
 		const selectedVoice = voice || 'nova'
 		const selectedModel = model || this.ttsModel || 'openai/gpt-4o-mini-tts'
@@ -441,26 +414,17 @@ export class OpenRouterService {
 			`FoundryAI | API generateSpeech — model: ${selectedModel}, voice: ${selectedVoice}, input length: ${input.length}`,
 		)
 
-		// OpenRouter uses the chat/completions endpoint with modalities for audio output
 		const body = {
 			model: selectedModel,
-			messages: [
-				{
-					role: 'user',
-					content: `Read the following text aloud naturally:\n\n${input}`,
-				},
-			],
+			messages: [{ role: 'user', content: `Read the following text aloud naturally:\n\n${input}` }],
 			modalities: ['text', 'audio'],
-			audio: {
-				voice: selectedVoice,
-				format: 'wav',
-			},
+			audio: { voice: selectedVoice, format: 'wav' },
 			stream: true,
 		}
 
-		const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+		const response = await fetch(`${this.tts.baseUrl}/chat/completions`, {
 			method: 'POST',
-			headers: this.headers,
+			headers: this.headersFor(this.tts),
 			body: JSON.stringify(body),
 		})
 
@@ -470,11 +434,8 @@ export class OpenRouterService {
 			throw new Error(`TTS error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`)
 		}
 
-		if (!response.body) {
-			throw new Error('No response body for TTS streaming request')
-		}
+		if (!response.body) throw new Error('No response body for TTS streaming request')
 
-		// Collect base64 audio chunks from the SSE stream
 		const reader = response.body.getReader()
 		const decoder = new TextDecoder()
 		let buffer = ''
@@ -493,36 +454,25 @@ export class OpenRouterService {
 					const trimmed = line.trim()
 					if (!trimmed || trimmed.startsWith(':')) continue
 					if (!trimmed.startsWith('data: ')) continue
-
 					const data = trimmed.slice(6)
 					if (data === '[DONE]') break
-
 					try {
 						const chunk = JSON.parse(data)
 						const delta = chunk.choices?.[0]?.delta
-						if (delta?.audio?.data) {
-							audioChunks.push(delta.audio.data)
-						}
-					} catch {
-						// skip malformed chunks
-					}
+						if (delta?.audio?.data) audioChunks.push(delta.audio.data)
+					} catch { /* skip malformed */ }
 				}
 			}
 		} finally {
 			reader.releaseLock()
 		}
 
-		if (audioChunks.length === 0) {
-			throw new Error('No audio data received from TTS model')
-		}
+		if (audioChunks.length === 0) throw new Error('No audio data received from TTS model')
 
-		// Decode base64 chunks into a single ArrayBuffer
 		const fullBase64 = audioChunks.join('')
 		const binaryString = atob(fullBase64)
 		const bytes = new Uint8Array(binaryString.length)
-		for (let i = 0; i < binaryString.length; i++) {
-			bytes[i] = binaryString.charCodeAt(i)
-		}
+		for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i)
 
 		console.log(`FoundryAI | TTS audio generated: ${bytes.byteLength} bytes from ${audioChunks.length} chunks`)
 		return bytes.buffer
@@ -530,30 +480,12 @@ export class OpenRouterService {
 
 	// ---- Connection Test ----
 
-	async testConnection(): Promise<{ success: boolean; message: string; model?: string }> {
+	async testConnection(provider: ProviderConfig): Promise<{ success: boolean; message: string }> {
 		try {
-			if (!this.apiKey) {
-				return { success: false, message: 'No API key configured' }
-			}
-
-			const response = await this.chatCompletion({
-				model: this.defaultModel,
-				messages: [{ role: 'user', content: 'Say "connected" in one word.' }],
-				max_tokens: 10,
-				temperature: 0,
-			})
-
-			const content = response.choices?.[0]?.message?.content
-			return {
-				success: true,
-				message: `Connected! Response: "${content}"`,
-				model: response.model,
-			}
+			const models = await this.listModels(provider)
+			return { success: true, message: `✅ Connected — ${models.length} model${models.length !== 1 ? 's' : ''} available` }
 		} catch (error: any) {
-			return {
-				success: false,
-				message: error.message || 'Unknown error',
-			}
+			return { success: false, message: `❌ ${error.message || 'Unknown error'}` }
 		}
 	}
 }

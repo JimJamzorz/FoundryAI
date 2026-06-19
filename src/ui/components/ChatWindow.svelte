@@ -105,7 +105,7 @@
 
   const hasApiKey = $derived.by(() => {
     try {
-      return !!getSetting('apiKey');
+      return openRouterService.isConfigured;
     } catch {
       return false;
     }
@@ -325,7 +325,7 @@ IMPORTANT: You already have all the information you need about this character fr
     if (!text || isGenerating) return;
 
     if (!hasApiKey) {
-      ui.notifications.warn('Please configure your OpenRouter API key in FoundryAI settings.');
+      ui.notifications.warn('Please configure an API provider in FoundryAI settings.');
       return;
     }
 
@@ -1076,7 +1076,7 @@ IMPORTANT: You already have all the information you need about this character fr
         <div class="setup-notice">
           <i class="fas fa-key"></i>
           <h3>Welcome to FoundryAI</h3>
-          <p>Configure your OpenRouter API key to get started.</p>
+          <p>Configure an API provider in settings to get started.</p>
           <button class="setup-btn" onclick={openSettings}>
             <i class="fas fa-cog"></i> Open Settings
           </button>

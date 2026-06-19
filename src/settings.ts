@@ -8,8 +8,19 @@ import SettingsPanel from '@ui/components/SettingsPanel.svelte'
 
 const MODULE_ID = 'foundry-ai'
 
-export interface FoundryAISettings {
+export interface ApiProvider {
+	id: string
+	name: string
+	baseUrl: string
 	apiKey: string
+}
+
+export interface FoundryAISettings {
+	apiProviders: ApiProvider[]
+	chatProvider: string
+	embeddingProvider: string
+	imageProvider: string
+	ttsProvider: string
 	chatModel: string
 	embeddingModel: string
 	imageModel: string
@@ -49,18 +60,37 @@ export interface FoundryAISettings {
 }
 
 export function registerSettings(): void {
-	// ---- API Configuration ----
+	// ---- API Providers ----
 
-	game.settings.register(MODULE_ID, 'apiKey', {
-		name: 'FOUNDRYAI.Settings.ApiKey',
-		hint: 'FOUNDRYAI.Settings.ApiKeyHint',
+	game.settings.register(MODULE_ID, 'apiProviders', {
+		name: 'API Providers',
+		hint: 'List of API providers (name, base URL, API key)',
 		scope: 'world',
-		config: false, // Shown in custom settings panel
-		type: String,
-		default: '',
-		onChange: () => {
-			Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'apiKey')
-		},
+		config: false,
+		type: Array,
+		default: [],
+		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'apiProviders') },
+	})
+
+	game.settings.register(MODULE_ID, 'chatProvider', {
+		name: 'Chat Provider',
+		scope: 'world', config: false, type: String, default: '',
+		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'chatProvider') },
+	})
+
+	game.settings.register(MODULE_ID, 'embeddingProvider', {
+		name: 'Embedding Provider',
+		scope: 'world', config: false, type: String, default: '',
+	})
+
+	game.settings.register(MODULE_ID, 'imageProvider', {
+		name: 'Image Provider',
+		scope: 'world', config: false, type: String, default: '',
+	})
+
+	game.settings.register(MODULE_ID, 'ttsProvider', {
+		name: 'TTS Provider',
+		scope: 'world', config: false, type: String, default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'chatModel', {
