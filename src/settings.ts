@@ -20,10 +20,14 @@ export interface FoundryAISettings {
 	chatProvider: string
 	embeddingProvider: string
 	imageProvider: string
+	visionProvider: string
 	ttsProvider: string
+	comfyUrl: string
+	comfyWorkflow: string
 	chatModel: string
 	embeddingModel: string
 	imageModel: string
+	visionModel: string
 	ttsModel: string
 	journalFolders: string[]
 	actorFolders: string[]
@@ -88,8 +92,25 @@ export function registerSettings(): void {
 		scope: 'world', config: false, type: String, default: '',
 	})
 
+	game.settings.register(MODULE_ID, 'visionProvider', {
+		name: 'Vision Provider',
+		scope: 'world', config: false, type: String, default: '',
+	})
+
 	game.settings.register(MODULE_ID, 'ttsProvider', {
 		name: 'TTS Provider',
+		scope: 'world', config: false, type: String, default: '',
+	})
+
+	game.settings.register(MODULE_ID, 'comfyUrl', {
+		name: 'ComfyUI URL',
+		hint: 'Base URL of your ComfyUI instance. When set, image generation uses ComfyUI instead of the image provider.',
+		scope: 'world', config: false, type: String, default: '',
+	})
+
+	game.settings.register(MODULE_ID, 'comfyWorkflow', {
+		name: 'ComfyUI Workflow JSON',
+		hint: 'Custom ComfyUI workflow JSON. Leave empty to use the built-in Flux workflow.',
 		scope: 'world', config: false, type: String, default: '',
 	})
 
@@ -127,6 +148,15 @@ export function registerSettings(): void {
 		onChange: () => {
 			Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'imageModel')
 		},
+	})
+
+	game.settings.register(MODULE_ID, 'visionModel', {
+		name: 'Vision Model',
+		hint: 'Model used for image analysis (describe_image). Falls back to the chat model if left empty.',
+		scope: 'world',
+		config: false,
+		type: String,
+		default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'ttsModel', {

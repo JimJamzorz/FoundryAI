@@ -157,29 +157,48 @@ export class OpenRouterService {
 	private chat: ProviderConfig = DEFAULT_PROVIDER
 	private embedding: ProviderConfig = DEFAULT_PROVIDER
 	private image: ProviderConfig = DEFAULT_PROVIDER
+	private vision: ProviderConfig = DEFAULT_PROVIDER
 	private tts: ProviderConfig = DEFAULT_PROVIDER
+	private comfyUrl: string = ''
+	private customWorkflow: Record<string, any> | null = null
 	private defaultModel: string = ''
 	private embeddingModel: string = ''
 	private imageModel: string = ''
+	private visionModel: string = ''
 	private ttsModel: string = ''
 
 	configure(options: {
 		chat?: ProviderConfig
 		embedding?: ProviderConfig
 		image?: ProviderConfig
+		vision?: ProviderConfig
 		tts?: ProviderConfig
+		comfyUrl?: string
+		comfyWorkflow?: string
 		defaultModel?: string
 		embeddingModel?: string
 		imageModel?: string
+		visionModel?: string
 		ttsModel?: string
 	}): void {
 		if (options.chat !== undefined) this.chat = this.resolve(options.chat)
 		if (options.embedding !== undefined) this.embedding = this.resolve(options.embedding)
 		if (options.image !== undefined) this.image = this.resolve(options.image)
+		if (options.vision !== undefined) this.vision = this.resolve(options.vision)
 		if (options.tts !== undefined) this.tts = this.resolve(options.tts)
+		if (options.comfyUrl !== undefined) this.comfyUrl = options.comfyUrl.trim()
+		if (options.comfyWorkflow !== undefined) {
+			if (!options.comfyWorkflow) {
+				this.customWorkflow = null
+			} else {
+				try { this.customWorkflow = JSON.parse(options.comfyWorkflow) }
+				catch { console.warn('FoundryAI | Invalid comfyWorkflow JSON — workflow not updated') }
+			}
+		}
 		if (options.defaultModel) this.defaultModel = options.defaultModel
 		if (options.embeddingModel) this.embeddingModel = options.embeddingModel
 		if (options.imageModel) this.imageModel = options.imageModel
+		if (options.visionModel !== undefined) this.visionModel = options.visionModel
 		if (options.ttsModel) this.ttsModel = options.ttsModel
 	}
 
@@ -365,9 +384,87 @@ export class OpenRouterService {
 		return data.data
 	}
 
+	// ---- ComfyUI Image Generation ----
+
+	private async generateImageComfy(prompt: string, size?: string): Promise<{ url?: string; b64_json?: string }> {
+		if (!this.customWorkflow) throw new Error('No ComfyUI workflow configured — open Settings and use "Edit Workflow" to paste your workflow JSON.')
+		const workflow = JSON.parse(JSON.stringify(this.customWorkflow))
+
+		const findNode = (classType: string) => Object.keys(workflow).find(id => workflow[id]?.class_type === classType)
+		const findNodes = (classType: string) => Object.keys(workflow).filter(id => workflow[id]?.class_type === classType)
+
+		// Inject prompt — prefer a PrimitiveStringMultiline (value field), fall back to
+		// any CLIPTextEncode whose text is a plain string (not a node reference array)
+		const primitiveId = findNode('PrimitiveStringMultiline')
+		if (primitiveId) {
+			workflow[primitiveId].inputs.value = prompt
+		} else {
+			for (const id of findNodes('CLIPTextEncode')) {
+				if (typeof workflow[id].inputs.text === 'string') {
+					workflow[id].inputs.text = prompt
+				}
+			}
+		}
+
+		// Randomise seed
+		const randomNoiseId = findNode('RandomNoise')
+		if (randomNoiseId) workflow[randomNoiseId].inputs.noise_seed = Math.floor(Math.random() * 2 ** 32)
+		const kSamplerId = findNode('KSampler')
+		if (kSamplerId) workflow[kSamplerId].inputs.seed = Math.floor(Math.random() * 2 ** 32)
+
+		// Apply dimensions
+		if (size) {
+			const [w, h] = size.split('x').map(Number)
+			if (w && h) {
+				const latentId = findNode('EmptyLatentImage')
+				if (latentId) { workflow[latentId].inputs.width = w; workflow[latentId].inputs.height = h }
+				const fluxSamplingId = findNode('ModelSamplingFlux')
+				if (fluxSamplingId) { workflow[fluxSamplingId].inputs.width = w; workflow[fluxSamplingId].inputs.height = h }
+			}
+		}
+
+		console.log(`FoundryAI | ComfyUI generateImage — prompt: "${prompt.slice(0, 80)}..."`)
+
+		const queueRes = await fetch(`${this.comfyUrl}/prompt`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ prompt: workflow, client_id: 'foundry-ai' }),
+		})
+		if (!queueRes.ok) throw new Error(`ComfyUI queue error (${queueRes.status}): ${queueRes.statusText}`)
+
+		const { prompt_id } = await queueRes.json()
+		console.log(`FoundryAI | ComfyUI prompt queued: ${prompt_id}`)
+
+		// Poll history until complete (max 5 min)
+		const deadline = Date.now() + 5 * 60 * 1000
+		while (Date.now() < deadline) {
+			await new Promise(r => setTimeout(r, 2000))
+			const histRes = await fetch(`${this.comfyUrl}/history/${prompt_id}`)
+			const history = await histRes.json()
+			const entry = history[prompt_id]
+			if (!entry) continue
+			if (entry.status?.status_str === 'error') throw new Error('ComfyUI generation failed')
+			if (!entry.status?.completed) continue
+
+			// Find the first image in any output node
+			for (const nodeOutput of Object.values(entry.outputs) as any[]) {
+				if (nodeOutput.images?.length > 0) {
+					const img = nodeOutput.images[0]
+					const url = `${this.comfyUrl}/view?filename=${encodeURIComponent(img.filename)}&subfolder=${encodeURIComponent(img.subfolder ?? '')}&type=${img.type ?? 'output'}`
+					console.log(`FoundryAI | ComfyUI image ready: ${url}`)
+					return { url }
+				}
+			}
+			throw new Error('ComfyUI completed but no image found in outputs')
+		}
+
+		throw new Error('ComfyUI image generation timed out after 5 minutes')
+	}
+
 	// ---- Image Generation ----
 
 	async generateImage(prompt: string, model?: string, size?: string): Promise<{ url?: string; b64_json?: string }> {
+		if (this.comfyUrl) return this.generateImageComfy(prompt, size)
 		if (!this.isConfigured) throw new Error('No API provider configured')
 
 		const body = {
@@ -400,6 +497,47 @@ export class OpenRouterService {
 
 		console.log(`FoundryAI | Image generated successfully`)
 		return { url: imageData.url, b64_json: imageData.b64_json }
+	}
+
+	// ---- Image Description (Vision) ----
+
+	async describeImage(imageUrl: string, question: string, model?: string): Promise<string> {
+		if (!this.isConfigured) throw new Error('No API provider configured')
+
+		// Use vision provider if configured, otherwise fall back to chat provider
+		const provider = this.vision.baseUrl && this.vision.baseUrl !== OPENROUTER_BASE || this.vision.apiKey
+			? this.vision
+			: this.chat
+		const selectedModel = model || this.visionModel || this.defaultModel
+
+		const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+			method: 'POST',
+			headers: this.headersFor(provider),
+			body: JSON.stringify({
+				model: selectedModel,
+				messages: [
+					{
+						role: 'user',
+						content: [
+							{ type: 'image_url', image_url: { url: imageUrl } },
+							{ type: 'text', text: question },
+						],
+					},
+				],
+				max_tokens: 1024,
+			}),
+		})
+
+		if (!response.ok) {
+			const rawText = await response.text().catch(() => response.statusText)
+			console.error(`FoundryAI | Vision error (${response.status}) raw body:`, rawText)
+			let err: any = {}
+			try { err = JSON.parse(rawText) } catch {}
+			throw new Error(`Vision error (${response.status}): ${err.message || err.error?.message || rawText || 'Unknown error'}`)
+		}
+
+		const result = await response.json()
+		return result.choices?.[0]?.message?.content ?? 'No description returned'
 	}
 
 	// ---- Text-to-Speech ----

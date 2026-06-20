@@ -364,6 +364,30 @@ const SCENE_TOOLS: ToolDefinition[] = [
 			},
 		},
 	},
+	{
+		type: 'function',
+		function: {
+			name: 'update_scene',
+			description: 'Update an existing scene\'s properties — rename it, change its background image, or adjust grid settings. To change the background, either pass image_path (an already-generated image) or prompt (generates a new image). Do NOT call generate_image separately before this — pass the prompt directly.',
+			parameters: {
+				type: 'object',
+				properties: {
+					scene_id: { type: 'string', description: 'The ID of the scene to update' },
+					name: { type: 'string', description: 'New name for the scene' },
+					image_path: { type: 'string', description: 'Path to an already-generated image to use as the new background' },
+					prompt: { type: 'string', description: 'Generate a new background image from this description and apply it to the scene' },
+					size: {
+						type: 'string',
+						enum: ['1024x1024', '1792x1024', '1024x1792'],
+						description: 'Image dimensions when generating a new background via prompt. Default: 1792x1024',
+					},
+					grid_distance: { type: 'number', description: 'Grid square distance value (e.g. 5 for 5ft squares)' },
+					grid_units: { type: 'string', description: 'Grid distance units (e.g. "ft")' },
+				},
+				required: ['scene_id'],
+			},
+		},
+	},
 ]
 
 // == Dice Tools ==
@@ -1289,6 +1313,35 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 	{
 		type: 'function',
 		function: {
+			name: 'list_assets',
+			description: 'List all previously generated images and maps saved locally. Check this before generating new images — an existing asset may already be suitable. Filenames describe the content.',
+			parameters: { type: 'object', properties: {} },
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'describe_image',
+			description: 'Use vision AI to describe the contents of an image file. Useful for inspecting existing assets before reusing or replacing them.',
+			parameters: {
+				type: 'object',
+				properties: {
+					image_path: {
+						type: 'string',
+						description: 'Path to the image file (e.g. "foundry-ai/images/foo.png" or any Foundry asset path)',
+					},
+					question: {
+						type: 'string',
+						description: 'What to ask about the image. Defaults to a general description if omitted.',
+					},
+				},
+				required: ['image_path'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
 			name: 'generate_image',
 			description:
 				'Generate an image from a text prompt using AI image generation. Returns the image URL. Can be used for token art, item art, portraits, etc.',
@@ -1316,7 +1369,7 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'generate_scene',
 			description:
-				'Generate a new Foundry VTT scene with an AI-generated background map image. Provide a description of the map and the scene will be created with the generated image as its background.',
+				'Generate a new Foundry VTT scene with a background map image. This tool handles image generation internally — do NOT call generate_image first. If you already have an image path from a previous generate_image call, pass it via image_path to skip regeneration.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1325,6 +1378,10 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 						type: 'string',
 						description:
 							'Detailed description of the battle map / scene background to generate. Be specific about environment, style (top-down, isometric, etc.), lighting, and key features.',
+					},
+					image_path: {
+						type: 'string',
+						description: 'Path to an already-generated image (e.g. from a prior generate_image call). When provided, skips image generation and uses this image as the scene background.',
 					},
 					grid_distance: {
 						type: 'number',
@@ -1342,7 +1399,7 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 					folder_name: { type: 'string', description: 'Scene folder name to create the scene in' },
 					folder_id: { type: 'string', description: 'Scene folder ID to create the scene in' },
 				},
-				required: ['name', 'prompt'],
+				required: ['name'],
 			},
 		},
 	},
@@ -1446,6 +1503,8 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return handleViewScene(args.scene_id)
 			case 'activate_scene':
 				return await handleActivateScene(args.scene_id)
+			case 'update_scene':
+				return await handleUpdateScene(args)
 
 			// Dice tools
 			case 'roll_dice':
@@ -1556,6 +1615,10 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handleExecuteMacro(args.macro_id)
 
 			// Image & Scene generation tools
+			case 'list_assets':
+				return await handleListAssets()
+			case 'describe_image':
+				return await handleDescribeImage(args.image_path, args.question)
 			case 'generate_image':
 				return await handleGenerateImage(args.prompt, args.size)
 			case 'generate_scene':
@@ -1975,6 +2038,77 @@ async function handleActivateScene(sceneId: string): Promise<string> {
 		success: true,
 		message: `Activated scene "${scene.name}". All players have been moved to this scene.`,
 	})
+}
+
+async function handleUpdateScene(args: Record<string, any>): Promise<string> {
+	console.log(`FoundryAI | update_scene: sceneId="${args.scene_id}"`)
+	const scene = game.scenes?.get(args.scene_id)
+	if (!scene) return JSON.stringify({ error: `Scene not found: ${args.scene_id}` })
+	try {
+		const updates: Record<string, any> = {}
+
+		if (args.name) updates.name = args.name
+
+		if (args.grid_distance || args.grid_units) {
+			updates.grid = { ...scene.grid, ...(args.grid_distance ? { distance: args.grid_distance } : {}), ...(args.grid_units ? { units: args.grid_units } : {}) }
+		}
+
+		let newBackground: string | null = null
+
+		if (args.image_path) {
+			newBackground = args.image_path
+		} else if (args.prompt) {
+			const size = args.size || '1792x1024'
+			const imageModel = getSetting('imageModel') || 'openai/dall-e-3'
+			const mapPrompt = `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
+			const result = await openRouterService.generateImage(mapPrompt, imageModel, size)
+
+			const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+			const filename = `map-${promptToSlug(args.prompt ?? scene.name)}-${Date.now()}.png`
+			await FP.createDirectory('data', 'foundry-ai').catch(() => {})
+			await FP.createDirectory('data', 'foundry-ai/maps').catch(() => {})
+
+			if (result.url) {
+				const blob = await fetch(result.url).then(r => r.blob())
+				const file = new File([blob], filename, { type: 'image/png' })
+				const uploadResult = await FP.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
+				newBackground = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
+			} else if (result.b64_json) {
+				const bytes = atob(result.b64_json)
+				const arr = new Uint8Array(bytes.length)
+				for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i)
+				const file = new File([arr], filename, { type: 'image/png' })
+				const uploadResult = await FP.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
+				newBackground = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
+			} else {
+				return JSON.stringify({ error: 'No image data in response' })
+			}
+		}
+
+		if (newBackground) {
+			const levels = (scene as any).levels?.contents ?? []
+			if (levels.length > 0) {
+				const levelsData = levels.map((l: any) => (l.toObject ? l.toObject() : { ...l }))
+				levelsData[0].background = { ...(levelsData[0].background ?? {}), src: newBackground }
+				updates.levels = levelsData
+			} else {
+				updates.background = { src: newBackground }
+			}
+		}
+
+		if (Object.keys(updates).length === 0) return JSON.stringify({ error: 'No updates provided' })
+
+		await scene.update(updates)
+		return JSON.stringify({
+			success: true,
+			scene_id: scene.id,
+			scene_name: updates.name ?? scene.name,
+			background: newBackground,
+			message: `Updated scene "${updates.name ?? scene.name}".`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `Scene update failed: ${error.message}` })
+	}
 }
 
 // ===============================
@@ -3297,6 +3431,74 @@ async function handleExecuteMacro(macroId: string): Promise<string> {
 // IMAGE & SCENE GENERATION HANDLERS
 // ===============================
 
+function promptToSlug(prompt: string, maxWords = 7): string {
+	return prompt
+		.toLowerCase()
+		.replace(/[^a-z0-9\s]/g, '')
+		.trim()
+		.split(/\s+/)
+		.slice(0, maxWords)
+		.join('-')
+}
+
+async function handleListAssets(): Promise<string> {
+	try {
+		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+		const results: { path: string; name: string; type: string }[] = []
+
+		const browseDirs = [
+			{ dir: 'foundry-ai/images', type: 'image' },
+			{ dir: 'foundry-ai/maps', type: 'map' },
+		]
+
+		for (const { dir, type } of browseDirs) {
+			try {
+				const browse = await (FP as any).browse('data', dir)
+				for (const file of browse.files ?? []) {
+					const name = file.split('/').pop() ?? file
+					results.push({ path: file, name, type })
+				}
+			} catch {
+				// Directory may not exist yet
+			}
+		}
+
+		if (results.length === 0) return JSON.stringify({ assets: [], message: 'No generated assets found yet.' })
+
+		return JSON.stringify({
+			assets: results,
+			message: `Found ${results.length} generated asset(s). Filenames describe the content — use path when referencing an asset.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `Failed to list assets: ${error.message}` })
+	}
+}
+
+async function handleDescribeImage(imagePath: string, question?: string): Promise<string> {
+	console.log(`FoundryAI | describe_image: path="${imagePath}"`)
+	try {
+		// Fetch the image in the browser and encode as base64 so the vision model
+		// receives the raw data rather than a localhost URL it can't reach itself
+		const imageUrl = `${window.location.origin}/${imagePath}`
+		const imgResponse = await fetch(imageUrl)
+		if (!imgResponse.ok) return JSON.stringify({ error: `Could not fetch image: ${imgResponse.status} ${imgResponse.statusText}` })
+
+		const blob = await imgResponse.blob()
+		const base64 = await new Promise<string>((resolve, reject) => {
+			const reader = new FileReader()
+			reader.onload = () => resolve((reader.result as string))
+			reader.onerror = reject
+			reader.readAsDataURL(blob)
+		})
+
+		const q = question || 'Describe this image in detail — what it depicts, its style, and any notable features.'
+		const description = await openRouterService.describeImage(base64, q)
+		return JSON.stringify({ success: true, description })
+	} catch (error: any) {
+		return JSON.stringify({ error: `Image description failed: ${error.message}` })
+	}
+}
+
 async function handleGenerateImage(prompt: string, size?: string): Promise<string> {
 	console.log(`FoundryAI | generate_image: prompt="${prompt.slice(0, 100)}..."`)
 
@@ -3309,14 +3511,15 @@ async function handleGenerateImage(prompt: string, size?: string): Promise<strin
 			try {
 				const response = await fetch(result.url)
 				const blob = await response.blob()
-				const filename = `foundry-ai-${Date.now()}.png`
+				const filename = `${promptToSlug(prompt)}-${Date.now()}.png`
 				const file = new File([blob], filename, { type: 'image/png' })
 
 				// Ensure the foundry-ai/images directory exists
-				await FilePicker.createDirectory('data', 'foundry-ai').catch(() => {})
-				await FilePicker.createDirectory('data', 'foundry-ai/images').catch(() => {})
+				const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+				await FP.createDirectory('data', 'foundry-ai').catch(() => {})
+				await FP.createDirectory('data', 'foundry-ai/images').catch(() => {})
 
-				const uploadResult = await FilePicker.upload('data', 'foundry-ai/images', file, {}, { notify: false })
+				const uploadResult = await FP.upload('data', 'foundry-ai/images', file, {}, { notify: false })
 				const savedPath = (uploadResult as any)?.path || `foundry-ai/images/${filename}`
 
 				return JSON.stringify({
@@ -3339,7 +3542,7 @@ async function handleGenerateImage(prompt: string, size?: string): Promise<strin
 			const arr = new Uint8Array(bytes.length)
 			for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i)
 			const blob = new Blob([arr], { type: 'image/png' })
-			const filename = `foundry-ai-${Date.now()}.png`
+			const filename = `${promptToSlug(prompt)}-${Date.now()}.png`
 			const file = new File([blob], filename, { type: 'image/png' })
 
 			await FilePicker.createDirectory('data', 'foundry-ai').catch(() => {})
@@ -3362,46 +3565,47 @@ async function handleGenerateImage(prompt: string, size?: string): Promise<strin
 }
 
 async function handleGenerateScene(args: Record<string, any>): Promise<string> {
-	console.log(`FoundryAI | generate_scene: name="${args.name}", prompt="${(args.prompt as string).slice(0, 100)}..."`)
+	console.log(`FoundryAI | generate_scene: name="${args.name}", prompt="${(args.prompt as string | undefined)?.slice(0, 100) ?? '(using image_path)'}"...`)
 
 	try {
-		// Generate the map image
-		const imageModel = getSetting('imageModel') || 'openai/dall-e-3'
-		const mapSize = args.size || '1792x1024'
+		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+		let imagePath = ''
 
-		// Enhance the prompt for battle map generation
-		const mapPrompt = `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
+		const mapSize = args.size || '896x512'
+		// Parse image dimensions for scene size
+		const [imgWidth, imgHeight] = mapSize.split('x').map(Number)
 
-		const result = await openRouterService.generateImage(mapPrompt, imageModel, mapSize)
+		if (!args.image_path && !args.prompt) {
+			return JSON.stringify({ error: 'Either prompt or image_path is required to generate a scene' })
+		} else if (args.image_path) {
+			imagePath = args.image_path
+		} else if (args.prompt) {
+			// Generate the map image
+			const imageModel = getSetting('imageModel') || 'openai/dall-e-3'
 
-		let imagePath: string
+			const mapPrompt = `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
 
-		if (result.url) {
-			const response = await fetch(result.url)
-			const blob = await response.blob()
-			const filename = `map-${args.name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}.png`
-			const file = new File([blob], filename, { type: 'image/png' })
+			const result = await openRouterService.generateImage(mapPrompt, imageModel, mapSize)
+			const filename = `map-${promptToSlug(args.prompt)}-${Date.now()}.png`
 
-			await FilePicker.createDirectory('data', 'foundry-ai').catch(() => {})
-			await FilePicker.createDirectory('data', 'foundry-ai/maps').catch(() => {})
+			await FP.createDirectory('data', 'foundry-ai').catch(() => {})
+			await FP.createDirectory('data', 'foundry-ai/maps').catch(() => {})
 
-			const uploadResult = await FilePicker.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
-			imagePath = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
-		} else if (result.b64_json) {
-			const bytes = atob(result.b64_json)
-			const arr = new Uint8Array(bytes.length)
-			for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i)
-			const blob = new Blob([arr], { type: 'image/png' })
-			const filename = `map-${args.name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}.png`
-			const file = new File([blob], filename, { type: 'image/png' })
-
-			await FilePicker.createDirectory('data', 'foundry-ai').catch(() => {})
-			await FilePicker.createDirectory('data', 'foundry-ai/maps').catch(() => {})
-
-			const uploadResult = await FilePicker.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
-			imagePath = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
-		} else {
-			return JSON.stringify({ error: 'No image data in response' })
+			if (result.url) {
+				const blob = await fetch(result.url).then(r => r.blob())
+				const file = new File([blob], filename, { type: 'image/png' })
+				const uploadResult = await FP.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
+				imagePath = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
+			} else if (result.b64_json) {
+				const bytes = atob(result.b64_json)
+				const arr = new Uint8Array(bytes.length)
+				for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i)
+				const file = new File([arr], filename, { type: 'image/png' })
+				const uploadResult = await FP.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
+				imagePath = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
+			} else {
+				return JSON.stringify({ error: 'No image data in response' })
+			}
 		}
 
 		// Resolve scene folder
@@ -3414,13 +3618,9 @@ async function handleGenerateScene(args: Record<string, any>): Promise<string> {
 			sceneFolderId = folder?.id || null
 		}
 
-		// Parse image dimensions for scene size
-		const [imgWidth, imgHeight] = mapSize.split('x').map(Number)
-
-		// Create the scene
+		// Create the scene without background first so Foundry initialises the levels structure
 		const sceneData: Record<string, any> = {
 			name: args.name,
-			background: { src: imagePath },
 			width: imgWidth,
 			height: imgHeight,
 			grid: {
@@ -3435,6 +3635,16 @@ async function handleGenerateScene(args: Record<string, any>): Promise<string> {
 		if (sceneFolderId) sceneData.folder = sceneFolderId
 
 		const scene = await Scene.create(sceneData)
+
+		// Set the background via levels (same path as update_scene)
+		const levels = (scene as any).levels?.contents ?? []
+		if (levels.length > 0) {
+			const levelsData = levels.map((l: any) => (l.toObject ? l.toObject() : { ...l }))
+			levelsData[0].background = { ...(levelsData[0].background ?? {}), src: imagePath }
+			await scene.update({ levels: levelsData })
+		} else {
+			await scene.update({ background: { src: imagePath } })
+		}
 
 		return JSON.stringify({
 			success: true,

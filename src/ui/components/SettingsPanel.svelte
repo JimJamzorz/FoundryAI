@@ -3,6 +3,8 @@
   import { embeddingService } from '@core/embedding-service';
   import { collectionReader } from '@core/collection-reader';
   import { getSetting, setSetting, type ApiProvider } from '../../settings';
+  import { SvelteApplication } from '../svelte-application';
+  import ComfyWorkflowEditor from './ComfyWorkflowEditor.svelte';
 
   interface Props {
     application?: any;
@@ -15,7 +17,9 @@
   let chatProvider = $state('');
   let embeddingProvider = $state('');
   let imageProvider = $state('');
+  let visionProvider = $state('');
   let ttsProvider = $state('');
+  let comfyUrl = $state('');
   let providerTesting = $state<Record<string, boolean>>({});
   let providerTestResults = $state<Record<string, {success: boolean; message: string} | null>>({});
 
@@ -44,6 +48,7 @@
   let enableMacroTools = $state(true);
   let enableImageTools = $state(true);
   let imageModel = $state('openai/dall-e-3');
+  let visionModel = $state('');
   let ttsModel = $state('openai/tts-1');
   let systemPromptOverride = $state('');
   let selectedJournalFolders = $state<string[]>([]);
@@ -56,14 +61,17 @@
   let chatModels = $state<ModelInfo[]>([]);
   let embeddingModels = $state<ModelInfo[]>([]);
   let imageModels = $state<ModelInfo[]>([]);
+  let visionModels = $state<ModelInfo[]>([]);
   let ttsModels = $state<ModelInfo[]>([]);
   let chatModelFilter = $state('');
   let embeddingModelFilter = $state('');
   let imageModelFilter = $state('');
+  let visionModelFilter = $state('');
   let ttsModelFilter = $state('');
   let loadingChatModels = $state(false);
   let loadingEmbeddingModels = $state(false);
   let loadingImageModels = $state(false);
+  let loadingVisionModels = $state(false);
   let loadingTtsModels = $state(false);
   let macroFolders = $state<Array<{ id: string; name: string; path: string }>>([]);
   let journalFolders = $state<Array<{ id: string; name: string; path: string }>>([]);
@@ -82,7 +90,9 @@
       chatProvider = getSetting('chatProvider') || '';
       embeddingProvider = getSetting('embeddingProvider') || '';
       imageProvider = getSetting('imageProvider') || '';
+      visionProvider = getSetting('visionProvider') || '';
       ttsProvider = getSetting('ttsProvider') || '';
+      comfyUrl = getSetting('comfyUrl') || '';
       chatModel = getSetting('chatModel') || 'anthropic/claude-sonnet-4';
       embeddingModel = getSetting('embeddingModel') || 'openai/text-embedding-3-small';
       temperature = getSetting('temperature') ?? 0.8;
@@ -108,6 +118,7 @@
       enableMacroTools = getSetting('enableMacroTools') ?? true;
       enableImageTools = getSetting('enableImageTools') ?? true;
       imageModel = getSetting('imageModel') || 'openai/dall-e-3';
+      visionModel = getSetting('visionModel') || '';
       ttsModel = getSetting('ttsModel') || 'openai/tts-1';
       systemPromptOverride = getSetting('systemPromptOverride') || '';
       selectedJournalFolders = getSetting('journalFolders') || [];
@@ -140,6 +151,7 @@
     if (chatProvider === id) chatProvider = '';
     if (embeddingProvider === id) embeddingProvider = '';
     if (imageProvider === id) imageProvider = '';
+    if (visionProvider === id) visionProvider = '';
     if (ttsProvider === id) ttsProvider = '';
   }
 
@@ -188,6 +200,10 @@
         imageModels = all.filter(m => m.architecture?.modality?.includes('image') || m.id.includes('dall-e') || m.id.includes('flux') || m.id.includes('image')).sort(byName);
         imageModelFilter = '';
         if (imageModels.length === 0) imageModel = '';
+      } else if (type === 'vision') {
+        visionModels = all.filter(m => !m.architecture?.modality || m.architecture.modality.includes('text')).sort(byName);
+        visionModelFilter = '';
+        if (visionModels.length === 0) visionModel = '';
       } else {
         ttsModels = all.filter(m => m.id.includes('tts') || m.id.includes('audio') || m.architecture?.modality?.includes('audio')).sort(byName);
         ttsModelFilter = '';
@@ -203,6 +219,19 @@
     }
   }
 
+  // ---- ComfyUI Workflow Editor ----
+  let comfyEditorApp: SvelteApplication | null = null;
+
+  function openComfyWorkflowEditor() {
+    if (comfyEditorApp?.rendered) { comfyEditorApp.bringToFront(); return; }
+    comfyEditorApp = new SvelteApplication(ComfyWorkflowEditor, {}, {
+      id: 'foundry-ai-comfy-editor',
+      window: { frame: true, positioned: true, title: 'ComfyUI Workflow Editor', icon: 'fas fa-code', minimizable: true, resizable: true, contentTag: 'section', contentClasses: ['foundry-ai-content'] },
+      position: { width: 700, height: 600 },
+    });
+    comfyEditorApp.render(true);
+  }
+
   // ---- Save ----
   async function handleSave() {
     isSaving = true;
@@ -211,7 +240,9 @@
       await setSetting('chatProvider', chatProvider);
       await setSetting('embeddingProvider', embeddingProvider);
       await setSetting('imageProvider', imageProvider);
+      await setSetting('visionProvider', visionProvider);
       await setSetting('ttsProvider', ttsProvider);
+      await setSetting('comfyUrl', comfyUrl);
       await setSetting('chatModel', chatModel);
       await setSetting('embeddingModel', embeddingModel);
       await setSetting('temperature', temperature);
@@ -237,6 +268,7 @@
       await setSetting('enableMacroTools', enableMacroTools);
       await setSetting('enableImageTools', enableImageTools);
       await setSetting('imageModel', imageModel);
+      await setSetting('visionModel', visionModel);
       await setSetting('ttsModel', ttsModel);
       await setSetting('systemPromptOverride', systemPromptOverride);
       await setSetting('journalFolders', selectedJournalFolders);
@@ -254,7 +286,8 @@
         embedding: toConfig(findProvider(embeddingProvider)),
         image: toConfig(findProvider(imageProvider)),
         tts: toConfig(findProvider(ttsProvider)),
-        defaultModel: chatModel, embeddingModel, imageModel, ttsModel,
+        comfyUrl,
+        defaultModel: chatModel, embeddingModel, imageModel, visionModel, ttsModel,
       });
 
       // Refresh stats display
@@ -440,6 +473,24 @@
         (id) => { imageProvider = id; loadModelsForType('image', id); },
         (v) => { imageModel = v; },
         (v) => { imageModelFilter = v; }
+      )}
+
+      <div class="field comfy-field">
+        <label for="comfy-url">ComfyUI URL <span class="comfy-badge">overrides image provider</span></label>
+        <div class="comfy-url-row">
+          <input id="comfy-url" type="text" bind:value={comfyUrl} placeholder="e.g. http://localhost:8188 — leave blank to use image provider" />
+          <button class="comfy-workflow-btn" onclick={() => openComfyWorkflowEditor()} title="Edit ComfyUI Workflow JSON">
+            <i class="fas fa-code"></i> Edit Workflow
+          </button>
+        </div>
+      </div>
+
+      {@render modelProviderSelect(
+        'Vision Model', visionModel, visionProvider, loadingVisionModels, visionModels, visionModelFilter,
+        'optional — falls back to chat model',
+        (id) => { visionProvider = id; loadModelsForType('vision', id); },
+        (v) => { visionModel = v; },
+        (v) => { visionModelFilter = v; }
       )}
 
       {@render modelProviderSelect(
@@ -987,6 +1038,42 @@
   .model-id-field {
     flex: 1;
     min-width: 0;
+  }
+
+  .comfy-field { margin-bottom: 16px; }
+
+  .comfy-url-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .comfy-url-row input { flex: 1; }
+
+  .comfy-workflow-btn {
+    white-space: nowrap;
+    padding: 4px 10px;
+    font-size: 12px;
+    border-radius: 4px;
+    border: 1px solid rgba(139,92,246,0.4);
+    background: rgba(139,92,246,0.15);
+    color: #c4b5fd;
+    cursor: pointer;
+  }
+
+  .comfy-workflow-btn:hover {
+    background: rgba(139,92,246,0.3);
+  }
+
+  .comfy-badge {
+    font-size: 0.75em;
+    background: rgba(139,92,246,0.2);
+    border: 1px solid rgba(139,92,246,0.3);
+    color: #c4b5fd;
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+    font-weight: normal;
   }
 
   .model-loading {
