@@ -2148,6 +2148,9 @@ async function handleCreateJournal(
 	const journal = await JournalEntry.create(journalData)
 	const pageCount = pages.length
 	console.log(`FoundryAI | create_journal: created journal id=${journal.id} with ${pageCount} page(s)`)
+	if (journal?.id) {
+		embeddingService.queueReindex(journal.id, 'journal')
+	}
 	return JSON.stringify({
 		success: true,
 		id: journal.id,
@@ -2183,6 +2186,7 @@ async function handleUpdateJournal(
 			{ type: 'text', name: newPageName, text: { content, format: 1 } },
 		])
 		const newPage = created?.[0]
+		embeddingService.queueReindex(journalId, 'journal')
 		return JSON.stringify({
 			success: true,
 			id: journalId,
@@ -2201,6 +2205,7 @@ async function handleUpdateJournal(
 		const updateData: Record<string, any> = { 'text.content': content }
 		if (pageName) updateData.name = pageName
 		await page.update(updateData)
+		embeddingService.queueReindex(journalId, 'journal')
 		return JSON.stringify({
 			success: true,
 			id: journalId,
@@ -2218,6 +2223,7 @@ async function handleUpdateJournal(
 	const updateData: Record<string, any> = { 'text.content': content }
 	if (pageName) updateData.name = pageName
 	await firstPage.update(updateData)
+	embeddingService.queueReindex(journalId, 'journal')
 	return JSON.stringify({
 		success: true,
 		id: journalId,

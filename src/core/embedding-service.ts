@@ -247,9 +247,118 @@ export class EmbeddingService {
 		return chunks.filter((c) => c.length > 0)
 	}
 
+	// ---- Incremental Re-indexing ----
+
+	async reindexDocument(documentId: string, documentType: 'journal' | 'actor'): Promise<void> {
+		if (!this.vectorStore) {
+			console.warn('FoundryAI | reindexDocument: embedding service not initialized, skipping')
+			return
+		}
+		if (!openRouterService.isConfigured) {
+			console.warn('FoundryAI | reindexDocument: OpenRouter not configured, skipping')
+			return
+		}
+
+		try {
+			const doc = this.extractSingleDocument(documentId, documentType)
+			if (!doc) {
+				await this.vectorStore.deleteByDocument(documentId)
+				await this.vectorStore.deleteIndexMeta(documentId)
+				console.log(`FoundryAI | reindexDocument: ${documentId} had no content, removed from index`)
+				return
+			}
+
+			await this.vectorStore.deleteByDocument(documentId)
+
+			const chunks = this.chunkText(doc.content)
+			if (chunks.length === 0) {
+				await this.vectorStore.deleteIndexMeta(documentId)
+				return
+			}
+
+			const embeddingResponse = await openRouterService.generateEmbeddings(chunks)
+
+			const vectorEntries: VectorEntry[] = chunks.map((text, idx) => ({
+				id: `${doc.type}:${doc.id}:${idx}`,
+				documentId: doc.id,
+				documentType: doc.type,
+				documentName: doc.name,
+				folderName: doc.folderName,
+				chunkIndex: idx,
+				text,
+				vector: embeddingResponse.data[idx].embedding,
+				metadata: doc.metadata,
+			}))
+			await this.vectorStore.upsertVectors(vectorEntries)
+
+			await this.vectorStore.setIndexMeta({
+				documentId: doc.id,
+				documentType: doc.type,
+				documentName: doc.name,
+				lastModified: doc.lastModified,
+				chunkCount: chunks.length,
+			})
+
+			console.log(`FoundryAI | reindexDocument: re-indexed "${doc.name}" (${chunks.length} chunks)`)
+		} catch (error: any) {
+			console.error(`FoundryAI | reindexDocument failed for ${documentId}:`, error)
+		}
+	}
+
+	private extractSingleDocument(documentId: string, documentType: 'journal' | 'actor'): ExtractedDocument | null {
+		if (documentType === 'journal') {
+			const entry = game.journal?.get(documentId)
+			if (!entry || !entry.folder) return null
+			const content = collectionReader.getJournalContent(documentId)
+			if (!content) return null
+			return {
+				id: entry.id,
+				name: entry.name,
+				type: 'journal',
+				folderId: entry.folder?.id || null,
+				folderName: entry.folder?.name || 'Uncategorized',
+				content,
+				lastModified: Date.now(),
+				metadata: { pageCount: entry.pages.size },
+			}
+		} else {
+			const actor = game.actors?.get(documentId)
+			if (!actor || !actor.folder) return null
+			const content = collectionReader.getActorContent(documentId)
+			if (!content) return null
+			return {
+				id: actor.id,
+				name: actor.name,
+				type: 'actor',
+				folderId: actor.folder?.id || null,
+				folderName: actor.folder?.name || 'Uncategorized',
+				content,
+				lastModified: Date.now(),
+				metadata: {},
+			}
+		}
+	}
+
+	private reindexQueue = new Map<string, 'journal' | 'actor'>()
+	private reindexTimer: ReturnType<typeof setTimeout> | null = null
+
+	queueReindex(documentId: string, documentType: 'journal' | 'actor'): void {
+		this.reindexQueue.set(documentId, documentType)
+		if (this.reindexTimer) clearTimeout(this.reindexTimer)
+		this.reindexTimer = setTimeout(() => {
+			const queued = Array.from(this.reindexQueue.entries())
+			this.reindexQueue.clear()
+			this.reindexTimer = null
+			for (const [id, type] of queued) {
+				void this.reindexDocument(id, type)
+			}
+		}, 3000)
+	}
+
 	// ---- Cleanup ----
 
 	async destroy(): Promise<void> {
+		if (this.reindexTimer) clearTimeout(this.reindexTimer)
 		this.vectorStore?.close()
 		this.vectorStore = null
 	}
