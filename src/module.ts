@@ -9,6 +9,9 @@ import { embeddingService } from '@core/embedding-service'
 import { chatSessionManager } from '@core/chat-session-manager'
 import { sessionRecapManager } from '@core/session-recap-manager'
 import { ensureFoundryAIFolders } from '@core/folder-manager'
+import { registerCampaignHooks } from '@core/campaign-hooks'
+import { registerSessionEventHooks } from '@core/session-event-hooks'
+import { sessionEventBuffer } from '@core/session-event-buffer'
 import { openPopoutChat } from '@ui/svelte-application'
 import { buildSystemPrompt } from '@core/system-prompt'
 import ChatWindow from '@ui/components/ChatWindow.svelte'
@@ -26,6 +29,9 @@ Hooks.once('init', () => {
 	// Register settings
 	registerSettings()
 
+	// Register campaign dashboard hooks (status toggles)
+	registerCampaignHooks()
+
 	// Register scene control button (must be before first render)
 	registerSceneControlButton()
 })
@@ -38,6 +44,10 @@ Hooks.once('ready', async () => {
 		console.log('FoundryAI | Non-GM user, skipping initialization.')
 		return
 	}
+
+	// Load persisted session events and register table event hooks
+	sessionEventBuffer.load()
+	registerSessionEventHooks()
 
 	// Configure OpenRouter service from saved providers
 	configureServiceFromSettings()

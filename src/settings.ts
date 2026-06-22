@@ -63,6 +63,8 @@ export interface FoundryAISettings {
 	ttsVoice: string
 	contextSummarizeThreshold: number
 	summarizeKeepMessages: number
+	captureSessionEvents: boolean
+	sessionEvents: string
 }
 
 export function registerSettings(): void {
@@ -498,6 +500,24 @@ export function registerSettings(): void {
 		type: Number,
 		default: 10,
 		range: { min: 4, max: 30, step: 1 },
+	})
+
+	// ---- Session Event Capture ----
+
+	game.settings.register(MODULE_ID, 'captureSessionEvents', {
+		name: 'Capture Session Events',
+		hint: 'Automatically record combat, damage, conditions, and scene changes during play. These events are included in AI-generated session recaps.',
+		scope: 'world',
+		config: true,
+		type: Boolean,
+		default: true,
+	})
+
+	game.settings.register(MODULE_ID, 'sessionEvents', {
+		scope: 'world',
+		config: false,
+		type: String,
+		default: '[]',
 	})
 
 	// ---- Settings Menu ----

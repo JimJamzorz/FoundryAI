@@ -8,6 +8,7 @@ import { openRouterService, type LLMMessage } from './openrouter-service'
 import { chatSessionManager } from './chat-session-manager'
 import { collectionReader } from './collection-reader'
 import { getSubfolderId } from './folder-manager'
+import { sessionEventBuffer } from './session-event-buffer'
 
 const MODULE_ID = 'foundry-ai'
 const RECAP_FOLDER_NAME = 'Sessions'
@@ -100,7 +101,9 @@ class SessionRecapManager {
 			allConversations.push(`--- Session: ${session.name} ---\n${formatted}`)
 		}
 
-		if (allConversations.length === 0) {
+		const eventTimeline = sessionEventBuffer.getFormattedTimeline()
+
+		if (allConversations.length === 0 && !eventTimeline) {
 			throw new Error('No valid chat sessions found to recap.')
 		}
 
@@ -114,6 +117,11 @@ class SessionRecapManager {
 
 		onProgress?.({ phase: 'generating', message: 'AI is writing the session recap...' })
 
+		const timelineSection = eventTimeline
+			? `Session Event Timeline (what happened at the table):\n${eventTimeline}\n\n`
+			: ''
+		const chatSection = allConversations.length > 0 ? allConversations.join('\n\n') : ''
+
 		// Build the recap prompt
 		const messages: LLMMessage[] = [
 			{
@@ -122,7 +130,7 @@ class SessionRecapManager {
 			},
 			{
 				role: 'user',
-				content: `Here are the chat sessions from today's game session. Please write a polished session recap.\n\n${sceneContext ? `Current Scene Context:\n${sceneContext}\n\n` : ''}${allConversations.join('\n\n')}`,
+				content: `Here are the chat sessions from today's game session. Please write a polished session recap.\n\n${sceneContext ? `Current Scene Context:\n${sceneContext}\n\n` : ''}${timelineSection}${chatSection}`,
 			},
 		]
 
@@ -173,6 +181,9 @@ class SessionRecapManager {
 		})
 
 		onProgress?.({ phase: 'complete', message: 'Session recap saved!' })
+
+		// Clear the event buffer now that events are captured in the recap
+		sessionEventBuffer.clear()
 
 		return {
 			id: journal.id,

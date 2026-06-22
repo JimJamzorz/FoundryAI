@@ -119,6 +119,7 @@ interface FoundryDocument {
 
 interface JournalEntry extends FoundryDocument {
 	pages: Collection<JournalEntryPage>
+	createEmbeddedDocuments(type: string, data: Record<string, any>[]): Promise<any[]>
 }
 
 interface JournalEntryPage extends FoundryDocument {

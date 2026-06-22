@@ -8,6 +8,7 @@ import { getSetting } from '../settings'
 import { openRouterService } from './openrouter-service'
 import type { ToolDefinition, ToolCall } from './openrouter-service'
 import { getRootFolderId, getSubfolderId } from './folder-manager'
+import { generateCampaignDashboardHTML } from './campaign-management'
 
 // ---- Folder Permission Helpers ----
 // These check whether a document's folder is in the user's allowed list.
@@ -195,7 +196,7 @@ const CORE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'create_journal',
 			description:
-				'Create a new journal entry in a specified folder. Session recaps MUST go in the "Sessions" folder. Notes and stored data MUST go in the "Notes" folder.',
+				'Create a new journal entry in a specified folder. Supports multi-page journals and auto-formatted quest journals with styled headers, details grids, and GM notes. Session recaps MUST go in the "Sessions" folder. Notes and stored data MUST go in the "Notes" folder.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -216,6 +217,40 @@ const CORE_TOOLS: ToolDefinition[] = [
 						type: 'string',
 						description: 'The folder ID to create the journal in. Prefer folder_name instead.',
 					},
+					additional_pages: {
+						type: 'array',
+						description:
+							'Optional extra pages to add after the main page. Use for multi-section journals (e.g. a "Player Handout" page and a separate "GM Notes" page). Each page becomes a distinct, separately-retrievable journal page.',
+						items: {
+							type: 'object',
+							properties: {
+								name: { type: 'string', description: 'Page title (e.g. "GM Notes", "Player Handout")' },
+								content: { type: 'string', description: 'HTML content for this page' },
+							},
+							required: ['name', 'content'],
+						},
+					},
+					quest_meta: {
+						type: 'object',
+						description:
+							'Optional structured quest metadata. When provided, a formatted quest header (summary, details grid, adventure hook, GM notes) is auto-generated and prepended to the main content. Use this when creating quest journals.',
+						properties: {
+							quest_type: {
+								type: 'string',
+								enum: ['main', 'side', 'personal', 'mystery', 'fetch', 'escort', 'kill', 'collection'],
+								description: 'Type of quest',
+							},
+							difficulty: {
+								type: 'string',
+								enum: ['easy', 'medium', 'hard', 'deadly'],
+								description: 'Quest difficulty',
+							},
+							location: { type: 'string', description: 'Where the quest takes place' },
+							quest_giver: { type: 'string', description: 'NPC who gives the quest' },
+							npc_name: { type: 'string', description: 'Key NPC involved (antagonist/ally/target)' },
+							rewards: { type: 'string', description: 'Quest rewards description' },
+						},
+					},
 				},
 				required: ['name', 'content'],
 			},
@@ -225,7 +260,8 @@ const CORE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'update_journal',
-			description: 'Update the content of an existing journal entry.',
+			description:
+				'Update an existing journal entry. By default updates the first text page. Pass page_id to update a specific page (get page IDs from list_journals_in_folder), or new_page_name to append a brand-new page instead of overwriting.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -235,11 +271,19 @@ const CORE_TOOLS: ToolDefinition[] = [
 					},
 					content: {
 						type: 'string',
-						description: 'The new HTML content for the first page',
+						description: 'The new HTML content for the target page',
+					},
+					page_id: {
+						type: 'string',
+						description: 'ID of a specific page to update (from list_journals_in_folder). If omitted, updates the first text page.',
+					},
+					new_page_name: {
+						type: 'string',
+						description: 'If provided, creates a NEW page with this name instead of updating an existing one.',
 					},
 					page_name: {
 						type: 'string',
-						description: 'Optionally update the page name',
+						description: 'Optionally rename the page being updated.',
 					},
 				},
 				required: ['journal_id', 'content'],
@@ -250,7 +294,7 @@ const CORE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'list_journals_in_folder',
-			description: 'List all journal entries in a specific folder.',
+			description: 'List all journal entries in a specific folder, including page IDs that can be passed to update_journal.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1464,10 +1508,71 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 	},
 ]
 
+// == Campaign Tools ==
+const CAMPAIGN_TOOLS: ToolDefinition[] = [
+	{
+		type: 'function',
+		function: {
+			name: 'create_campaign_dashboard',
+			description:
+				'Create a campaign dashboard journal with navigation, progress tracking, and clickable status toggles for each campaign part. Use at the start of a new campaign to give a single home-base journal.',
+			parameters: {
+				type: 'object',
+				properties: {
+					campaign_title: { type: 'string', description: 'Campaign title' },
+					campaign_description: {
+						type: 'string',
+						description: 'Brief description of the campaign theme and scope',
+					},
+					template: {
+						type: 'string',
+						enum: ['five-part-adventure', 'dungeon-crawl', 'investigation', 'sandbox', 'custom'],
+						description: 'Campaign structure template',
+					},
+					custom_parts: {
+						type: 'array',
+						description: 'Custom parts when template is "custom"',
+						items: {
+							type: 'object',
+							properties: {
+								title: { type: 'string', description: 'Part title' },
+								description: { type: 'string', description: 'Part description' },
+								type: {
+									type: 'string',
+									enum: ['main_part', 'sub_part', 'chapter', 'session', 'optional'],
+									description: 'Part type',
+								},
+								level_start: { type: 'number', description: 'Recommended starting level' },
+								level_end: { type: 'number', description: 'Recommended ending level' },
+								sub_parts: {
+									type: 'array',
+									items: {
+										type: 'object',
+										properties: {
+											title: { type: 'string' },
+											description: { type: 'string' },
+										},
+										required: ['title', 'description'],
+									},
+								},
+							},
+							required: ['title', 'description', 'type', 'level_start', 'level_end'],
+						},
+					},
+					default_quest_giver: { type: 'string', description: 'Default quest-giver NPC name (optional)' },
+					default_location: { type: 'string', description: 'Default campaign setting/location (optional)' },
+				},
+				required: ['campaign_title', 'campaign_description', 'template'],
+			},
+		},
+	},
+]
+
 // ---- Combine all static tool definition arrays ----
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	...CORE_TOOLS,
+	...CAMPAIGN_TOOLS,
 	...SCENE_TOOLS,
 	...DICE_TOOLS,
 	...TOKEN_TOOLS,
@@ -1489,7 +1594,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 export function getEnabledTools(): ToolDefinition[] {
 	if (!getSetting('enableTools')) return []
 
-	const tools: ToolDefinition[] = [...CORE_TOOLS]
+	const tools: ToolDefinition[] = [...CORE_TOOLS, ...CAMPAIGN_TOOLS]
 
 	if (getSetting('enableSceneTools')) tools.push(...SCENE_TOOLS)
 	if (getSetting('enableDiceTools')) tools.push(...DICE_TOOLS)
@@ -1535,6 +1640,10 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 	try {
 		let result: string
 		switch (funcName) {
+			// Campaign tools
+			case 'create_campaign_dashboard':
+				return await handleCreateCampaignDashboard(args)
+
 			// Core tools
 			case 'search_journals':
 				return await handleSearchJournals(args.query, args.max_results)
@@ -1545,9 +1654,9 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			case 'get_actor':
 				return handleGetActor(args.actor_id)
 			case 'create_journal':
-				return await handleCreateJournal(args.name, args.content, args.folder_name, args.folder_id)
+				return await handleCreateJournal(args.name, args.content, args.folder_name, args.folder_id, args.additional_pages, args.quest_meta)
 			case 'update_journal':
-				return await handleUpdateJournal(args.journal_id, args.content, args.page_name)
+				return await handleUpdateJournal(args.journal_id, args.content, args.page_id, args.new_page_name, args.page_name)
 			case 'list_journals_in_folder':
 				return handleListJournalsInFolder(args.folder_id)
 			case 'list_folders':
@@ -1702,6 +1811,39 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 	} catch (error: any) {
 		console.error(`FoundryAI | Tool "${funcName}" execution failed:`, error)
 		return JSON.stringify({ error: `Tool execution failed: ${error.message}` })
+	}
+}
+
+// ===============================
+// CAMPAIGN TOOL HANDLERS
+// ===============================
+
+async function handleCreateCampaignDashboard(args: any): Promise<string> {
+	try {
+		const { html, campaignId, partCount } = generateCampaignDashboardHTML({
+			campaign_title: args.campaign_title,
+			campaign_description: args.campaign_description,
+			template: args.template,
+			custom_parts: args.custom_parts,
+			default_quest_giver: args.default_quest_giver,
+			default_location: args.default_location,
+		})
+		// Reuse handleCreateJournal so folder creation and permissions stay consistent
+		const result = await handleCreateJournal(
+			`${args.campaign_title} - Campaign Dashboard`,
+			html,
+			args.campaign_title,
+		)
+		const parsed = JSON.parse(result)
+		return JSON.stringify({
+			success: true,
+			campaignId,
+			partCount,
+			journalId: parsed.id,
+			message: `Campaign dashboard "${args.campaign_title}" created with ${partCount} parts.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `Failed to create campaign dashboard: ${error.message}` })
 	}
 }
 
@@ -1881,12 +2023,99 @@ function handleGetActor(actorId: string): string {
 	})
 }
 
+interface JournalPage {
+	name: string
+	content: string
+}
+
+interface QuestMeta {
+	quest_type?: string
+	difficulty?: string
+	location?: string
+	quest_giver?: string
+	npc_name?: string
+	rewards?: string
+}
+
+function buildStyledJournalHTML(title: string, body: string): string {
+	return `
+		<section class="foundryai-journal">
+			<style>
+				.foundryai-journal { --ink:#222; --muted:#666; --paper:#f8f5f2; --gm:#f2f2f2; --accent:#b33; --rule:#ddd; font-size:14px; line-height:1.6; color:var(--ink); }
+				.foundryai-journal .wrap { max-width: 980px; margin: 0 auto; padding: 8px 12px 24px; }
+				.foundryai-journal h1 { font-size: 28px; letter-spacing: .5px; text-align: center; margin: 8px 0 6px; }
+				.foundryai-journal .orn { height: 10px; border: 0; border-top: 2px solid var(--rule); margin: 8px auto 16px; width: 60%; }
+				.foundryai-journal h2 { font-size: 20px; margin: 18px 0 6px; }
+				.foundryai-journal h3 { font-size: 16px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+				.foundryai-journal p.lead { font-size: 15px; color: var(--muted); margin: 0 0 10px; }
+				.foundryai-journal .readaloud { background: var(--paper); border-left: 4px solid var(--accent); padding: 10px 12px; margin: 12px 0; }
+				.foundryai-journal .gmnote { background: var(--gm); border-left: 4px solid #444; padding: 10px 12px; margin: 12px 0; }
+				.foundryai-journal ul { margin: 6px 0 10px 18px; }
+				.foundryai-journal .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px 24px; }
+				.foundryai-journal img { max-width: 100%; height: auto; border-radius: 2px; }
+				.foundryai-journal .meta { font-size: 12px; color: var(--muted); margin: 4px 0 12px; }
+				.foundryai-journal table { border-collapse: collapse; width: 100%; }
+				.foundryai-journal table th, .foundryai-journal table td { border-bottom: 1px solid var(--rule); padding: 6px 4px; text-align: left; }
+				.foundryai-journal .spaced { margin-top: 14px; }
+			</style>
+			<div class="wrap">
+				<h1>${title}</h1>
+				<hr class="orn"/>
+				${body}
+			</div>
+		</section>`
+}
+
+function buildQuestHeader(questMeta: QuestMeta, description: string): string {
+	const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
+	const today = new Date().toLocaleDateString()
+
+	const detailItems: string[] = []
+	if (questMeta.quest_type) detailItems.push(`<li><strong>Type:</strong> ${cap(questMeta.quest_type)} Quest</li>`)
+	if (questMeta.difficulty) detailItems.push(`<li><strong>Difficulty:</strong> ${cap(questMeta.difficulty)}</li>`)
+	if (questMeta.location) detailItems.push(`<li><strong>Location:</strong> ${questMeta.location}</li>`)
+	if (questMeta.quest_giver) detailItems.push(`<li><strong>Quest Giver:</strong> ${questMeta.quest_giver}</li>`)
+	if (questMeta.npc_name) detailItems.push(`<li><strong>Key NPC:</strong> ${questMeta.npc_name}</li>`)
+
+	const rewardItems: string[] = []
+	if (questMeta.rewards) rewardItems.push(`<li><strong>Rewards:</strong> ${questMeta.rewards}</li>`)
+	rewardItems.push(`<li><strong>Status:</strong> Active</li>`)
+	rewardItems.push(`<li><strong>Created:</strong> ${today}</li>`)
+
+	const giver = questMeta.quest_giver || 'A mysterious contact'
+	const diffText = questMeta.difficulty ? ` This is a ${cap(questMeta.difficulty)} difficulty quest.` : ''
+	const typeText = questMeta.quest_type ? ` (${cap(questMeta.quest_type)} Quest)` : ''
+
+	return `
+		<p class="lead">${description}</p>
+		<div class="grid-2">
+			<div>
+				<h3>Quest Details</h3>
+				<ul>${detailItems.join('')}</ul>
+			</div>
+			<div>
+				<h3>Rewards &amp; Status</h3>
+				<ul>${rewardItems.join('')}</ul>
+			</div>
+		</div>
+		<h2 class="spaced">Adventure Hook</h2>
+		<div class="readaloud">
+			<p>${giver} approaches you with an urgent matter${typeText}. The task must be completed soon.</p>
+		</div>
+		<div class="gmnote">
+			<p><strong>GM Notes:</strong>${diffText} Adjust encounters to suit your party. Track quest progress and update this journal as the story develops.</p>
+		</div>`
+}
+
 async function handleCreateJournal(
 	name: string,
 	content: string,
 	folderName?: string,
 	folderId?: string,
+	additionalPages?: JournalPage[],
+	questMeta?: QuestMeta,
 ): Promise<string> {
+	console.log(`FoundryAI | create_journal: name="${name}", folder="${folderName || folderId || 'root'}", pages=${1 + (additionalPages?.length ?? 0)}, questMeta=${!!questMeta}`)
 	let resolvedFolderId = folderId || null
 
 	if (folderName && !resolvedFolderId) {
@@ -1903,61 +2132,97 @@ async function handleCreateJournal(
 		resolvedFolderId = folder?.id || null
 	}
 
-	const journalData: any = {
-		name,
-		pages: [
-			{
-				name,
-				type: 'text',
-				text: { content, format: 1 },
-			},
-		],
+	const mainContent = questMeta ? buildStyledJournalHTML(name, buildQuestHeader(questMeta, content)) : content
+	if (questMeta) console.log(`FoundryAI | create_journal: quest formatting applied`)
+
+	const pages: any[] = [{ name, type: 'text', text: { content: mainContent, format: 1 } }]
+	if (additionalPages) {
+		for (const page of additionalPages) {
+			pages.push({ name: page.name, type: 'text', text: { content: page.content, format: 1 } })
+		}
 	}
 
-	if (resolvedFolderId) {
-		journalData.folder = resolvedFolderId
-	}
+	const journalData: any = { name, pages }
+	if (resolvedFolderId) journalData.folder = resolvedFolderId
 
 	const journal = await JournalEntry.create(journalData)
+	const pageCount = pages.length
+	console.log(`FoundryAI | create_journal: created journal id=${journal.id} with ${pageCount} page(s)`)
 	return JSON.stringify({
 		success: true,
 		id: journal.id,
 		name: journal.name,
 		folder: folderName || 'Root',
-		message: `Created journal entry "${name}" in folder "${folderName || 'Root'}"`,
+		pageCount,
+		message: `Created journal entry "${name}" in folder "${folderName || 'Root'}" with ${pageCount} page(s)`,
 	})
 }
 
-async function handleUpdateJournal(journalId: string, content: string, pageName?: string): Promise<string> {
+async function handleUpdateJournal(
+	journalId: string,
+	content: string,
+	pageId?: string,
+	newPageName?: string,
+	pageName?: string,
+): Promise<string> {
 	console.log(
-		`FoundryAI | update_journal: journalId="${journalId}", pageName="${pageName}", content length=${content?.length}`,
+		`FoundryAI | update_journal: journalId="${journalId}", pageId="${pageId}", newPageName="${newPageName}", content length=${content?.length}`,
 	)
+
 	const entry = game.journal?.get(journalId)
 	if (!entry) {
-		console.log(`FoundryAI | update_journal: journal not found`)
 		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
 	}
-
 	if (!isJournalFolderAllowed(entry.folder?.id)) {
 		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
 	}
 
-	const firstPage = entry.pages.contents?.[0]
+	// Mode 1: Append a brand-new page
+	if (newPageName) {
+		const created = await entry.createEmbeddedDocuments('JournalEntryPage', [
+			{ type: 'text', name: newPageName, text: { content, format: 1 } },
+		])
+		const newPage = created?.[0]
+		return JSON.stringify({
+			success: true,
+			id: journalId,
+			pageId: newPage?.id || '',
+			pageName: newPageName,
+			message: `Added new page "${newPageName}" to "${entry.name}"`,
+		})
+	}
+
+	// Mode 2: Update a specific page by ID
+	if (pageId) {
+		const page = entry.pages?.get(pageId)
+		if (!page) {
+			return JSON.stringify({ error: `Page not found: ${pageId}` })
+		}
+		const updateData: Record<string, any> = { 'text.content': content }
+		if (pageName) updateData.name = pageName
+		await page.update(updateData)
+		return JSON.stringify({
+			success: true,
+			id: journalId,
+			pageId: page.id,
+			pageName: page.name,
+			message: `Updated page "${page.name}" in "${entry.name}"`,
+		})
+	}
+
+	// Mode 3: Update first text page (backward-compatible default)
+	const firstPage = entry.pages?.find((p: any) => p.type === 'text') || entry.pages.contents?.[0]
 	if (!firstPage) {
 		return JSON.stringify({ error: 'Journal has no pages to update' })
 	}
-
-	const updateData: Record<string, any> = {
-		'text.content': content,
-	}
-	if (pageName) {
-		updateData.name = pageName
-	}
-
+	const updateData: Record<string, any> = { 'text.content': content }
+	if (pageName) updateData.name = pageName
 	await firstPage.update(updateData)
 	return JSON.stringify({
 		success: true,
 		id: journalId,
+		pageId: firstPage.id,
+		pageName: firstPage.name,
 		message: `Updated journal entry "${entry.name}"`,
 	})
 }
@@ -3849,10 +4114,10 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 				canvas.height = imgData.height
 				const ctx = canvas.getContext('2d')!
 
-				let pixelData: Uint8ClampedArray
+				let pixelData!: Uint8ClampedArray<ArrayBuffer>
 				if (imgData.kind === 3) {
 					// RGBA_32BPP — copy to ensure plain ArrayBuffer (not SharedArrayBuffer)
-					pixelData = new Uint8ClampedArray(imgData.data)
+					pixelData = new Uint8ClampedArray(imgData.data) as Uint8ClampedArray<ArrayBuffer>
 				} else if (imgData.kind === 2) {
 					// RGB_24BPP — expand to RGBA
 					const src = imgData.data
