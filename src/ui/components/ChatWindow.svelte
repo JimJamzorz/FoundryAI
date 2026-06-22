@@ -76,9 +76,10 @@
         // Consume all following tool result messages
         let j = i + 1;
         while (j < filtered.length && filtered[j].role === 'tool') {
+          const toolContent = filtered[j].content;
           results.push({
             name: filtered[j].name || 'unknown',
-            content: typeof filtered[j].content === 'string' ? filtered[j].content : '',
+            content: typeof toolContent === 'string' ? toolContent : '',
           });
           j++;
         }
@@ -156,7 +157,11 @@
       if (fallback) modelContextLength = fallback;
 
       // Then try fetching from API for exact value
-      openRouterService.listChatModels().then((models: ModelInfo[]) => {
+      const providers = (getSetting('apiProviders') || []) as Array<{ id: string; baseUrl: string; apiKey: string }>;
+      const chatProviderId = getSetting('chatProvider');
+      const chatProv = providers.find(p => p.id === chatProviderId);
+      const providerConfig = { baseUrl: chatProv?.baseUrl ?? '', apiKey: chatProv?.apiKey ?? '' };
+      openRouterService.listModels(providerConfig).then((models: ModelInfo[]) => {
         const match = models.find((m: ModelInfo) => m.id === model);
         if (match?.context_length) {
           modelContextLength = match.context_length;
@@ -324,11 +329,6 @@ IMPORTANT: You already have all the information you need about this character fr
     const text = inputText.trim();
     if (!text || isGenerating) return;
 
-    if (!hasApiKey) {
-      ui.notifications.warn('Please configure an API provider in FoundryAI settings.');
-      return;
-    }
-
     // Create session if needed
     if (!currentSessionId) {
       await startNewSession();
@@ -471,7 +471,8 @@ IMPORTANT: You already have all the information you need about this character fr
     }
 
     // There was a user message — truncate to that message and resend
-    const userText = typeof messages[userIndex].content === 'string' ? messages[userIndex].content : '';
+    const msgContent = messages[userIndex].content;
+    const userText = typeof msgContent === 'string' ? msgContent : '';
     messages = messages.slice(0, userIndex);
     inputText = userText;
     await sendMessage();

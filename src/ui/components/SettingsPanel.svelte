@@ -219,6 +219,39 @@
     }
   }
 
+  // ---- PDF Upload ----
+  let pdfUploadInput: HTMLInputElement | null = null;
+  let pdfUploading = $state(false);
+  let pdfUploadResult = $state<{ success: boolean; message: string } | null>(null);
+
+  async function handlePdfUpload(event: Event) {
+    const files = (event.target as HTMLInputElement).files;
+    if (!files || files.length === 0) return;
+
+    pdfUploading = true;
+    pdfUploadResult = null;
+
+    try {
+      const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker;
+      await (FP as any).createDirectory('data', 'foundry-ai').catch(() => {});
+      await (FP as any).createDirectory('data', 'foundry-ai/pdfs').catch(() => {});
+
+      const results: string[] = [];
+      for (const file of Array.from(files)) {
+        const result = await FP.upload('data', 'foundry-ai/pdfs', file, {}, { notify: false });
+        results.push((result as any)?.path ?? file.name);
+      }
+
+      pdfUploadResult = { success: true, message: `Uploaded ${results.length} file(s) to foundry-ai/pdfs/` };
+    } catch (err: any) {
+      pdfUploadResult = { success: false, message: err.message ?? 'Upload failed' };
+    } finally {
+      pdfUploading = false;
+      if (pdfUploadInput) pdfUploadInput.value = '';
+      setTimeout(() => { pdfUploadResult = null; }, 4000);
+    }
+  }
+
   // ---- ComfyUI Workflow Editor ----
   let comfyEditorApp: SvelteApplication | null = null;
 
@@ -320,8 +353,9 @@
   }
 
   async function handleReindex() {
-    if (!apiKey) {
-      ui.notifications.warn('Enter your API key first.');
+    const embProv = providers.find(p => p.id === embeddingProvider);
+    if (!embProv?.baseUrl) {
+      ui.notifications.warn('Select an embedding provider with a base URL first.');
       return;
     }
 
@@ -335,7 +369,6 @@
 
     try {
       // Make sure service is configured
-      const embProv = providers.find(p => p.id === embeddingProvider);
       openRouterService.configure({
         embedding: { baseUrl: embProv?.baseUrl ?? '', apiKey: embProv?.apiKey ?? '' },
         defaultModel: chatModel, embeddingModel,
@@ -550,8 +583,43 @@
         <label><input type="checkbox" bind:checked={enableActorTools} /> Actor Tools (create, update, delete actors)</label>
         <label><input type="checkbox" bind:checked={enableItemTools} /> Item Tools (create, update, delete items)</label>
         <label><input type="checkbox" bind:checked={enableMacroTools} /> Macro Tools (create, update, execute macros)</label>
-        <label><input type="checkbox" bind:checked={enableImageTools} /> Image Tools (generate images, create scenes)</label>
+        <label><input type="checkbox" bind:checked={enableImageTools} /> Image Tools (generate images, create scenes, process PDFs)</label>
       </div>
+
+      {#if enableImageTools}
+      <div class="field pdf-upload-field">
+        <label>PDF Library</label>
+        <div class="pdf-upload-row">
+          <span class="pdf-upload-hint">Upload PDFs so the AI can convert them into journal entries.</span>
+          <input
+            bind:this={pdfUploadInput}
+            type="file"
+            accept=".pdf"
+            multiple
+            style="display:none"
+            onchange={handlePdfUpload}
+          />
+          <button
+            class="pdf-upload-btn"
+            onclick={() => pdfUploadInput?.click()}
+            disabled={pdfUploading}
+            title="Upload PDF files to foundry-ai/pdfs/"
+          >
+            {#if pdfUploading}
+              <i class="fas fa-spinner fa-spin"></i> Uploading…
+            {:else}
+              <i class="fas fa-file-pdf"></i> Upload PDFs
+            {/if}
+          </button>
+        </div>
+        {#if pdfUploadResult}
+          <p class="pdf-upload-result" class:success={pdfUploadResult.success} class:error={!pdfUploadResult.success}>
+            {pdfUploadResult.message}
+          </p>
+        {/if}
+      </div>
+      {/if}
+
       {/if}
 
       <div class="field checkbox-field">
@@ -1064,6 +1132,49 @@
   .comfy-workflow-btn:hover {
     background: rgba(139,92,246,0.3);
   }
+
+  .pdf-upload-field { margin-top: 8px; }
+
+  .pdf-upload-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 4px;
+  }
+
+  .pdf-upload-hint {
+    flex: 1;
+    font-size: 11px;
+    color: var(--color-text-dark-5, #888);
+  }
+
+  .pdf-upload-btn {
+    white-space: nowrap;
+    padding: 4px 10px;
+    font-size: 12px;
+    border-radius: 4px;
+    border: 1px solid rgba(239,68,68,0.4);
+    background: rgba(239,68,68,0.12);
+    color: #fca5a5;
+    cursor: pointer;
+  }
+
+  .pdf-upload-btn:hover:not(:disabled) {
+    background: rgba(239,68,68,0.25);
+  }
+
+  .pdf-upload-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .pdf-upload-result {
+    margin: 4px 0 0;
+    font-size: 11px;
+  }
+
+  .pdf-upload-result.success { color: #86efac; }
+  .pdf-upload-result.error { color: #fca5a5; }
 
   .comfy-badge {
     font-size: 0.75em;

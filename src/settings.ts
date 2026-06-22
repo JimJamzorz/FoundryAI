@@ -69,7 +69,7 @@ export function registerSettings(): void {
 	game.settings.register(MODULE_ID, 'apiProviders', {
 		name: 'API Providers',
 		hint: 'List of API providers (name, base URL, API key)',
-		scope: 'world',
+		scope: 'client',
 		config: false,
 		type: Array,
 		default: [],
@@ -78,34 +78,34 @@ export function registerSettings(): void {
 
 	game.settings.register(MODULE_ID, 'chatProvider', {
 		name: 'Chat Provider',
-		scope: 'world', config: false, type: String, default: '',
+		scope: 'client', config: false, type: String, default: '',
 		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'chatProvider') },
 	})
 
 	game.settings.register(MODULE_ID, 'embeddingProvider', {
 		name: 'Embedding Provider',
-		scope: 'world', config: false, type: String, default: '',
+		scope: 'client', config: false, type: String, default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'imageProvider', {
 		name: 'Image Provider',
-		scope: 'world', config: false, type: String, default: '',
+		scope: 'client', config: false, type: String, default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'visionProvider', {
 		name: 'Vision Provider',
-		scope: 'world', config: false, type: String, default: '',
+		scope: 'client', config: false, type: String, default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'ttsProvider', {
 		name: 'TTS Provider',
-		scope: 'world', config: false, type: String, default: '',
+		scope: 'client', config: false, type: String, default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'comfyUrl', {
 		name: 'ComfyUI URL',
 		hint: 'Base URL of your ComfyUI instance. When set, image generation uses ComfyUI instead of the image provider.',
-		scope: 'world', config: false, type: String, default: '',
+		scope: 'client', config: false, type: String, default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'comfyWorkflow', {

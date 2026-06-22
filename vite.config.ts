@@ -21,7 +21,13 @@ function foundryModulePlugin(): Plugin {
 				fs.copyFileSync(path.resolve(langSrc, file), path.resolve(langDst, file))
 			}
 
-			console.log('✔ Copied module.json and languages/ into dist/')
+			// Copy PDF.js worker so it can be loaded at runtime
+			fs.copyFileSync(
+				path.resolve(__dirname, 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs'),
+				path.resolve(distDir, 'pdf.worker.min.mjs'),
+			)
+
+			console.log('✔ Copied module.json, languages/, and pdf.worker.min.mjs into dist/')
 		},
 	}
 }

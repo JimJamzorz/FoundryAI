@@ -86,6 +86,14 @@ Hooks.once('ready', async () => {
 	// Ensure standard journal folders exist
 	await ensureFoundryAIFolders()
 
+	// Ensure file system directories exist for generated content and PDF uploads
+	try {
+		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+		for (const dir of ['foundry-ai', 'foundry-ai/images', 'foundry-ai/maps', 'foundry-ai/pdfs']) {
+			await (FP as any).createDirectory('data', dir).catch(() => {})
+		}
+	} catch { /* non-fatal */ }
+
 	// Create/update the hotbar macro for easy access
 	await ensureChatMacro()
 

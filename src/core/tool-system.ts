@@ -18,7 +18,7 @@ function getFoundryAIFolderIds(): string[] {
 	const ids: string[] = []
 	const root = getRootFolderId()
 	if (root) ids.push(root)
-	for (const key of ['notes', 'chatHistory', 'sessions', 'actors'] as const) {
+	for (const key of ['notes', 'chatHistory', 'sessions', 'actors', 'pdfs'] as const) {
 		const id = getSubfolderId(key)
 		if (id) ids.push(id)
 	}
@@ -116,7 +116,7 @@ const CORE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'search_journals',
 			description:
-				'Semantically search through indexed journal entries (sourcebooks, notes, lore). Returns brief summaries of matching journals. Use get_journal with the documentId to retrieve the full content of a specific entry. Always cite results using the provided uuidRef.',
+				'Semantically search indexed journal entries to find which ones contain relevant information. Returns a documentId and excerpt for each match. Once you have a documentId, call get_journal immediately — do NOT browse folders, list journals, or call process_pdf. Always cite results using the provided uuidRef.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -160,13 +160,13 @@ const CORE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'get_journal',
 			description:
-				'Get the full content of a specific journal entry by its ID. Use this after search_journals to retrieve the complete text of a journal you need to read.',
+				'Retrieve the full text of every page in a journal entry. Accepts either the Foundry document ID or the exact journal name. This is the ONLY tool needed to read journal content — call it directly after search_journals returns a documentId, or directly by name if you already know it.',
 			parameters: {
 				type: 'object',
 				properties: {
 					journal_id: {
 						type: 'string',
-						description: 'The Foundry VTT document ID of the journal entry',
+						description: 'The Foundry document ID of the journal entry, OR the exact journal name',
 					},
 				},
 				required: ['journal_id'],
@@ -1308,6 +1308,65 @@ const MACRO_TOOLS: ToolDefinition[] = [
 	},
 ]
 
+// == PDF Tools ==
+const PDF_TOOLS: ToolDefinition[] = [
+	{
+		type: 'function',
+		function: {
+			name: 'list_pdfs',
+			description: 'List PDF files available in foundry-ai/pdfs/ — the recommended upload location for PDFs to be processed. Returns file paths to use with process_pdf.',
+			parameters: { type: 'object', properties: {} },
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'process_pdf',
+			description: 'Convert a PDF file into a new Foundry journal entry (one page per PDF page). WARNING: This CREATES a new journal — do NOT call it to read or access an existing journal. To read a journal, use get_journal. PDFs should be uploaded to foundry-ai/pdfs/ via the Foundry file browser, then listed with list_pdfs. Pages containing mostly images will say so and can be rendered with render_pdf_page.',
+			parameters: {
+				type: 'object',
+				properties: {
+					pdf_path: { type: 'string', description: 'Path to the PDF — e.g. "foundry-ai/pdfs/rulebook.pdf". Use list_pdfs to see available files.' },
+					journal_name: { type: 'string', description: 'Name for the journal entry to create' },
+					folder_name: { type: 'string', description: 'Journal folder to create the entry in' },
+				},
+				required: ['pdf_path', 'journal_name'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'render_pdf_page',
+			description: 'Render a single PDF page to an image file and save it to Foundry storage. Returns the image path so you can pass it to describe_image to vision-read it, update_actor to use it as a portrait, or update_scene to use it as a map background.',
+			parameters: {
+				type: 'object',
+				properties: {
+					pdf_path: { type: 'string', description: 'Path to the PDF file' },
+					page_number: { type: 'number', description: '1-indexed page number to render' },
+				},
+				required: ['pdf_path', 'page_number'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'extract_pdf_images',
+			description: 'Extract embedded images (maps, illustrations, artwork) from a PDF and save them as PNG files to Foundry storage. Unlike render_pdf_page which captures a whole page, this pulls raw image objects out of the PDF so you get clean maps without text overlays. Use this to rip maps from adventure books for use as scene backgrounds. Returns paths to all extracted images.',
+			parameters: {
+				type: 'object',
+				properties: {
+					pdf_path: { type: 'string', description: 'Path to the PDF file — e.g. "foundry-ai/pdfs/adventure.pdf"' },
+					pages: { type: 'array', items: { type: 'number' }, description: '1-indexed page numbers to extract from. Omit to scan all pages.' },
+					min_size: { type: 'number', description: 'Minimum pixel dimension (width or height) to keep an image. Defaults to 300. Use a larger value to skip decorative borders and icons.' },
+				},
+				required: ['pdf_path'],
+			},
+		},
+	},
+]
+
 // == Image & Scene Generation Tools ==
 const IMAGE_TOOLS: ToolDefinition[] = [
 	{
@@ -1421,6 +1480,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	...ITEM_TOOLS,
 	...MACRO_TOOLS,
 	...IMAGE_TOOLS,
+	...PDF_TOOLS,
 ]
 
 /**
@@ -1443,6 +1503,7 @@ export function getEnabledTools(): ToolDefinition[] {
 	if (getSetting('enableItemTools')) tools.push(...ITEM_TOOLS)
 	if (getSetting('enableMacroTools')) tools.push(...MACRO_TOOLS)
 	if (getSetting('enableImageTools')) tools.push(...IMAGE_TOOLS)
+	if (getSetting('enableImageTools')) tools.push(...PDF_TOOLS)
 
 	return tools
 }
@@ -1614,6 +1675,16 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			case 'execute_macro':
 				return await handleExecuteMacro(args.macro_id)
 
+			// PDF tools
+			case 'list_pdfs':
+				return await handleListPdfs()
+			case 'process_pdf':
+				return await handleProcessPdf(args)
+			case 'render_pdf_page':
+				return await handleRenderPdfPage(args.pdf_path, args.page_number)
+			case 'extract_pdf_images':
+				return await handleExtractPdfImages(args)
+
 			// Image & Scene generation tools
 			case 'list_assets':
 				return await handleListAssets()
@@ -1756,8 +1827,12 @@ async function handleSearchActors(query: string, maxResults?: number): Promise<s
 }
 
 function handleGetJournal(journalId: string): string {
-	console.log(`FoundryAI | get_journal: id="${journalId}"`)
-	const entry = game.journal?.get(journalId)
+	console.log(`FoundryAI | get_journal: id/name="${journalId}"`)
+	// Try by ID first, then fall back to exact name match
+	let entry = game.journal?.get(journalId)
+	if (!entry) {
+		entry = game.journal?.find((j: any) => j.name?.toLowerCase() === journalId.toLowerCase())
+	}
 	if (!entry) {
 		console.log(`FoundryAI | get_journal: not found in game.journal`)
 		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
@@ -3042,14 +3117,23 @@ async function handleCreateActor(
 	if (resolvedFolderId) actorData.folder = resolvedFolderId
 	if (img) actorData.img = img
 
-	// Apply system-specific data using dot-notation expansion
+	// Separate items from the rest of the data — they must be added via createEmbeddedDocuments
+	let itemsToAdd: any[] = []
 	if (data) {
 		for (const [key, value] of Object.entries(data)) {
-			actorData[key] = value
+			if (key === 'items' && Array.isArray(value)) {
+				itemsToAdd = value
+			} else {
+				actorData[key] = value
+			}
 		}
 	}
 
 	const actor = await Actor.create(actorData)
+
+	if (itemsToAdd.length > 0) {
+		await actor.createEmbeddedDocuments('Item', itemsToAdd)
+	}
 
 	return JSON.stringify({
 		success: true,
@@ -3496,6 +3580,322 @@ async function handleDescribeImage(imagePath: string, question?: string): Promis
 		return JSON.stringify({ success: true, description })
 	} catch (error: any) {
 		return JSON.stringify({ error: `Image description failed: ${error.message}` })
+	}
+}
+
+// ===============================
+// PDF TOOL HANDLERS
+// ===============================
+
+async function handleListPdfs(): Promise<string> {
+	try {
+		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+		const browse = await (FP as any).browse('data', 'foundry-ai/pdfs')
+		const pdfs: { path: string; name: string }[] = (browse.files ?? [])
+			.filter((f: string) => f.toLowerCase().endsWith('.pdf'))
+			.map((f: string) => ({ path: f, name: f.split('/').pop() ?? f }))
+
+		if (pdfs.length === 0) return JSON.stringify({
+			pdfs: [],
+			message: 'No PDFs found in foundry-ai/pdfs/. Upload PDF files there via the Foundry file browser (File > Browse Files).',
+		})
+
+		return JSON.stringify({
+			pdfs,
+			message: `Found ${pdfs.length} PDF(s). Use process_pdf with the path to create a journal from one.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `Failed to list PDFs: ${error.message}` })
+	}
+}
+
+async function getPdfjsLib(): Promise<any> {
+	if ((globalThis as any).pdfjsLib) return (globalThis as any).pdfjsLib
+	const pdfjs = await import('pdfjs-dist')
+	// Resolve worker file relative to this module — works wherever Foundry serves the module from
+	pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdf.worker.min.mjs', import.meta.url).href
+	return pdfjs
+}
+
+function escapeHtml(str: string): string {
+	return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+
+async function handleProcessPdf(args: Record<string, any>): Promise<string> {
+	console.log(`FoundryAI | process_pdf: path="${args.pdf_path}"`)
+	try {
+		const pdfjsLib = await getPdfjsLib()
+
+		const pdfUrl = `${window.location.origin}/${args.pdf_path}`
+		const response = await fetch(pdfUrl)
+		if (!response.ok) return JSON.stringify({ error: `Could not fetch PDF: ${response.status} ${response.statusText}` })
+
+		const arrayBuffer = await response.arrayBuffer()
+		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+		const numPages: number = pdf.numPages
+
+		// Default to FoundryAI/PDFs subfolder; override with folder_name if given
+		let folderId: string | null = getSubfolderId('pdfs')
+		if (args.folder_name) {
+			let folder = game.folders?.find((f: any) => f.type === 'JournalEntry' && f.name === args.folder_name)
+			if (!folder) folder = await Folder.create({ name: args.folder_name, type: 'JournalEntry', parent: null } as any)
+			folderId = folder?.id || null
+		}
+
+		const pages: any[] = []
+		let failedCount = 0
+
+		for (let i = 1; i <= numPages; i++) {
+			const page = await pdf.getPage(i)
+
+			// Step 1: try getTextContent — no canvas rendering, no font warnings
+			let pageText = ''
+			try {
+				const content = await page.getTextContent({ normalizeWhitespace: true } as any)
+				const items = (content.items as any[]).filter((item: any) => item.str)
+
+				// Sort top-to-bottom (y descending in PDF coords), then left-to-right
+				items.sort((a: any, b: any) => {
+					const ay = a.transform?.[5] ?? 0
+					const by = b.transform?.[5] ?? 0
+					const yDiff = by - ay
+					if (Math.abs(yDiff) > 3) return yDiff
+					return (a.transform?.[4] ?? 0) - (b.transform?.[4] ?? 0)
+				})
+
+				// Reconstruct text with line/paragraph breaks based on y-gaps and hasEOL
+				let prevY: number | null = null
+				for (const item of items as any[]) {
+					const str: string = item.str || ''
+					if (!str.trim()) continue
+					const y: number = item.transform?.[5] ?? 0
+					if (prevY !== null) {
+						const gap = prevY - y
+						if (gap > 14) pageText += '\n\n'
+						else if (gap > 3 || item.hasEOL) pageText += '\n'
+						else pageText += ' '
+					}
+					pageText += str
+					if (item.hasEOL) prevY = null
+					else prevY = y
+				}
+				pageText = pageText.trim()
+			} catch {
+				pageText = ''
+			}
+
+			let pageHtml: string
+
+			if (pageText.length > 80) {
+				// Sufficient text extracted — convert to HTML paragraphs
+				pageHtml = pageText
+					.split(/\n{2,}/)
+					.map(block => block.replace(/\n/g, ' ').trim())
+					.filter(Boolean)
+					.map(block => `<p>${escapeHtml(block)}</p>`)
+					.join('\n')
+			} else {
+				// Too little text (image-only page or encoding failure) — fall back to vision OCR
+				try {
+					const viewport = page.getViewport({ scale: 2.0 })
+					const canvas = document.createElement('canvas')
+					canvas.width = viewport.width
+					canvas.height = viewport.height
+					const ctx = canvas.getContext('2d')!
+					await page.render({ canvasContext: ctx, viewport }).promise
+					const dataUrl = canvas.toDataURL('image/png')
+
+					const extracted = await openRouterService.describeImage(
+						dataUrl,
+						'Extract every word of text visible on this page. This may be an adventure book page with illustrated panels, numbered sections, stat blocks, or sidebars. Read ALL text including small text inside boxes, choices like "Turn to 37", and captions. Separate blocks with a blank line. Plain text only — no markdown, no HTML.',
+					)
+					pageHtml = extracted
+						.split(/\n{2,}/)
+						.map(block => block.replace(/\n/g, ' ').trim())
+						.filter(Boolean)
+						.map(block => `<p>${escapeHtml(block)}</p>`)
+						.join('\n')
+				} catch {
+					failedCount++
+					pageHtml = `<p>(No extractable text on this page — use <code>render_pdf_page</code> then <code>describe_image</code> to read it manually.)</p>`
+				}
+			}
+
+			const sourceNote = `<p><em>[PDF source: ${args.pdf_path} — Page ${i} of ${numPages}]</em></p>`
+			pages.push({
+				name: `Page ${i}`,
+				type: 'text',
+				text: { content: sourceNote + '\n' + pageHtml, format: 1 },
+				sort: i * 100,
+			})
+		}
+
+		const journalData: any = { name: args.journal_name, pages }
+		if (folderId) journalData.folder = folderId
+
+		const journal = await JournalEntry.create(journalData)
+
+		return JSON.stringify({
+			success: true,
+			journal_id: journal.id,
+			journal_name: journal.name,
+			folder: 'FoundryAI/PDFs',
+			page_count: numPages,
+			failed_pages: failedCount,
+			message: `Created journal "${args.journal_name}" with ${numPages} pages in FoundryAI/PDFs using vision-based text extraction.${failedCount > 0 ? ` ${failedCount} page(s) failed vision extraction — use render_pdf_page on those.` : ''}`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `PDF processing failed: ${error.message}` })
+	}
+}
+
+async function handleRenderPdfPage(pdfPath: string, pageNumber: number): Promise<string> {
+	console.log(`FoundryAI | render_pdf_page: path="${pdfPath}", page=${pageNumber}`)
+	try {
+		const pdfjsLib = await getPdfjsLib()
+		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+
+		const pdfUrl = `${window.location.origin}/${pdfPath}`
+		const response = await fetch(pdfUrl)
+		if (!response.ok) return JSON.stringify({ error: `Could not fetch PDF: ${response.status} ${response.statusText}` })
+
+		const arrayBuffer = await response.arrayBuffer()
+		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+
+		if (pageNumber < 1 || pageNumber > pdf.numPages) {
+			return JSON.stringify({ error: `Page ${pageNumber} is out of range — PDF has ${pdf.numPages} pages.` })
+		}
+
+		const page = await pdf.getPage(pageNumber)
+		const viewport = page.getViewport({ scale: 2.0 })
+
+		const canvas = document.createElement('canvas')
+		canvas.width = viewport.width
+		canvas.height = viewport.height
+		const ctx = canvas.getContext('2d')!
+		await page.render({ canvasContext: ctx, viewport }).promise
+
+		const blob: Blob = await new Promise(resolve => canvas.toBlob(b => resolve(b!), 'image/png'))
+		const filename = `pdf-${promptToSlug(pdfPath)}-p${pageNumber}-${Date.now()}.png`
+		const file = new File([blob], filename, { type: 'image/png' })
+
+		await FP.createDirectory('data', 'foundry-ai').catch(() => {})
+		await FP.createDirectory('data', 'foundry-ai/images').catch(() => {})
+		const uploadResult = await FP.upload('data', 'foundry-ai/images', file, {}, { notify: false })
+		const savedPath = (uploadResult as any)?.path || `foundry-ai/images/${filename}`
+
+		return JSON.stringify({
+			success: true,
+			path: savedPath,
+			page: pageNumber,
+			total_pages: pdf.numPages,
+			message: `Rendered page ${pageNumber} of ${pdf.numPages} to ${savedPath}. Use describe_image to analyse it, update_actor to use it as a portrait, or update_scene to use it as a map background.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `PDF page render failed: ${error.message}` })
+	}
+}
+
+async function handleExtractPdfImages(args: Record<string, any>): Promise<string> {
+	console.log(`FoundryAI | extract_pdf_images: path="${args.pdf_path}"`)
+	try {
+		const pdfjsLib = await getPdfjsLib()
+		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+
+		const pdfUrl = `${window.location.origin}/${args.pdf_path}`
+		const response = await fetch(pdfUrl)
+		if (!response.ok) return JSON.stringify({ error: `Could not fetch PDF: ${response.status} ${response.statusText}` })
+
+		const arrayBuffer = await response.arrayBuffer()
+		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+		const numPages: number = pdf.numPages
+		const minSize: number = args.min_size ?? 300
+
+		const pagesToProcess: number[] = args.pages
+			? (args.pages as number[]).filter((n: number) => n >= 1 && n <= numPages)
+			: Array.from({ length: numPages }, (_, i) => i + 1)
+
+		await FP.createDirectory('data', 'foundry-ai').catch(() => {})
+		await FP.createDirectory('data', 'foundry-ai/images').catch(() => {})
+
+		const savedImages: Array<{ path: string; page: number; width: number; height: number }> = []
+		const slug = promptToSlug(args.pdf_path)
+
+		for (const pageNum of pagesToProcess) {
+			const page = await pdf.getPage(pageNum)
+			const opList = await page.getOperatorList()
+
+			// Collect unique image XObject names from this page
+			const seen = new Set<string>()
+			const imgOps = [pdfjsLib.OPS.paintImageXObject, pdfjsLib.OPS.paintJpegXObject].filter(Boolean)
+			for (let i = 0; i < opList.fnArray.length; i++) {
+				if (imgOps.includes(opList.fnArray[i])) {
+					const name: string = opList.argsArray[i][0]
+					seen.add(name)
+				}
+			}
+
+			let imgIndex = 0
+			for (const imgName of seen) {
+				const imgData = await new Promise<any>((resolve) => {
+					;(page as any).objs.get(imgName, resolve)
+				})
+
+				if (!imgData || imgData.width < minSize || imgData.height < minSize) continue
+
+				const canvas = document.createElement('canvas')
+				canvas.width = imgData.width
+				canvas.height = imgData.height
+				const ctx = canvas.getContext('2d')!
+
+				let pixelData: Uint8ClampedArray
+				if (imgData.kind === 3) {
+					// RGBA_32BPP — copy to ensure plain ArrayBuffer (not SharedArrayBuffer)
+					pixelData = new Uint8ClampedArray(imgData.data)
+				} else if (imgData.kind === 2) {
+					// RGB_24BPP — expand to RGBA
+					const src = imgData.data
+					pixelData = new Uint8ClampedArray(imgData.width * imgData.height * 4)
+					for (let j = 0; j < imgData.width * imgData.height; j++) {
+						pixelData[j * 4] = src[j * 3]
+						pixelData[j * 4 + 1] = src[j * 3 + 1]
+						pixelData[j * 4 + 2] = src[j * 3 + 2]
+						pixelData[j * 4 + 3] = 255
+					}
+				} else {
+					continue
+				}
+
+				ctx.putImageData(new ImageData(pixelData, imgData.width, imgData.height), 0, 0)
+
+				const blob: Blob = await new Promise(resolve => canvas.toBlob(b => resolve(b!), 'image/png'))
+				const filename = `pdf-${slug}-p${pageNum}-img${++imgIndex}-${Date.now()}.png`
+				const file = new File([blob], filename, { type: 'image/png' })
+
+				const uploadResult = await FP.upload('data', 'foundry-ai/images', file, {}, { notify: false })
+				const savedPath = (uploadResult as any)?.path || `foundry-ai/images/${filename}`
+				savedImages.push({ path: savedPath, page: pageNum, width: imgData.width, height: imgData.height })
+			}
+		}
+
+		if (savedImages.length === 0) {
+			return JSON.stringify({
+				success: true,
+				extracted_count: 0,
+				images: [],
+				message: `No embedded images found larger than ${minSize}px on the scanned pages. The PDF may use vector art or the images may be smaller than min_size. Try render_pdf_page to capture a whole page instead.`,
+			})
+		}
+
+		return JSON.stringify({
+			success: true,
+			extracted_count: savedImages.length,
+			images: savedImages,
+			message: `Extracted ${savedImages.length} image(s). Use update_scene with the path field to set one as a map background.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `PDF image extraction failed: ${error.message}` })
 	}
 }
 

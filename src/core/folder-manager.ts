@@ -18,6 +18,7 @@ export const SUBFOLDER_NAMES = {
 	chatHistory: 'Chat History',
 	sessions: 'Sessions',
 	actors: 'Actors',
+	pdfs: 'PDFs',
 } as const
 
 export type SubfolderKey = keyof typeof SUBFOLDER_NAMES
