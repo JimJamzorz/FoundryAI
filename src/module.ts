@@ -70,17 +70,34 @@ Hooks.once('ready', async () => {
 		}
 	}
 
+	// Start MCP bridge if enabled
+	if (getSetting('mcpBridgeEnabled')) {
+		const mcpUrl = getSetting('mcpServerUrl') || 'ws://localhost:3001'
+		const { initMCPBridge } = await import('@core/mcp-bridge')
+		initMCPBridge(mcpUrl)
+		console.log(`FoundryAI | MCP bridge started → ${mcpUrl}`)
+	}
+
 	// Expose public API
 	game.foundryAI = {
 		chat: publicChat,
 		openChat: () => openPopoutChat(ChatWindow),
 		reindex: publicReindex,
 		generateSessionRecap: publicGenerateRecap,
+		getMCPBridge: () => import('@core/mcp-bridge').then(m => m.mcpBridge),
 	}
 
 	// Listen for settings changes
-	Hooks.on(`${MODULE_ID}.settingsChanged`, (key: string) => {
+	Hooks.on(`${MODULE_ID}.settingsChanged`, async (key: string) => {
 		if (key === 'apiProviders' || key === 'chatProvider') configureServiceFromSettings()
+		if (key === 'mcpBridgeEnabled' || key === 'mcpServerUrl') {
+			const { mcpBridge: bridge, initMCPBridge } = await import('@core/mcp-bridge')
+			if (getSetting('mcpBridgeEnabled')) {
+				initMCPBridge(getSetting('mcpServerUrl') || 'ws://localhost:3001')
+			} else {
+				bridge?.stop()
+			}
+		}
 	})
 
 	// Ensure standard journal folders exist

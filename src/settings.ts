@@ -16,6 +16,8 @@ export interface ApiProvider {
 }
 
 export interface FoundryAISettings {
+	mcpBridgeEnabled: boolean
+	mcpServerUrl: string
 	apiProviders: ApiProvider[]
 	chatProvider: string
 	embeddingProvider: string
@@ -64,6 +66,28 @@ export interface FoundryAISettings {
 }
 
 export function registerSettings(): void {
+	// ---- MCP Bridge ----
+
+	game.settings.register(MODULE_ID, 'mcpBridgeEnabled', {
+		name: 'Enable MCP Bridge',
+		hint: 'Connect to an external MCP server so Claude Code / Claude Desktop can call FoundryAI tools.',
+		scope: 'world',
+		config: true,
+		type: Boolean,
+		default: false,
+		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'mcpBridgeEnabled') },
+	})
+
+	game.settings.register(MODULE_ID, 'mcpServerUrl', {
+		name: 'MCP Server URL',
+		hint: 'WebSocket URL of the MCP server (e.g. ws://localhost:3001)',
+		scope: 'world',
+		config: true,
+		type: String,
+		default: 'ws://localhost:3001',
+		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'mcpServerUrl') },
+	})
+
 	// ---- API Providers ----
 
 	game.settings.register(MODULE_ID, 'apiProviders', {

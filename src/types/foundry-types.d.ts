@@ -41,6 +41,7 @@ interface FoundryAIApi {
 	openChat: () => void
 	reindex: () => Promise<void>
 	generateSessionRecap: () => Promise<void>
+	getMCPBridge: () => Promise<import('../core/mcp-bridge').MCPBridge | null>
 }
 
 interface User {
