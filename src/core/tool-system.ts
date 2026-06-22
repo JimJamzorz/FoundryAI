@@ -1397,7 +1397,7 @@ const PDF_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'extract_pdf_images',
-			description: 'Extract embedded images (maps, illustrations, artwork) from a PDF and save them as PNG files to Foundry storage. Unlike render_pdf_page which captures a whole page, this pulls raw image objects out of the PDF so you get clean maps without text overlays. Use this to rip maps from adventure books for use as scene backgrounds. Returns paths to all extracted images.',
+			description: 'Extract embedded images (maps, illustrations, artwork) from a PDF and save them as PNG files to Foundry storage. Unlike render_pdf_page which captures a whole page, this pulls raw image objects out of the PDF so you get clean maps without text overlays. Use this to rip maps from adventure books for use as scene backgrounds. Returns paths to all extracted images; use organize_images afterwards to classify and rename them.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1439,6 +1439,21 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 					},
 				},
 				required: ['image_path'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'organize_images',
+			description: 'Use vision AI to classify image assets, move them into category subfolders, and rename them descriptively. Use after extract_pdf_images or for any existing Foundry image assets. Makes one vision request per image.',
+			parameters: {
+				type: 'object',
+				properties: {
+					image_paths: { type: 'array', items: { type: 'string' }, description: 'Paths of the images to organize, such as paths returned by extract_pdf_images.' },
+					destination_root: { type: 'string', description: 'Optional folder to organize into. Defaults to each image’s current folder.' },
+				},
+				required: ['image_paths'],
 			},
 		},
 	},
@@ -1588,27 +1603,51 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	...PDF_TOOLS,
 ]
 
+export type ToolGroupId = 'all' | 'campaign' | 'world' | 'gameplay' | 'automation'
+
+export const TOOL_GROUPS: Array<{ id: ToolGroupId; label: string; description: string }> = [
+	{ id: 'all', label: 'All tools', description: 'Every enabled tool' },
+	{ id: 'campaign', label: 'Campaign', description: 'Journals, actors, items, and compendiums' },
+	{ id: 'world', label: 'World & assets', description: 'Scenes, maps, images, PDFs, and spatial tools' },
+	{ id: 'gameplay', label: 'Gameplay', description: 'Dice, tokens, combat, audio, and chat' },
+	{ id: 'automation', label: 'Automation', description: 'Macros and chat controls' },
+]
+
 /**
- * Get only the enabled tool definitions based on user settings.
+ * Get enabled tool definitions for a focused chat preset. Core search and
+ * document tools are included in every preset so the model can use world context.
  */
-export function getEnabledTools(): ToolDefinition[] {
+export function getEnabledTools(group: ToolGroupId = 'all'): ToolDefinition[] {
 	if (!getSetting('enableTools')) return []
 
-	const tools: ToolDefinition[] = [...CORE_TOOLS, ...CAMPAIGN_TOOLS]
+	const tools: ToolDefinition[] = [...CORE_TOOLS]
+	const include = (id: ToolGroupId) => group === 'all' || group === id
 
-	if (getSetting('enableSceneTools')) tools.push(...SCENE_TOOLS)
-	if (getSetting('enableDiceTools')) tools.push(...DICE_TOOLS)
-	if (getSetting('enableTokenTools')) tools.push(...TOKEN_TOOLS)
-	if (getSetting('enableCombatTools')) tools.push(...COMBAT_TOOLS)
-	if (getSetting('enableAudioTools')) tools.push(...AUDIO_TOOLS)
-	if (getSetting('enableChatTools')) tools.push(...CHAT_TOOLS)
-	if (getSetting('enableCompendiumTools')) tools.push(...COMPENDIUM_TOOLS)
-	if (getSetting('enableSpatialTools')) tools.push(...SPATIAL_TOOLS)
-	if (getSetting('enableActorTools')) tools.push(...ACTOR_TOOLS)
-	if (getSetting('enableItemTools')) tools.push(...ITEM_TOOLS)
-	if (getSetting('enableMacroTools')) tools.push(...MACRO_TOOLS)
-	if (getSetting('enableImageTools')) tools.push(...IMAGE_TOOLS)
-	if (getSetting('enableImageTools')) tools.push(...PDF_TOOLS)
+	if (include('campaign')) {
+		tools.push(...CAMPAIGN_TOOLS)
+		if (getSetting('enableCompendiumTools')) tools.push(...COMPENDIUM_TOOLS)
+		if (getSetting('enableActorTools')) tools.push(...ACTOR_TOOLS)
+		if (getSetting('enableItemTools')) tools.push(...ITEM_TOOLS)
+	}
+
+	if (include('world')) {
+		if (getSetting('enableSceneTools')) tools.push(...SCENE_TOOLS)
+		if (getSetting('enableSpatialTools')) tools.push(...SPATIAL_TOOLS)
+		if (getSetting('enableImageTools')) tools.push(...IMAGE_TOOLS, ...PDF_TOOLS)
+	}
+
+	if (include('gameplay')) {
+		if (getSetting('enableDiceTools')) tools.push(...DICE_TOOLS)
+		if (getSetting('enableTokenTools')) tools.push(...TOKEN_TOOLS)
+		if (getSetting('enableCombatTools')) tools.push(...COMBAT_TOOLS)
+		if (getSetting('enableAudioTools')) tools.push(...AUDIO_TOOLS)
+		if (getSetting('enableChatTools')) tools.push(...CHAT_TOOLS)
+	}
+
+	if (include('automation')) {
+		if (getSetting('enableMacroTools')) tools.push(...MACRO_TOOLS)
+		if (getSetting('enableChatTools')) tools.push(...CHAT_TOOLS)
+	}
 
 	return tools
 }
@@ -1799,6 +1838,8 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handleListAssets()
 			case 'describe_image':
 				return await handleDescribeImage(args.image_path, args.question)
+			case 'organize_images':
+				return await handleOrganizeImages(args.image_paths, args.destination_root)
 			case 'generate_image':
 				return await handleGenerateImage(args.prompt, args.size)
 			case 'generate_scene':
@@ -3854,6 +3895,69 @@ async function handleDescribeImage(imagePath: string, question?: string): Promis
 	}
 }
 
+async function handleOrganizeImages(imagePaths: unknown, destinationRoot?: string): Promise<string> {
+	if (!Array.isArray(imagePaths) || imagePaths.length === 0) {
+		return JSON.stringify({ error: 'image_paths must contain at least one image path.' })
+	}
+
+	console.log(`FoundryAI | organize_images: organizing ${imagePaths.length} image(s)${destinationRoot ? ` into "${destinationRoot}"` : ''}`)
+	const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+	const results: Array<Record<string, any>> = []
+
+	for (const imagePath of imagePaths) {
+		if (typeof imagePath !== 'string' || !imagePath.trim()) {
+			results.push({ success: false, error: 'Invalid image path.' })
+			continue
+		}
+
+		try {
+			const sourcePath = imagePath.trim()
+			const sourceName = sourcePath.split('/').pop() || 'image'
+			const sourceDirectory = sourcePath.slice(0, sourcePath.lastIndexOf('/'))
+			const rootDirectory = destinationRoot?.trim().replace(/\/+$/, '') || sourceDirectory
+			const imageUrl = `${window.location.origin}/${sourcePath}`
+			console.log(`FoundryAI | organize_images: fetching "${sourcePath}"`)
+			const response = await fetch(imageUrl)
+			if (!response.ok) throw new Error(`Could not fetch image: ${response.status} ${response.statusText}`)
+
+			const blob = await response.blob()
+			const organization = await classifyImageForOrganization(blob, sourceName)
+			const targetDirectory = `${rootDirectory}/${organization.category}`
+			const extension = sourceName.match(/\.[a-z0-9]+$/i)?.[0] || (blob.type === 'image/jpeg' ? '.jpg' : '.png')
+			const filename = `${promptToSlug(organization.name)}-${Date.now()}${extension}`
+			const file = new File([blob], filename, { type: blob.type || 'image/png' })
+
+			await FP.createDirectory('data', rootDirectory).catch(() => {})
+			await FP.createDirectory('data', targetDirectory).catch(() => {})
+			console.log(`FoundryAI | organize_images: saving "${sourcePath}" as "${targetDirectory}/${filename}"`)
+			const uploadResult = await FP.upload('data', targetDirectory, file, {}, { notify: false })
+			const savedPath = (uploadResult as any)?.path || `${targetDirectory}/${filename}`
+
+			let moved = false
+			if (typeof (FP as any).delete === 'function') {
+				await (FP as any).delete('data', sourcePath)
+				moved = true
+			} else {
+				console.warn(`FoundryAI | organize_images: FilePicker.delete is unavailable; kept original "${sourcePath}" after saving organized copy`)
+			}
+
+			results.push({ success: true, original_path: sourcePath, path: savedPath, moved, category: organization.category, name: organization.name, description: organization.description })
+		} catch (error: any) {
+			console.error(`FoundryAI | organize_images: failed for "${imagePath}"`, error)
+			results.push({ success: false, original_path: imagePath, error: error.message })
+		}
+	}
+
+	const organizedCount = results.filter(result => result.success).length
+	return JSON.stringify({
+		success: organizedCount > 0,
+		organized_count: organizedCount,
+		failed_count: results.length - organizedCount,
+		images: results,
+		message: `Organized ${organizedCount} of ${results.length} image(s) into vision-detected categories.`,
+	})
+}
+
 // ===============================
 // PDF TOOL HANDLERS
 // ===============================
@@ -4068,34 +4172,83 @@ async function handleRenderPdfPage(pdfPath: string, pageNumber: number): Promise
 	}
 }
 
+type ImageOrganization = {
+	category: 'maps' | 'portraits' | 'tokens' | 'handouts' | 'items' | 'artwork' | 'textures' | 'other'
+	name: string
+	description: string
+}
+
+async function classifyImageForOrganization(blob: Blob, imageName: string): Promise<ImageOrganization> {
+	const fallback: ImageOrganization = {
+		category: 'other',
+		name: imageName.replace(/\.[^.]+$/, ''),
+		description: 'Image asset; vision classification was unavailable.',
+	}
+
+	try {
+		const base64 = await new Promise<string>((resolve, reject) => {
+			const reader = new FileReader()
+			reader.onload = () => resolve(reader.result as string)
+			reader.onerror = reject
+			reader.readAsDataURL(blob)
+		})
+		const response = await openRouterService.describeImage(base64,
+			'Classify this tabletop RPG asset for a Foundry VTT library. Return only JSON with "category", "name", and "description". category must be one of: maps, portraits, tokens, handouts, items, artwork, textures, other. name must be a concise descriptive filename stem (3-8 words; no extension). description must briefly say what it depicts and how it can be used in a game.')
+		const match = response.match(/\{[\s\S]*\}/)
+		const classification = match ? JSON.parse(match[0]) : null
+		const validCategories = new Set<ImageOrganization['category']>(['maps', 'portraits', 'tokens', 'handouts', 'items', 'artwork', 'textures', 'other'])
+		const category = validCategories.has(classification?.category) ? classification.category : fallback.category
+		const name = typeof classification?.name === 'string' && classification.name.trim() ? classification.name.trim() : fallback.name
+		const description = typeof classification?.description === 'string' && classification.description.trim() ? classification.description.trim() : fallback.description
+		return { category, name, description }
+	} catch (error) {
+		console.warn(`FoundryAI | organize_images: vision classification failed for image "${imageName}"; using fallback`, error)
+		return fallback
+	}
+}
+
 async function handleExtractPdfImages(args: Record<string, any>): Promise<string> {
 	console.log(`FoundryAI | extract_pdf_images: path="${args.pdf_path}"`)
 	try {
+		console.log('FoundryAI | extract_pdf_images: loading PDF.js')
 		const pdfjsLib = await getPdfjsLib()
+		console.log('FoundryAI | extract_pdf_images: PDF.js loaded')
 		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
 
 		const pdfUrl = `${window.location.origin}/${args.pdf_path}`
+		console.log(`FoundryAI | extract_pdf_images: fetching PDF from "${pdfUrl}"`)
 		const response = await fetch(pdfUrl)
+		console.log(`FoundryAI | extract_pdf_images: fetch completed (${response.status} ${response.statusText})`)
 		if (!response.ok) return JSON.stringify({ error: `Could not fetch PDF: ${response.status} ${response.statusText}` })
 
 		const arrayBuffer = await response.arrayBuffer()
+		console.log(`FoundryAI | extract_pdf_images: read PDF body (${arrayBuffer.byteLength} bytes); loading document`)
 		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
 		const numPages: number = pdf.numPages
 		const minSize: number = args.min_size ?? 300
+		const imageResolveTimeoutMs = 10_000
 
 		const pagesToProcess: number[] = args.pages
 			? (args.pages as number[]).filter((n: number) => n >= 1 && n <= numPages)
 			: Array.from({ length: numPages }, (_, i) => i + 1)
+		console.log(`FoundryAI | extract_pdf_images: PDF loaded (${numPages} page(s)); processing pages [${pagesToProcess.join(', ')}] with min_size=${minSize}`)
+		const slug = promptToSlug(args.pdf_path)
+		const outputDirectory = `foundry-ai/images/${slug}`
 
+		console.log('FoundryAI | extract_pdf_images: ensuring output directories exist')
 		await FP.createDirectory('data', 'foundry-ai').catch(() => {})
 		await FP.createDirectory('data', 'foundry-ai/images').catch(() => {})
+		await FP.createDirectory('data', outputDirectory).catch(() => {})
+		console.log(`FoundryAI | extract_pdf_images: output directory ready at "${outputDirectory}"`)
 
 		const savedImages: Array<{ path: string; page: number; width: number; height: number }> = []
-		const slug = promptToSlug(args.pdf_path)
 
 		for (const pageNum of pagesToProcess) {
+			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: loading page`)
 			const page = await pdf.getPage(pageNum)
+			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: building operator list`)
 			const opList = await page.getOperatorList()
+			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: operator list ready (${opList.fnArray.length} operation(s))`)
 
 			// Collect unique image XObject names from this page
 			const seen = new Set<string>()
@@ -4106,21 +4259,40 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 					seen.add(name)
 				}
 			}
+			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: found ${seen.size} unique image XObject(s)`)
 
 			let imgIndex = 0
 			for (const imgName of seen) {
-				const imgData = await new Promise<any>((resolve) => {
-					;(page as any).objs.get(imgName, resolve)
-				})
+				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: resolving image "${imgName}"`)
+				const imgData = await new Promise<any | undefined>((resolve) => {
+					let settled = false
+					const timeoutId = window.setTimeout(() => {
+						if (settled) return
+						settled = true
+						console.warn(`FoundryAI | extract_pdf_images: page ${pageNum}: timed out after ${imageResolveTimeoutMs}ms resolving image "${imgName}"; skipping it`)
+						resolve(undefined)
+					}, imageResolveTimeoutMs)
 
-				if (!imgData || imgData.width < minSize || imgData.height < minSize) continue
+					;(page as any).objs.get(imgName, (data: any) => {
+						if (settled) return
+						settled = true
+						window.clearTimeout(timeoutId)
+						resolve(data)
+					})
+				})
+				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: image "${imgName}" resolved (${imgData?.width ?? 'unknown'}x${imgData?.height ?? 'unknown'}, kind=${imgData?.kind ?? 'unknown'}, bitmap=${Boolean(imgData?.bitmap)})`)
+
+				if (!imgData || imgData.width < minSize || imgData.height < minSize) {
+					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: skipping image "${imgName}" (missing or below min_size)`)
+					continue
+				}
 
 				const canvas = document.createElement('canvas')
 				canvas.width = imgData.width
 				canvas.height = imgData.height
 				const ctx = canvas.getContext('2d')!
 
-				let pixelData!: Uint8ClampedArray<ArrayBuffer>
+				let pixelData: Uint8ClampedArray<ArrayBuffer> | undefined
 				if (imgData.kind === 3) {
 					// RGBA_32BPP — copy to ensure plain ArrayBuffer (not SharedArrayBuffer)
 					pixelData = new Uint8ClampedArray(imgData.data) as Uint8ClampedArray<ArrayBuffer>
@@ -4134,20 +4306,33 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 						pixelData[j * 4 + 2] = src[j * 3 + 2]
 						pixelData[j * 4 + 3] = 255
 					}
+				}
+
+				if (pixelData) {
+					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: drawing raw pixel data for image "${imgName}" to canvas`)
+					ctx.putImageData(new ImageData(pixelData, imgData.width, imgData.height), 0, 0)
+				} else if (imgData.bitmap) {
+					// Modern PDF.js commonly transfers decoded images as ImageBitmap objects.
+					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: drawing ImageBitmap for image "${imgName}" to canvas`)
+					ctx.drawImage(imgData.bitmap as CanvasImageSource, 0, 0, imgData.width, imgData.height)
 				} else {
+					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: skipping image "${imgName}" (unsupported pixel format kind=${imgData.kind})`)
 					continue
 				}
 
-				ctx.putImageData(new ImageData(pixelData, imgData.width, imgData.height), 0, 0)
-
+				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: encoding image "${imgName}" as PNG`)
 				const blob: Blob = await new Promise(resolve => canvas.toBlob(b => resolve(b!), 'image/png'))
-				const filename = `pdf-${slug}-p${pageNum}-img${++imgIndex}-${Date.now()}.png`
+				const imageNumber = ++imgIndex
+				const filename = `pdf-${slug}-p${pageNum}-img${imageNumber}-${Date.now()}.png`
 				const file = new File([blob], filename, { type: 'image/png' })
 
-				const uploadResult = await FP.upload('data', 'foundry-ai/images', file, {}, { notify: false })
-				const savedPath = (uploadResult as any)?.path || `foundry-ai/images/${filename}`
+				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: uploading image "${imgName}" as "${outputDirectory}/${filename}" (${blob.size} bytes)`)
+				const uploadResult = await FP.upload('data', outputDirectory, file, {}, { notify: false })
+				const savedPath = (uploadResult as any)?.path || `${outputDirectory}/${filename}`
 				savedImages.push({ path: savedPath, page: pageNum, width: imgData.width, height: imgData.height })
+				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: saved image "${imgName}" to "${savedPath}"`)
 			}
+			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: complete (${imgIndex} eligible image(s))`)
 		}
 
 		if (savedImages.length === 0) {
@@ -4163,9 +4348,10 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 			success: true,
 			extracted_count: savedImages.length,
 			images: savedImages,
-			message: `Extracted ${savedImages.length} image(s). Use update_scene with the path field to set one as a map background.`,
+			message: `Extracted ${savedImages.length} image(s). Use organize_images to classify and rename them, or update_scene with a path to set one as a map background.`,
 		})
 	} catch (error: any) {
+		console.error('FoundryAI | extract_pdf_images: failed', error)
 		return JSON.stringify({ error: `PDF image extraction failed: ${error.message}` })
 	}
 }

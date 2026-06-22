@@ -5,7 +5,7 @@
   import { chatSessionManager } from '@core/chat-session-manager';
   import { sessionRecapManager, type RecapProgress } from '@core/session-recap-manager';
   import { embeddingService } from '@core/embedding-service';
-  import { getEnabledTools, executeTool } from '@core/tool-system';
+  import { getEnabledTools, executeTool, TOOL_GROUPS, type ToolGroupId } from '@core/tool-system';
   import { buildSystemPrompt, buildActorRoleplayPrompt, type ActorRoleplayContext } from '@core/system-prompt';
   import { estimateTokens, getModelContextLimit } from '@core/token-estimator';
   import { summarizeConversation } from '@core/context-summarizer';
@@ -37,6 +37,7 @@
   let recapProgress = $state<RecapProgress | null>(null);
   let isIndexing = $state(false);
   let indexProgress = $state('');
+  let selectedToolGroup = $state<ToolGroupId>('all');
 
   // Actor roleplay state
   let currentActorId = $state<string | null>(null);
@@ -364,12 +365,12 @@ IMPORTANT: You already have all the information you need about this character fr
       const stream = getSetting('streamResponses');
       const useTools = getSetting('enableTools');
 
-      console.log(`FoundryAI | Sending message — model: ${model}, stream: ${stream}, tools: ${useTools}, messages: ${apiMessages.length}, actor: ${currentActorId || 'none'}`);
+      console.log(`FoundryAI | Sending message — model: ${model}, stream: ${stream}, tools: ${useTools ? selectedToolGroup : 'disabled'}, messages: ${apiMessages.length}, actor: ${currentActorId || 'none'}`);
 
       if (stream) {
-        await handleStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, abortController.signal);
+        await handleStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, selectedToolGroup, abortController.signal);
       } else {
-        await handleNonStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, abortController.signal);
+        await handleNonStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, selectedToolGroup, abortController.signal);
       }
 
       // Save full conversation to session
@@ -484,6 +485,7 @@ IMPORTANT: You already have all the information you need about this character fr
     temperature: number,
     maxTokens: number,
     useTools: boolean,
+    toolGroup: ToolGroupId,
     signal?: AbortSignal,
   ) {
     let fullContent = '';
@@ -539,7 +541,7 @@ IMPORTANT: You already have all the information you need about this character fr
         messages: apiMessages,
         temperature,
         max_tokens: maxTokens,
-        tools: useTools ? getEnabledTools() : undefined,
+        tools: useTools ? getEnabledTools(toolGroup) : undefined,
         tool_choice: useTools ? 'auto' : undefined,
       },
       onChunk,
@@ -557,7 +559,7 @@ IMPORTANT: You already have all the information you need about this character fr
       if (valid.length > 0) {
         console.log('FoundryAI | Executing streamed tool calls:', valid.map(tc => `${tc.function.name}(${tc.function.arguments.slice(0, 100)}...)`));
         const assistantMessage = { content: fullContent || null, tool_calls: valid };
-        await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, 0, signal);
+        await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, toolGroup, 0, signal);
       } else {
         console.warn('FoundryAI | All streamed tool calls had missing names, treating as text response');
         const msg: LLMMessage = { role: 'assistant', content: fullContent || '⚠️ Tool call failed — the model returned an invalid response.' };
@@ -581,6 +583,7 @@ IMPORTANT: You already have all the information you need about this character fr
     temperature: number,
     maxTokens: number,
     useTools: boolean,
+    toolGroup: ToolGroupId,
     signal?: AbortSignal,
   ) {
     const response = await openRouterService.chatCompletion(
@@ -589,7 +592,7 @@ IMPORTANT: You already have all the information you need about this character fr
         messages: apiMessages,
         temperature,
         max_tokens: maxTokens,
-        tools: useTools ? getEnabledTools() : undefined,
+        tools: useTools ? getEnabledTools(toolGroup) : undefined,
         tool_choice: useTools ? 'auto' : undefined,
       },
       signal,
@@ -604,7 +607,7 @@ IMPORTANT: You already have all the information you need about this character fr
     });
 
     if (assistantMessage?.tool_calls?.length) {
-      await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, 0, signal);
+      await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, toolGroup, 0, signal);
     } else {
       const msg: LLMMessage = { role: 'assistant', content: assistantMessage?.content || '' };
       messages = [...messages, msg];
@@ -622,6 +625,7 @@ IMPORTANT: You already have all the information you need about this character fr
     model: string,
     temperature: number,
     maxTokens: number,
+    toolGroup: ToolGroupId,
     depth: number = 0,
     signal?: AbortSignal,
   ) {
@@ -689,7 +693,7 @@ IMPORTANT: You already have all the information you need about this character fr
         messages: continuedMessages,
         temperature,
         max_tokens: maxTokens,
-        tools: getEnabledTools(),
+        tools: getEnabledTools(toolGroup),
         tool_choice: 'auto',
       },
       signal,
@@ -705,7 +709,7 @@ IMPORTANT: You already have all the information you need about this character fr
 
     if (nextMessage?.tool_calls?.length) {
       // Recursive tool calls
-      await handleToolCalls(nextMessage, continuedMessages, model, temperature, maxTokens, depth + 1, signal);
+      await handleToolCalls(nextMessage, continuedMessages, model, temperature, maxTokens, toolGroup, depth + 1, signal);
     } else {
       messages = [...messages, { role: 'assistant', content: nextMessage?.content || '' }];
     }
@@ -1195,6 +1199,17 @@ IMPORTANT: You already have all the information you need about this character fr
 
     <!-- Input Area -->
     <div class="input-area">
+      <select
+        class="tool-group-select"
+        bind:value={selectedToolGroup}
+        disabled={isGenerating || !hasApiKey}
+        title="Choose which tool set is available for this message"
+        aria-label="Tool set"
+      >
+        {#each TOOL_GROUPS as group}
+          <option value={group.id} title={group.description}>{group.label}</option>
+        {/each}
+      </select>
       <textarea
         bind:this={inputEl}
         bind:value={inputText}
@@ -1633,6 +1648,30 @@ IMPORTANT: You already have all the information you need about this character fr
     padding: 8px;
     border-top: 1px solid rgba(255, 255, 255, 0.08);
     background: rgba(0, 0, 0, 0.2);
+  }
+
+  .tool-group-select {
+    width: 116px;
+    min-height: 38px;
+    flex-shrink: 0;
+    padding: 0 8px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.06);
+    color: inherit;
+    font-family: inherit;
+    font-size: 0.78em;
+    cursor: pointer;
+  }
+
+  .tool-group-select:focus {
+    outline: none;
+    border-color: rgba(139, 92, 246, 0.5);
+  }
+
+  .tool-group-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   .input-area textarea {

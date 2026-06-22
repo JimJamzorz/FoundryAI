@@ -14,7 +14,11 @@
 		"link": "node scripts/link-module.mjs",
 		"package": "node scripts/package-module.mjs",
 		"release": "node scripts/release.mjs",
-		"publish": "node scripts/publish.mjs"
+		"publish": "node scripts/publish.mjs",
+		"server:install": "cd server && npm install",
+		"server:build": "cd server && npm run build",
+		"server:start": "cd server && npm run start",
+		"server:bundle": "cd server && npm run build:bundle"
 	},
 	"devDependencies": {
 		"@sveltejs/vite-plugin-svelte": "^5.0.0",

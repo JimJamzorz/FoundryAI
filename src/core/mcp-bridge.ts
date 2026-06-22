@@ -1,4 +1,4 @@
-import { executeTool } from './tool-system'
+import { executeTool, TOOL_DEFINITIONS } from './tool-system'
 import type { ToolCall } from './openrouter-service'
 
 const TOOL_PREFIX = 'foundry-ai.tool.'
@@ -85,6 +85,12 @@ export class MCPBridge {
 		// Handle ping
 		if (method === 'foundry-mcp-bridge.ping' || method === 'foundry-ai.ping') {
 			this.send({ type: 'mcp-response', id, data: { success: true, data: { pong: true } } })
+			return
+		}
+
+		// Return FoundryAI's tool list so the MCP server can expose it to Claude Desktop
+		if (method === 'foundry-ai.get_tools') {
+			this.send({ type: 'mcp-response', id, data: { success: true, data: JSON.stringify(TOOL_DEFINITIONS) } })
 			return
 		}
 
