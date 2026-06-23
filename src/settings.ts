@@ -82,11 +82,11 @@ export function registerSettings(): void {
 
 	game.settings.register(MODULE_ID, 'mcpServerUrl', {
 		name: 'MCP Server URL',
-		hint: 'WebSocket URL of the MCP server (e.g. ws://localhost:3001)',
+		hint: 'WebSocket URL of the MCP server (e.g. ws://localhost:31415)',
 		scope: 'world',
 		config: true,
 		type: String,
-		default: 'ws://localhost:3001',
+		default: 'ws://localhost:31415',
 		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'mcpServerUrl') },
 	})
 
