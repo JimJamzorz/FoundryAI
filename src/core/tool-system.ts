@@ -4,7 +4,7 @@
 
 import { embeddingService } from './embedding-service'
 import { collectionReader } from './collection-reader'
-import { getSetting } from '../settings'
+import { getSetting, setSetting } from '../settings'
 import { openRouterService } from './openrouter-service'
 import type { ToolDefinition, ToolCall } from './openrouter-service'
 import { getRootFolderId, getSubfolderId } from './folder-manager'
@@ -106,6 +106,71 @@ function isMacroFolderAllowed(folderId: string | undefined | null): boolean {
 		`FoundryAI | isMacroFolderAllowed: folderId="${folderId}", allowed=[${allowed.join(',')}], resolved=[${allAllowed.join(',')}], isAllowed=${isAllowed}`,
 	)
 	return isAllowed
+}
+
+const FOLDER_SETTING_KEYS = {
+	Actor: 'actorFolders',
+	JournalEntry: 'journalFolders',
+	Scene: 'sceneFolders',
+	Macro: 'macroFolders',
+} as const
+
+/**
+ * Resolve (creating if needed) the destination folder for a create_* tool call, and
+ * verify the result is actually visible to future tool calls before the caller reports
+ * success. Without this, an actor/journal/scene/macro can land in a folder that isn't
+ * in the type's allow-list (e.g. Root, when restrictions are active) — the create call
+ * reports success, but every later get/update/delete/list call filters it out as if it
+ * never existed.
+ *
+ * A folder the AI just created is automatically added to the allow-list, since the GM
+ * had no chance to select it beforehand and the AI will need to read/update it later.
+ * A pre-existing folder that the GM did not select is left alone — naming it here does
+ * not grant access to it.
+ */
+async function resolveManagedFolder(
+	folderName: string | undefined | null,
+	folderId: string | undefined | null,
+	docType: keyof typeof FOLDER_SETTING_KEYS,
+): Promise<{ folderId: string | null; error?: string }> {
+	const settingKey = FOLDER_SETTING_KEYS[docType]
+	let resolvedFolderId = folderId || null
+
+	if (folderName && !resolvedFolderId) {
+		let folder = game.folders?.find((f: any) => f.type === docType && f.name === folderName)
+		const isNewFolder = !folder
+		if (!folder) {
+			folder = await Folder.create({ name: folderName, type: docType, parent: null } as any)
+		}
+		resolvedFolderId = folder?.id || null
+
+		if (isNewFolder && resolvedFolderId) {
+			const allowed = getSetting(settingKey) || []
+			if (allowed.length > 0 && !allowed.includes(resolvedFolderId)) {
+				await setSetting(settingKey, [...allowed, resolvedFolderId])
+				console.log(`FoundryAI | resolveManagedFolder: granted access to new folder "${folderName}" (${resolvedFolderId}) in ${settingKey}`)
+			}
+		}
+	}
+
+	// FoundryAI's own managed folders (FoundryAI/Notes, /PDFs, etc.) are always
+	// readable regardless of the allow-list, same as isJournalFolderAllowed.
+	if (resolvedFolderId && getFoundryAIFolderIds().includes(resolvedFolderId)) {
+		return { folderId: resolvedFolderId }
+	}
+
+	const allowed = getSetting(settingKey) || []
+	if (allowed.length > 0) {
+		const allAllowed = collectionReader.resolveWithChildren(allowed)
+		if (!resolvedFolderId || !allAllowed.includes(resolvedFolderId)) {
+			return {
+				folderId: resolvedFolderId,
+				error: `No write access to folder "${folderName || 'Root'}" — it isn't in FoundryAI's allowed ${docType} folders. Specify a folder_name you have permission for, or enable this folder in FoundryAI settings.`,
+			}
+		}
+	}
+
+	return { folderId: resolvedFolderId }
 }
 
 // ---- Tool Definitions (OpenAI function calling format) ----
@@ -2159,21 +2224,10 @@ async function handleCreateJournal(
 	questMeta?: QuestMeta,
 ): Promise<string> {
 	console.log(`FoundryAI | create_journal: name="${name}", folder="${folderName || folderId || 'root'}", pages=${1 + (additionalPages?.length ?? 0)}, questMeta=${!!questMeta}`)
-	let resolvedFolderId = folderId || null
 
-	if (folderName && !resolvedFolderId) {
-		let folder = game.folders?.find((f: any) => f.type === 'JournalEntry' && f.name === folderName)
-
-		if (!folder) {
-			folder = await Folder.create({
-				name: folderName,
-				type: 'JournalEntry',
-				parent: null,
-			} as any)
-		}
-
-		resolvedFolderId = folder?.id || null
-	}
+	const resolved = await resolveManagedFolder(folderName, folderId, 'JournalEntry')
+	if (resolved.error) return JSON.stringify({ error: resolved.error })
+	const resolvedFolderId = resolved.folderId
 
 	const mainContent = questMeta ? buildStyledJournalHTML(name, buildQuestHeader(questMeta, content)) : content
 	if (questMeta) console.log(`FoundryAI | create_journal: quest formatting applied`)
@@ -3413,15 +3467,9 @@ async function handleCreateActor(
 ): Promise<string> {
 	console.log(`FoundryAI | create_actor: name="${name}", type="${type}", folderName="${folderName}"`)
 
-	let resolvedFolderId = folderId || null
-
-	if (folderName && !resolvedFolderId) {
-		let folder = game.folders?.find((f: any) => f.type === 'Actor' && f.name === folderName)
-		if (!folder) {
-			folder = await Folder.create({ name: folderName, type: 'Actor', parent: null } as any)
-		}
-		resolvedFolderId = folder?.id || null
-	}
+	const resolved = await resolveManagedFolder(folderName, folderId, 'Actor')
+	if (resolved.error) return JSON.stringify({ error: resolved.error })
+	const resolvedFolderId = resolved.folderId
 
 	const actorData: Record<string, any> = {
 		name,
@@ -3746,15 +3794,9 @@ async function handleCreateMacro(
 ): Promise<string> {
 	console.log(`FoundryAI | create_macro: name="${name}", type="${type}"`)
 
-	let resolvedFolderId = folderId || null
-
-	if (folderName && !resolvedFolderId) {
-		let folder = game.folders?.find((f: any) => f.type === 'Macro' && f.name === folderName)
-		if (!folder) {
-			folder = await Folder.create({ name: folderName, type: 'Macro', parent: null } as any)
-		}
-		resolvedFolderId = folder?.id || null
-	}
+	const resolved = await resolveManagedFolder(folderName, folderId, 'Macro')
+	if (resolved.error) return JSON.stringify({ error: resolved.error })
+	const resolvedFolderId = resolved.folderId
 
 	const macroData: Record<string, any> = {
 		name,
@@ -4002,6 +4044,16 @@ function escapeHtml(str: string): string {
 async function handleProcessPdf(args: Record<string, any>): Promise<string> {
 	console.log(`FoundryAI | process_pdf: path="${args.pdf_path}"`)
 	try {
+		// Resolve the destination folder before doing any expensive PDF/OCR work —
+		// default to FoundryAI/PDFs subfolder; override with folder_name if given.
+		const resolvedFolder = await resolveManagedFolder(
+			args.folder_name,
+			args.folder_name ? null : getSubfolderId('pdfs'),
+			'JournalEntry',
+		)
+		if (resolvedFolder.error) return JSON.stringify({ error: resolvedFolder.error })
+		const folderId = resolvedFolder.folderId
+
 		const pdfjsLib = await getPdfjsLib()
 
 		const pdfUrl = `${window.location.origin}/${args.pdf_path}`
@@ -4011,14 +4063,6 @@ async function handleProcessPdf(args: Record<string, any>): Promise<string> {
 		const arrayBuffer = await response.arrayBuffer()
 		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
 		const numPages: number = pdf.numPages
-
-		// Default to FoundryAI/PDFs subfolder; override with folder_name if given
-		let folderId: string | null = getSubfolderId('pdfs')
-		if (args.folder_name) {
-			let folder = game.folders?.find((f: any) => f.type === 'JournalEntry' && f.name === args.folder_name)
-			if (!folder) folder = await Folder.create({ name: args.folder_name, type: 'JournalEntry', parent: null } as any)
-			folderId = folder?.id || null
-		}
 
 		const pages: any[] = []
 		let failedCount = 0
@@ -4113,14 +4157,15 @@ async function handleProcessPdf(args: Record<string, any>): Promise<string> {
 
 		const journal = await JournalEntry.create(journalData)
 
+		const folderLabel = args.folder_name || 'FoundryAI/PDFs'
 		return JSON.stringify({
 			success: true,
 			journal_id: journal.id,
 			journal_name: journal.name,
-			folder: 'FoundryAI/PDFs',
+			folder: folderLabel,
 			page_count: numPages,
 			failed_pages: failedCount,
-			message: `Created journal "${args.journal_name}" with ${numPages} pages in FoundryAI/PDFs using vision-based text extraction.${failedCount > 0 ? ` ${failedCount} page(s) failed vision extraction — use render_pdf_page on those.` : ''}`,
+			message: `Created journal "${args.journal_name}" with ${numPages} pages in ${folderLabel} using vision-based text extraction.${failedCount > 0 ? ` ${failedCount} page(s) failed vision extraction — use render_pdf_page on those.` : ''}`,
 		})
 	} catch (error: any) {
 		return JSON.stringify({ error: `PDF processing failed: ${error.message}` })
@@ -4465,6 +4510,10 @@ async function handleGenerateScene(args: Record<string, any>): Promise<string> {
 		// Parse image dimensions for scene size
 		const [imgWidth, imgHeight] = mapSize.split('x').map(Number)
 
+		const resolvedFolder = await resolveManagedFolder(args.folder_name, args.folder_id, 'Scene')
+		if (resolvedFolder.error) return JSON.stringify({ error: resolvedFolder.error })
+		const sceneFolderId = resolvedFolder.folderId
+
 		if (!args.image_path && !args.prompt) {
 			return JSON.stringify({ error: 'Either prompt or image_path is required to generate a scene' })
 		} else if (args.image_path) {
@@ -4496,16 +4545,6 @@ async function handleGenerateScene(args: Record<string, any>): Promise<string> {
 			} else {
 				return JSON.stringify({ error: 'No image data in response' })
 			}
-		}
-
-		// Resolve scene folder
-		let sceneFolderId: string | null = args.folder_id || null
-		if (args.folder_name && !sceneFolderId) {
-			let folder = game.folders?.find((f: any) => f.type === 'Scene' && f.name === args.folder_name)
-			if (!folder) {
-				folder = await Folder.create({ name: args.folder_name, type: 'Scene', parent: null } as any)
-			}
-			sceneFolderId = folder?.id || null
 		}
 
 		// Create the scene without background first so Foundry initialises the levels structure
