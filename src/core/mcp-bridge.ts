@@ -1,7 +1,15 @@
 import { executeTool, TOOL_DEFINITIONS } from './tool-system'
-import type { ToolCall } from './openrouter-service'
+import type { ToolCall, ToolDefinition } from './openrouter-service'
 
 const TOOL_PREFIX = 'foundry-ai.tool.'
+
+function toMCPToolDefinition(tool: ToolDefinition) {
+	return {
+		name: tool.function.name,
+		description: tool.function.description,
+		inputSchema: tool.function.parameters,
+	}
+}
 
 export class MCPBridge {
 	private ws: WebSocket | null = null
@@ -90,7 +98,7 @@ export class MCPBridge {
 
 		// Return FoundryAI's tool list so the MCP server can expose it to Claude Desktop
 		if (method === 'foundry-ai.get_tools') {
-			this.send({ type: 'mcp-response', id, data: { success: true, data: JSON.stringify(TOOL_DEFINITIONS) } })
+			this.send({ type: 'mcp-response', id, data: { success: true, data: JSON.stringify(TOOL_DEFINITIONS.map(toMCPToolDefinition)) } })
 			return
 		}
 

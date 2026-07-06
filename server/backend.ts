@@ -44,8 +44,14 @@ class FoundryAIBridge {
 
   async getTools(): Promise<any[]> {
     if (!this.foundryClient.isConnected()) {
-      console.log('FoundryAI MCP Server | getTools: not connected, returning cached tools');
-      return this.cachedTools;
+      const deadline = Date.now() + 2500;
+      while (!this.foundryClient.isConnected() && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (!this.foundryClient.isConnected()) {
+        console.log('FoundryAI MCP Server | getTools: not connected, returning cached tools');
+        return this.cachedTools;
+      }
     }
     try {
       const result = await this.foundryClient.query('foundry-ai.get_tools', {});
@@ -867,7 +873,7 @@ async function processMapGenerationInBackend(
 
     let uploadResult: any;
     try {
-      uploadResult = await foundryClient.query('foundry-mcp-bridge.upload-generated-map', {
+      uploadResult = await foundryClient.query('foundry-ai.tool.upload_generated_map', {
         filename: filename,
         imageData: base64Image,
       });
@@ -882,7 +888,7 @@ async function processMapGenerationInBackend(
     const webPath = uploadResult.path;
     logger.info('Image uploaded successfully to Foundry', { path: webPath });
 
-    await jobQueue.updateJobProgress(jobId, 95, 'Creating scene data...');
+    await jobQueue.updateJobProgress(jobId, 95, 'Creating Foundry scene...');
 
     const sceneSize = comfyuiClient.getSizePixels(job.params.size as any);
 
@@ -893,56 +899,19 @@ async function processMapGenerationInBackend(
     }
 
     const sceneName = job.params.scene_name.trim();
-    const sceneData = {
+    const sceneResult = await foundryClient.query('foundry-ai.tool.generate_scene', {
       name: sceneName,
-      img: webPath,
-      background: { src: webPath },
-      width: sceneSize,
-      height: sceneSize,
-      padding: 0.25,
-      initial: {
-        x: sceneSize / 2,
-        y: sceneSize / 2,
-        scale: 1,
-      },
-      backgroundColor: '#999999',
-      grid: {
-        type: 1,
-        size: job.params.grid_size || 100,
-        color: '#000000',
-        alpha: 0.2,
-        distance: 5,
-        units: 'ft',
-      },
-      tokenVision: true,
-      fogExploration: true,
-      fogReset: Date.now(),
-      globalLight: false,
-      darkness: 0,
-      navigation: true,
-      active: false,
-      permission: {
-        default: 2,
-      },
-      walls: [],
-    };
+      image_path: webPath,
+      size: `${sceneSize}x${sceneSize}`,
+      grid_distance: 5,
+      grid_units: 'ft',
+    });
 
     await jobQueue.updateJobProgress(jobId, 100, 'Complete');
     await jobQueue.markJobComplete(jobId, {
       generation_time_ms: Date.now() - (job.started_at || job.created_at),
       image_url: webPath,
-      foundry_scene_payload: sceneData,
-    });
-
-    foundryClient.broadcastMessage({
-      type: 'job-completed',
-      jobId: jobId,
-      data: {
-        status: 'completed',
-        result: sceneData,
-        image_path: webPath,
-        prompt: job.params.prompt,
-      },
+      scene_id: sceneResult?.scene_id,
     });
 
     logger.info('Map generation completed successfully', { jobId });
@@ -988,6 +957,7 @@ async function startBackend(): Promise<void> {
 
   const foundryClient = new FoundryClient(config.foundry, logger);
   const foundryAIBridge = new FoundryAIBridge(foundryClient, logger);
+  const controlSockets = new Set<net.Socket>();
 
   // Initialize mapgen-style backend components for map generation
   let mapGenerationJobQueue: any = null;
@@ -1154,6 +1124,19 @@ async function startBackend(): Promise<void> {
     logger.error('Foundry connector failed to start', e);
   });
 
+  foundryClient.setOnFoundryConnected(async () => {
+    logger.info('Foundry module connected — warming tool cache and notifying index');
+    try {
+      await foundryAIBridge.getTools();
+    } catch (e: any) {
+      logger.warn('Failed to warm tool cache on Foundry connect', { error: e?.message });
+    }
+    const notification = JSON.stringify({ type: 'notification', method: 'tools_changed' }) + '\n';
+    for (const sock of controlSockets) {
+      try { sock.write(notification); } catch {}
+    }
+  });
+
   const autoStartComfyUI = async () => {
     try {
       logger.info('Auto-starting ComfyUI service...');
@@ -1170,6 +1153,10 @@ async function startBackend(): Promise<void> {
 
   // Control channel (TCP JSON-lines) — index.ts talks to us via this
   const server = net.createServer(socket => {
+    controlSockets.add(socket);
+    socket.on('close', () => { controlSockets.delete(socket); });
+    socket.on('error', () => { controlSockets.delete(socket); });
+
     socket.setEncoding('utf8');
 
     let buffer = '';
@@ -1210,21 +1197,28 @@ async function startBackend(): Promise<void> {
               let result: any;
 
               if (MAP_JOB_TOOLS.has(name)) {
-                // Async map job tools are handled locally (polling logic lives here)
                 switch (name) {
                   case 'generate-map':
-                    result = await mapGenerationTools.generateMap(args);
-
+                    result = await handleGenerateMapRequest(
+                      args,
+                      mapGenerationJobQueue,
+                      mapGenerationComfyUIClient,
+                      logger,
+                      foundryClient
+                    );
                     break;
 
                   case 'check-map-status':
-                    result = await mapGenerationTools.checkMapStatus(args);
-
+                    result = await handleCheckMapStatusRequest(args, mapGenerationJobQueue, logger);
                     break;
 
                   case 'cancel-map-job':
-                    result = await mapGenerationTools.cancelMapJob(args);
-
+                    result = await handleCancelMapJobRequest(
+                      args,
+                      mapGenerationJobQueue,
+                      mapGenerationComfyUIClient,
+                      logger
+                    );
                     break;
                 }
               } else {

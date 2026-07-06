@@ -35,6 +35,8 @@ class BackendClient {
 
   private pending = new Map<string, { resolve: (v: any) => void; reject: (e: any) => void }>();
 
+  onToolsChanged?: () => void;
+
   private logFile = path.join(os.tmpdir(), 'foundry-mcp-server', 'wrapper.log');
 
   private backendProcess: ChildProcess | null = null;
@@ -198,7 +200,13 @@ class BackendClient {
       if (!line) continue;
 
       try {
-        const msg = JSON.parse(line) as BackendRes;
+        const msg = JSON.parse(line) as BackendRes & { type?: string; method?: string };
+
+        if (msg.type === 'notification' && msg.method === 'tools_changed') {
+          this.log('onData(): tools_changed notification received');
+          this.onToolsChanged?.();
+          continue;
+        }
 
         this.log('onData(): received response', {
           id: msg.id,
@@ -305,8 +313,12 @@ async function startWrapper() {
 
   const mcp = new Server(
     { name: config.server.name, version: config.server.version },
-    { capabilities: { tools: {} } }
+    { capabilities: { tools: { listChanged: true } } }
   );
+
+  backend.onToolsChanged = () => {
+    mcp.sendToolListChanged().catch(() => {});
+  };
 
   // Setup cleanup handlers - cross-platform approach
 

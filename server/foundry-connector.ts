@@ -28,6 +28,8 @@ export class FoundryConnector {
   private pendingQueries = new Map<string, PendingQuery>();
   private queryIdCounter = 0;
 
+  onFoundryConnected?: () => void;
+
   constructor({ config, logger }: FoundryConnectorOptions) {
     this.config = config;
     this.logger = logger.child({ component: 'FoundryConnector' });
@@ -123,6 +125,7 @@ export class FoundryConnector {
         this.foundrySocket = ws;
         this.activeConnectionType = 'websocket';
         this.logger.info('Foundry module registered via WebSocket');
+        this.onFoundryConnected?.();
       }
 
       ws.on('close', () => {

@@ -1840,6 +1840,8 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handleDescribeImage(args.image_path, args.question)
 			case 'organize_images':
 				return await handleOrganizeImages(args.image_paths, args.destination_root)
+			case 'upload_generated_map':
+				return await handleUploadGeneratedMap(args.filename, args.imageData)
 			case 'generate_image':
 				return await handleGenerateImage(args.prompt, args.size)
 			case 'generate_scene':
@@ -4353,6 +4355,37 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 	} catch (error: any) {
 		console.error('FoundryAI | extract_pdf_images: failed', error)
 		return JSON.stringify({ error: `PDF image extraction failed: ${error.message}` })
+	}
+}
+
+async function handleUploadGeneratedMap(filename: string, imageData: string): Promise<string> {
+	console.log(`FoundryAI | upload_generated_map: filename="${filename}"`)
+	try {
+		if (!filename || typeof filename !== 'string') {
+			return JSON.stringify({ success: false, error: 'filename is required' })
+		}
+		if (!imageData || typeof imageData !== 'string') {
+			return JSON.stringify({ success: false, error: 'imageData is required' })
+		}
+
+		const bytes = atob(imageData)
+		const arr = new Uint8Array(bytes.length)
+		for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i)
+		const blob = new Blob([arr], { type: 'image/png' })
+		const file = new File([blob], filename, { type: 'image/png' })
+
+		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+		await FP.createDirectory('data', 'foundry-ai').catch(() => {})
+		await FP.createDirectory('data', 'foundry-ai/maps').catch(() => {})
+
+		const uploadResult = await FP.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
+		const savedPath = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
+
+		console.log(`FoundryAI | upload_generated_map: saved to "${savedPath}"`)
+		return JSON.stringify({ success: true, path: savedPath })
+	} catch (error: any) {
+		console.error('FoundryAI | upload_generated_map: failed', error)
+		return JSON.stringify({ success: false, error: error.message })
 	}
 }
 

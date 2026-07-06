@@ -7,6 +7,7 @@ import { SvelteApplication } from '@ui/svelte-application'
 import SettingsPanel from '@ui/components/SettingsPanel.svelte'
 
 const MODULE_ID = 'foundry-ai'
+export const DEFAULT_MCP_SERVER_URL = 'ws://localhost:31415/foundry-mcp'
 
 export interface ApiProvider {
 	id: string
@@ -82,11 +83,11 @@ export function registerSettings(): void {
 
 	game.settings.register(MODULE_ID, 'mcpServerUrl', {
 		name: 'MCP Server URL',
-		hint: 'WebSocket URL of the MCP server (e.g. ws://localhost:31415)',
+		hint: `WebSocket URL of the MCP server (e.g. ${DEFAULT_MCP_SERVER_URL})`,
 		scope: 'world',
 		config: true,
 		type: String,
-		default: 'ws://localhost:31415',
+		default: DEFAULT_MCP_SERVER_URL,
 		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'mcpServerUrl') },
 	})
 

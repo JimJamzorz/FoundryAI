@@ -106,4 +106,8 @@ export class FoundryClient {
   isConnected(): boolean {
     return this.connector.isConnected();
   }
+
+  setOnFoundryConnected(cb: () => void): void {
+    this.connector.onFoundryConnected = cb;
+  }
 }

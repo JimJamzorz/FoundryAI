@@ -3,7 +3,7 @@
    Registers hooks, settings, sidebar tab, and exposes the public API.
    ========================================================================== */
 
-import { registerSettings, getSetting } from './settings'
+import { DEFAULT_MCP_SERVER_URL, registerSettings, getSetting } from './settings'
 import { openRouterService } from '@core/openrouter-service'
 import { embeddingService } from '@core/embedding-service'
 import { chatSessionManager } from '@core/chat-session-manager'
@@ -82,7 +82,7 @@ Hooks.once('ready', async () => {
 
 	// Start MCP bridge if enabled
 	if (getSetting('mcpBridgeEnabled')) {
-		const mcpUrl = getSetting('mcpServerUrl') || 'ws://localhost:3001'
+		const mcpUrl = getSetting('mcpServerUrl') || DEFAULT_MCP_SERVER_URL
 		const { initMCPBridge } = await import('@core/mcp-bridge')
 		initMCPBridge(mcpUrl)
 		console.log(`FoundryAI | MCP bridge started → ${mcpUrl}`)
@@ -103,7 +103,7 @@ Hooks.once('ready', async () => {
 		if (key === 'mcpBridgeEnabled' || key === 'mcpServerUrl') {
 			const { mcpBridge: bridge, initMCPBridge } = await import('@core/mcp-bridge')
 			if (getSetting('mcpBridgeEnabled')) {
-				initMCPBridge(getSetting('mcpServerUrl') || 'ws://localhost:3001')
+				initMCPBridge(getSetting('mcpServerUrl') || DEFAULT_MCP_SERVER_URL)
 			} else {
 				bridge?.stop()
 			}
