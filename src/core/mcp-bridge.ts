@@ -98,7 +98,14 @@ export class MCPBridge {
 
 		// Return FoundryAI's tool list so the MCP server can expose it to Claude Desktop
 		if (method === 'foundry-ai.get_tools') {
-			this.send({ type: 'mcp-response', id, data: { success: true, data: JSON.stringify(TOOL_DEFINITIONS.map(toMCPToolDefinition)) } })
+			try {
+				const payload = TOOL_DEFINITIONS.map(toMCPToolDefinition)
+				console.log(`FoundryAI | MCP bridge: sending ${payload.length} tool definitions for id="${id}"`)
+				this.send({ type: 'mcp-response', id, data: { success: true, data: JSON.stringify(payload) } })
+			} catch (err: any) {
+				console.error('FoundryAI | MCP bridge: failed to build tool definitions:', err)
+				this.send({ type: 'mcp-response', id, data: { success: false, error: err?.message ?? String(err) } })
+			}
 			return
 		}
 

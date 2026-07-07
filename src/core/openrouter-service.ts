@@ -222,6 +222,47 @@ export class OpenRouterService {
 
 	// ---- Chat Completions ----
 
+	/**
+	 * Some local/self-hosted OpenAI-compatible servers fail to parse a model's tool-call
+	 * syntax into the structured `tool_calls` field, leaking the raw tags into `content` or
+	 * `reasoning_content` instead and leaving the turn looking like an empty, natural stop.
+	 * This recovers a tool call from that leaked text so the conversation can continue
+	 * instead of silently dying. Handles two known tag styles:
+	 *   - `<function=NAME><parameter=KEY>value</parameter>...</function>`
+	 *   - `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` (Hermes-style)
+	 */
+	recoverLeakedToolCalls(text: string): ToolCall[] | null {
+		if (!text) return null
+
+		const fnMatch = text.match(/<function=([\w-]+)>([\s\S]*?)(?:<\/function>|$)/)
+		if (fnMatch) {
+			const [, name, body] = fnMatch
+			const args: Record<string, string> = {}
+			for (const m of body.matchAll(/<parameter=([\w-]+)>([\s\S]*?)<\/parameter>/g)) {
+				args[m[1]] = m[2].trim()
+			}
+			return [{ id: crypto.randomUUID(), type: 'function', function: { name, arguments: JSON.stringify(args) } }]
+		}
+
+		const jsonMatch = text.match(/<tool_call>([\s\S]*?)<\/tool_call>/)
+		if (jsonMatch) {
+			try {
+				const parsed = JSON.parse(jsonMatch[1].trim())
+				if (parsed?.name) {
+					return [{
+						id: crypto.randomUUID(),
+						type: 'function',
+						function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) },
+					}]
+				}
+			} catch {
+				// not valid JSON — fall through
+			}
+		}
+
+		return null
+	}
+
 	async chatCompletion(request: ChatCompletionRequest, signal?: AbortSignal): Promise<ChatCompletionResponse> {
 		if (!this.isConfigured) throw new Error('No API provider configured')
 
@@ -249,12 +290,30 @@ export class OpenRouterService {
 		}
 
 		const result = await response.json()
+		const message = result.choices?.[0]?.message
+
+		// Recover tool calls the server failed to structure before we ever log/return —
+		// otherwise this looks identical to the model just giving up with an empty answer.
+		if (message && !message.tool_calls?.length) {
+			const recovered = this.recoverLeakedToolCalls(message.content || message.reasoning_content || message.reasoning || '')
+			if (recovered) {
+				console.warn('FoundryAI | Recovered tool call the server failed to structure:', recovered.map(tc => tc.function.name))
+				message.tool_calls = recovered
+				message.content = null
+			}
+		}
+
 		console.log('FoundryAI | API chatCompletion response:', {
 			model: result.model,
 			finishReason: result.choices?.[0]?.finish_reason,
-			hasContent: !!result.choices?.[0]?.message?.content,
-			toolCalls: result.choices?.[0]?.message?.tool_calls?.map((tc: any) => tc.function?.name) || [],
+			hasContent: !!message?.content,
+			toolCalls: message?.tool_calls?.map((tc: any) => tc.function?.name) || [],
 			usage: result.usage,
+			// Surface any hidden "thinking" text when content comes back empty — different servers
+			// expose this under different keys depending on how they implement reasoning models.
+			...(!message?.content && {
+				reasoningContent: message?.reasoning_content || message?.reasoning || null,
+			}),
 		})
 		return result
 	}

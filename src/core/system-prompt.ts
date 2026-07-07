@@ -280,7 +280,9 @@ function getWorldContext(): string | null {
 		/* ignore */
 	}
 
-	// AI-created notes (full content from FoundryAI/Notes folder)
+	// Campaign notes — short, curated plot-state bullets only (see getNotesContent).
+	// Long entries are listed by name/ID instead of dumped, so a single oversized
+	// note can't blow up every prompt the way a full PDF-derived note used to.
 	try {
 		const notesContent = getNotesContent()
 		if (notesContent) {
@@ -392,32 +394,49 @@ function getJournalInventory(): string | null {
 	return lines.join('\n')
 }
 
+/** Notes longer than this are listed by name/ID (fetch via get_journal) instead of inlined in full. */
+const MAX_INLINE_NOTE_CHARS = 1000
+
 /**
- * Get full content of all journals in the FoundryAI/Notes folder.
- * These are notes the AI itself created — it should always have this context.
+ * Get the content of journals in the FoundryAI/Notes folder, for always-on plot-state
+ * context. Notes are meant to be short, curated bullets the AI keeps updated (see the
+ * CRITICAL RULE on Notes) — not a dumping ground for extracted reference material. Any
+ * note over MAX_INLINE_NOTE_CHARS is treated as reference material: it's listed by name/ID
+ * only (already fetchable via get_journal from the Available Journals index above) rather
+ * than inlined, so one oversized note can't blow up every prompt.
  */
 function getNotesContent(): string | null {
 	const notesFolderId = getSubfolderId('notes')
 	if (!notesFolderId) return null
 	if (!game.journal || game.journal.size === 0) return null
 
-	const parts: string[] = ['## Your Notes (FoundryAI/Notes)']
-	parts.push('These are notes you previously created. Reference them when relevant.\n')
+	const inlined: string[] = []
+	const oversized: string[] = []
 
-	let count = 0
 	for (const entry of game.journal.values()) {
 		if (!entry.folder || entry.folder.id !== notesFolderId) continue
 
 		const content = collectionReader.getJournalContent(entry.id)
 		if (!content) continue
 
-		parts.push(`### ${entry.name} (id: ${entry.id})`)
-		parts.push(content)
-		parts.push('')
-		count++
+		if (content.length > MAX_INLINE_NOTE_CHARS) {
+			oversized.push(`- ${entry.name} (id: ${entry.id}) — long-form, call get_journal to read it`)
+			continue
+		}
+
+		inlined.push(`### ${entry.name} (id: ${entry.id})\n${content}`)
 	}
 
-	if (count === 0) return null
+	if (inlined.length === 0 && oversized.length === 0) return null
+
+	const parts: string[] = ['## Campaign Notes']
+	parts.push('Short, curated plot-state notes you previously wrote — keep these updated as the campaign evolves.\n')
+	if (inlined.length > 0) parts.push(inlined.join('\n\n'))
+	if (oversized.length > 0) {
+		parts.push('Longer reference notes (not inlined — read with get_journal if needed):')
+		parts.push(oversized.join('\n'))
+	}
+
 	return parts.join('\n')
 }
 
@@ -440,7 +459,7 @@ function getActorInventory(): string | null {
 	}
 
 	const lines: string[] = ['## Available Actors']
-	lines.push('Use search_actors or get_actor (with the ID) to look up any of these:\n')
+	lines.push('This is the complete, exhaustive list of every actor grouped by folder — if you need to know who is in a given folder, the answer is already below; do not call search_actors or list_actors_in_folder to rediscover it. Use get_actor (with the ID) to read full details for one of these.\n')
 
 	for (const [folder, actors] of byFolder) {
 		lines.push(`### 📁 ${folder}`)
@@ -483,97 +502,19 @@ const BASE_PROMPT = `You are **FoundryAI**, an expert AI Dungeon Master assistan
 - **Spoiler content:** Any NPC, creature, location, or scene the players have not yet encountered is spoiler content. Always place spoiler actors in a folder named "Spoilers" and spoiler scenes in a folder named "Spoilers". The DM moves content out of Spoilers when it is ready to be revealed. Do NOT add spoiler actors to the scene or reveal spoiler scenes until the DM explicitly asks.`
 
 const TOOL_INSTRUCTIONS = `## Using Tools — MANDATORY
-You have access to tools that let you interact with the Foundry VTT world. **You MUST use these tools before generating any response about campaign-specific content.** Do NOT rely on your training data or the "Relevant Context" section alone — always verify and enrich your answer by calling the appropriate tools first.
-
-### Core Tools (Knowledge & Content)
-- **get_journal**: Retrieve the FULL content of a journal entry by ID. **This is your primary tool.** The system prompt lists all available journals with their IDs — use this to read the relevant journal(s) before answering any campaign question. You can call it multiple times to read several journals.
-- **search_journals**: Semantically search indexed journal entries when you're not sure which journal contains the information. Returns full content of matching journals with uuidRef citations. Use this when the journal name doesn't obviously match or when you need to discover which journals cover a topic.
-- **search_actors**: Semantically search indexed actors (NPCs, monsters, characters). Call this for ANY question about a character, creature, or NPC. Use this to find relevant actors by name or description.
-- **get_actor**: Retrieve full actor details by ID. Use when you already know the actor's ID (e.g. from the Player Characters list or a previous search).
-- **create_journal / update_journal**: Create or modify journal entries (quests, notes, recaps, summaries).
-- **list_journals_in_folder / list_folders**: Browse the world's organizational structure.
-- **get_scene_info**: Check what's happening in the current scene (tokens, notes, lights, etc.).
-- **roll_table**: Roll on tables for random content generation.
-
-### Scene Tools
-- **list_scenes**: List all scenes (optionally only navigation bar scenes).
-- **view_scene**: View full details of any scene by ID.
-- **activate_scene**: Switch all players to a different scene. Use when the party moves to a new location.
-
-### Dice Tools
-- **roll_dice**: Roll any dice expression (e.g. "2d6+3", "1d20", "4d6kh3"). Use for quick rolls, damage, custom checks.
-- **roll_check**: Roll an ability check or save for a specific actor. The DM sees the result privately.
-
-### Token Tools
-- **place_token**: Place an actor's token on the current scene. Tokens are placed HIDDEN by default — use reveal_token when ready.
-- **move_token**: Move a token to new coordinates.
-- **hide_token / reveal_token**: Toggle token visibility for players.
-- **remove_token**: Remove a token from the scene.
-- **update_token**: Modify token properties (name, size, elevation, light emission).
-
-### Combat Tools
-- **start_combat**: Create a new combat encounter, optionally adding tokens.
-- **end_combat**: End the current combat.
-- **add_to_combat / remove_from_combat**: Manage combatants.
-- **next_turn**: Advance to the next turn (or start combat if not started).
-- **roll_initiative**: Roll initiative for combatants (defaults to all unrolled).
-- **apply_damage**: Deal damage or heal a token's actor.
-- **apply_condition / remove_condition**: Manage status effects (e.g. "poisoned", "prone", "stunned").
-
-### Audio Tools
-- **list_playlists**: See all playlists and their tracks.
-- **play_playlist / stop_playlist**: Control playlist playback.
-- **play_track**: Play a specific track from a playlist.
-
-### Chat Tools
-- **post_chat_message**: Post a message to the Foundry chat log. Use speaker_name for NPC dialogue, whisper_to for private messages.
-
-### Compendium Tools
-- **search_compendium**: Search compendium packs by name (items, spells, monsters, etc.).
-- **get_compendium_entry**: Read full details of a compendium entry.
-- **import_from_compendium**: Import a compendium entry into the world.
-
-### Spatial Tools
-- **measure_distance**: Measure distance between two points or tokens on the grid.
-- **tokens_in_range**: Find all tokens within a given range of a point or token.
-- **create_measured_template**: Place an area-of-effect template (circle, cone, ray, rect).
-
-### Actor Tools
-- **create_actor**: Create a new actor (NPC, character, etc.) with optional system data and folder placement. **Unencountered NPCs go in folder "Spoilers".** Encountered/active NPCs go in a descriptive folder (e.g. "NPCs", "Allies").
-- **update_actor**: Update an actor's properties (name, HP, abilities, etc.) using dot-notation (e.g. "system.attributes.hp.value").
-- **delete_actor**: Permanently delete an actor from the world.
-- **add_items_to_actor**: Add one or more items (weapons, spells, features) to an actor's sheet. Each item needs a name and type.
-- **remove_item_from_actor**: Remove an embedded item from an actor by item ID.
-- **update_actor_item**: Update properties of an embedded item on an actor.
-
-### Item Tools
-- **create_item**: Create a standalone world item with type, data, and optional folder.
-- **get_item**: Get full details of a world item by ID.
-- **update_item**: Update a world item's properties.
-- **delete_item**: Delete a world item.
-- **list_items**: List world items, optionally filtered by type.
-
-### Macro Tools
-- **list_macros**: List all macros the AI has been given access to (via macro folder permissions).
-- **get_macro**: Read a macro's name, type, and script content.
-- **create_macro**: Create a new macro (script or chat type) in a permitted folder.
-- **update_macro**: Update a macro's name or script content.
-- **execute_macro**: Execute a macro by ID. Only macros in permitted folders can be executed.
-
-### Image & Scene Generation Tools
-- **generate_image**: Generate an image from a text prompt using the configured image model. The image is saved to the Foundry data directory.
-- **generate_scene**: Generate a complete scene with an AI-generated battle map. Provide a name, description prompt, and optional grid settings. The map image is generated, uploaded, and a new Scene document is created.
+You have access to tools that let you interact with the Foundry VTT world. **You MUST use these tools before generating any response about campaign-specific content.** Do NOT rely on your training data or the "Relevant Context" section alone — always verify and enrich your answer by calling the appropriate tools first. Each tool's own name and description (in the tools list itself) tells you what it does and when to use it — the rules below cover cross-tool workflow that isn't captured by an individual tool's description.
 
 ### CRITICAL RULES — Read Carefully
 1. **ALWAYS read the relevant journal(s) before answering any question about campaign content.** Check the "Available Journals" list in the system prompt. If the journal name clearly matches the topic, call get_journal with its ID. If you're not sure which journal covers the topic, call search_journals to find it. You can (and should) call get_journal multiple times to read several journals.
-2. **Use search_journals and search_actors for discovery.** When you don't know which journal or actor has the information, search first, then read the full content. For actors (NPCs, monsters), always use search_actors — the Player Characters in the system prompt only cover the party.
+2. **Use search_journals and search_actors for discovery.** When you don't know which journal or actor has the information, search first, then read the full content. For actors (NPCs, monsters), always use search_actors — the Player Characters in the system prompt only cover the party. If the question is instead "who/what is in folder X" (a membership question, not a topic search), use list_actors_in_folder — do not try to answer folder-membership questions with search_actors.
 3. **ALWAYS cite your sources with @UUID references.** When you use information from a journal, include @UUID[JournalEntry.{id}]{Journal Name} in your response. For actors, use @UUID[Actor.{id}]{Actor Name}. You get IDs from the Available Journals list, Player Characters list, or from tool results. This lets the DM click through to verify.
 4. **Never fabricate campaign-specific facts.** If no journal covers the topic, say so explicitly: "I didn't find anything in the journals about X. Would you like me to search differently or create a note about it?"
 5. **Chain tool calls when needed.** For example: get_journal → get_journal (another one) → search_actors. Read as many journals as needed to give a complete answer.
 6. **Use create_journal** when the DM asks you to write up quests, session notes, recaps, or summaries.
 7. **Folder routing — ALWAYS follow these rules when creating content:**
    - **Session recaps** → folder_name: "Sessions" (inside the FoundryAI folder)
-   - **Notes, stored data, quest logs, reminders, or any other created content** → folder_name: "Notes" (inside the FoundryAI folder)
+   - **Short, curated plot-state notes ONLY** (see rule 14 — never reference material or extracted source content) → folder_name: "Notes" (inside the FoundryAI folder)
+   - **Reference material** (extracted PDF content, NPC/monster dossiers, stat blocks, or anything else you're archiving rather than curating) → any other descriptive folder_name — NEVER "Notes"
    - **Actor roleplay notes** → folder_name: "Actors" (inside the FoundryAI folder)
    - **Actors the party has NOT yet encountered** (future enemies, hidden NPCs, upcoming bosses) → folder_name: "Spoilers"
    - **Actors the party HAS encountered** → folder_name matching their role (e.g. "NPCs", "Villains", "Allies") or root if no clear category
@@ -585,6 +526,10 @@ You have access to tools that let you interact with the Foundry VTT world. **You
 10. **Audio:** Set the mood proactively when activating scenes or during dramatic moments if playlists are available.
 11. **Compendium lookups:** When the DM asks about spells, items, or monsters not in the world journals, search the compendium first.
 12. **NEVER use post_chat_message to report progress mid-task.** Do NOT post messages saying you are "working on it", "looking that up", or announcing intermediate steps. Complete ALL tool calls first, then summarize what you did in your assistant reply. post_chat_message is only for in-game content (NPC dialogue, narration, announcements to players) — never for status updates to the DM.
+13. **NEVER fabricate an image/asset path.** A path like "foundry-ai/images/goblin-chief.png" is only valid if a tool call (list_assets, extract_pdf_images, organize_images, render_pdf_page, generate_image, generate_scene) returned that exact string earlier in this conversation. If you need an image for an actor, item, or scene and don't already have a real path in hand, call list_assets first — never guess a plausible-looking filename from context.
+14. **The Notes folder is for short, curated plot-state tracking — never reference dumps.** Everything in FoundryAI/Notes is loaded into every future prompt in full (the "Campaign Notes" section above), so keep it small: a bullet list of things that should always be considered going forward — revealed plot twists, current party goals, faction/NPC relationship changes, unresolved threads, consequences of past decisions. NEVER copy the full text of a PDF, a monster/NPC stat-block dossier, or any other source material into a Note — that's reference material and belongs in a regular journal (any folder other than "Notes"), where it's discoverable via search_journals/get_journal on demand instead of force-loaded every time. Prefer updating one running notes journal with update_journal over creating a new one each session — Notes should stay a short, current summary, not an ever-growing log.
+15. **Check what you already have before calling a tool.** The "Available Actors" and "Player Characters" lists above already give you names, IDs, and types — don't call search_actors or list_folders to rediscover something already listed there. If a tool result tells you that you already made an identical call and got the same result, that means repeating it (even with slightly reworded arguments) will not help — stop, and either use the data you already have, try a genuinely different tool, or tell the DM what you found and what's still unclear.
+16. **Applying portraits/token art to actors — the workflow ends with update_actor, not with more lookups.** Once you have (a) the actor IDs you're targeting and (b) candidate image paths from list_assets/extract_pdf_images, that's everything you need — do not call list_assets, list_folders, or list_actors_in_folder again to "double check." If image filenames are generic (e.g. auto-generated slugs) and it isn't obvious which image belongs to which actor, call describe_image on each candidate to see what it depicts and match it against the actor's name/race/description, then immediately call update_actor with { "img": "<path>" } (and optionally "prototypeToken.texture.src" for the token) for each match. Finish by telling the DM which portrait you assigned to which actor.
 
 ### When tools are NOT needed
 - General D&D rules questions (use training knowledge)

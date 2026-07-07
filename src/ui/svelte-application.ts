@@ -13,7 +13,7 @@ export class SvelteApplication extends foundry.applications.api.ApplicationV2 {
 	protected svelteTarget: Component
 	protected svelteProps: Record<string, any>
 
-	constructor(component: Component, props: Record<string, any> = {}, options: Partial<ApplicationConfiguration> = {}) {
+	constructor(component: Component<any>, props: Record<string, any> = {}, options: Partial<ApplicationConfiguration> = {}) {
 		super(options)
 		this.svelteTarget = component
 		this.svelteProps = props
@@ -129,7 +129,7 @@ export class SvelteSidebarTab extends foundry.applications.sidebar.AbstractSideb
 
 	static override tabName = 'foundry-ai'
 
-	constructor(component: Component, props: Record<string, any> = {}, options: Partial<ApplicationConfiguration> = {}) {
+	constructor(component: Component<any>, props: Record<string, any> = {}, options: Partial<ApplicationConfiguration> = {}) {
 		super(options)
 		this.svelteTarget = component
 		this.svelteProps = props
@@ -236,7 +236,7 @@ let popoutInstance: SvelteApplication | null = null
  * Create and render a popout chat window.
  * Returns the existing instance if already open.
  */
-export function openPopoutChat(component: Component, props: Record<string, any> = {}): SvelteApplication {
+export function openPopoutChat(component: Component<any>, props: Record<string, any> = {}): SvelteApplication {
 	if (popoutInstance?.rendered) {
 		popoutInstance.bringToFront()
 		return popoutInstance
@@ -255,8 +255,8 @@ export function openPopoutChat(component: Component, props: Record<string, any> 
 			contentClasses: ['foundry-ai-content'],
 		},
 		position: {
-			width: 420,
-			height: 600,
+			width: 1100,
+			height: 800,
 		},
 	})
 
@@ -267,7 +267,7 @@ export function openPopoutChat(component: Component, props: Record<string, any> 
 /**
  * Create and render a settings dialog.
  */
-export function openSettingsDialog(component: Component, props: Record<string, any> = {}): SvelteApplication {
+export function openSettingsDialog(component: Component<any>, props: Record<string, any> = {}): SvelteApplication {
 	const app = new SvelteApplication(component, props, {
 		id: 'foundry-ai-settings',
 		window: {
@@ -275,6 +275,32 @@ export function openSettingsDialog(component: Component, props: Record<string, a
 			positioned: true,
 			title: 'FoundryAI Settings',
 			icon: 'fas fa-cog',
+			minimizable: false,
+			resizable: true,
+			contentTag: 'section',
+			contentClasses: ['foundry-ai-content'],
+		},
+		position: {
+			width: 600,
+			height: 700,
+		},
+	})
+
+	app.render(true)
+	return app
+}
+
+/**
+ * Create and render the tool selection dialog.
+ */
+export function openToolSelectionDialog(component: Component<any>, props: Record<string, any> = {}): SvelteApplication {
+	const app = new SvelteApplication(component, props, {
+		id: 'foundry-ai-tool-selection',
+		window: {
+			frame: true,
+			positioned: true,
+			title: 'Customize Tools',
+			icon: 'fas fa-sliders-h',
 			minimizable: false,
 			resizable: true,
 			contentTag: 'section',

@@ -5,14 +5,15 @@
   import { chatSessionManager } from '@core/chat-session-manager';
   import { sessionRecapManager, type RecapProgress } from '@core/session-recap-manager';
   import { embeddingService } from '@core/embedding-service';
-  import { getEnabledTools, executeTool, TOOL_GROUPS, type ToolGroupId } from '@core/tool-system';
+  import { resolveActiveTools, TOOL_GROUPS, executeTool, type ToolGroupId, type ActiveToolSelection } from '@core/tool-system';
   import { buildSystemPrompt, buildActorRoleplayPrompt, type ActorRoleplayContext } from '@core/system-prompt';
   import { estimateTokens, getModelContextLimit } from '@core/token-estimator';
   import { summarizeConversation } from '@core/context-summarizer';
   import { getSetting } from '../../settings';
-  import { openSettingsDialog } from '../svelte-application';
+  import { openSettingsDialog, openToolSelectionDialog } from '../svelte-application';
   import SettingsPanel from './SettingsPanel.svelte';
   import ContextIndicator from './ContextIndicator.svelte';
+  import ToolSelectionModal from './ToolSelectionModal.svelte';
 
   interface Props {
     isSidebar?: boolean;
@@ -38,6 +39,17 @@
   let isIndexing = $state(false);
   let indexProgress = $state('');
   let selectedToolGroup = $state<ToolGroupId>('all');
+  let customToolNames = $state<string[] | null>(null);
+  const activeToolSelection = $derived<ActiveToolSelection>(
+    customToolNames ? { custom: customToolNames } : { group: selectedToolGroup },
+  );
+
+  function openToolModal() {
+    openToolSelectionDialog(ToolSelectionModal, {
+      initialSelection: resolveActiveTools(activeToolSelection).map(t => t.function.name),
+      onApply: (names: string[]) => { customToolNames = names; },
+    });
+  }
 
   // Actor roleplay state
   let currentActorId = $state<string | null>(null);
@@ -365,12 +377,12 @@ IMPORTANT: You already have all the information you need about this character fr
       const stream = getSetting('streamResponses');
       const useTools = getSetting('enableTools');
 
-      console.log(`FoundryAI | Sending message — model: ${model}, stream: ${stream}, tools: ${useTools ? selectedToolGroup : 'disabled'}, messages: ${apiMessages.length}, actor: ${currentActorId || 'none'}`);
+      console.log(`FoundryAI | Sending message — model: ${model}, stream: ${stream}, tools: ${useTools ? JSON.stringify(activeToolSelection) : 'disabled'}, messages: ${apiMessages.length}, actor: ${currentActorId || 'none'}`);
 
       if (stream) {
-        await handleStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, selectedToolGroup, abortController.signal);
+        await handleStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, activeToolSelection, abortController.signal);
       } else {
-        await handleNonStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, selectedToolGroup, abortController.signal);
+        await handleNonStreamingResponse(apiMessages, model, temperature, maxTokens, useTools, activeToolSelection, abortController.signal);
       }
 
       // Save full conversation to session
@@ -485,7 +497,7 @@ IMPORTANT: You already have all the information you need about this character fr
     temperature: number,
     maxTokens: number,
     useTools: boolean,
-    toolGroup: ToolGroupId,
+    toolSelection: ActiveToolSelection,
     signal?: AbortSignal,
   ) {
     let fullContent = '';
@@ -541,7 +553,7 @@ IMPORTANT: You already have all the information you need about this character fr
         messages: apiMessages,
         temperature,
         max_tokens: maxTokens,
-        tools: useTools ? getEnabledTools(toolGroup) : undefined,
+        tools: useTools ? resolveActiveTools(toolSelection) : undefined,
         tool_choice: useTools ? 'auto' : undefined,
       },
       onChunk,
@@ -559,16 +571,28 @@ IMPORTANT: You already have all the information you need about this character fr
       if (valid.length > 0) {
         console.log('FoundryAI | Executing streamed tool calls:', valid.map(tc => `${tc.function.name}(${tc.function.arguments.slice(0, 100)}...)`));
         const assistantMessage = { content: fullContent || null, tool_calls: valid };
-        await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, toolGroup, 0, signal);
+        await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, toolSelection, 0, signal);
       } else {
         console.warn('FoundryAI | All streamed tool calls had missing names, treating as text response');
         const msg: LLMMessage = { role: 'assistant', content: fullContent || '⚠️ Tool call failed — the model returned an invalid response.' };
         messages = [...messages, msg];
       }
     } else {
-      // Normal text response
-      const msg: LLMMessage = { role: 'assistant', content: fullContent };
-      messages = [...messages, msg];
+      // Some local/self-hosted models stream a malformed tool call as plain text
+      // (e.g. "<function=...><parameter=...>") instead of proper tool_call deltas.
+      // The non-streaming continuation path already recovers these — do the same
+      // here, otherwise the very first streamed turn silently drops the call and
+      // the user gets a blank or garbled reply instead of the tool actually running.
+      const recovered = openRouterService.recoverLeakedToolCalls(fullContent);
+      if (recovered) {
+        console.warn('FoundryAI | Recovered tool call the server failed to structure (stream):', recovered.map(tc => tc.function.name));
+        const assistantMessage = { content: null, tool_calls: recovered };
+        await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, toolSelection, 0, signal);
+      } else {
+        // Normal text response
+        const msg: LLMMessage = { role: 'assistant', content: fullContent };
+        messages = [...messages, msg];
+      }
     }
 
     // Update token tracking from streaming usage
@@ -583,7 +607,7 @@ IMPORTANT: You already have all the information you need about this character fr
     temperature: number,
     maxTokens: number,
     useTools: boolean,
-    toolGroup: ToolGroupId,
+    toolSelection: ActiveToolSelection,
     signal?: AbortSignal,
   ) {
     const response = await openRouterService.chatCompletion(
@@ -592,7 +616,7 @@ IMPORTANT: You already have all the information you need about this character fr
         messages: apiMessages,
         temperature,
         max_tokens: maxTokens,
-        tools: useTools ? getEnabledTools(toolGroup) : undefined,
+        tools: useTools ? resolveActiveTools(toolSelection) : undefined,
         tool_choice: useTools ? 'auto' : undefined,
       },
       signal,
@@ -607,7 +631,7 @@ IMPORTANT: You already have all the information you need about this character fr
     });
 
     if (assistantMessage?.tool_calls?.length) {
-      await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, toolGroup, 0, signal);
+      await handleToolCalls(assistantMessage, apiMessages, model, temperature, maxTokens, toolSelection, 0, signal);
     } else {
       const msg: LLMMessage = { role: 'assistant', content: assistantMessage?.content || '' };
       messages = [...messages, msg];
@@ -625,9 +649,11 @@ IMPORTANT: You already have all the information you need about this character fr
     model: string,
     temperature: number,
     maxTokens: number,
-    toolGroup: ToolGroupId,
+    toolSelection: ActiveToolSelection,
     depth: number = 0,
     signal?: AbortSignal,
+    seenCalls: Map<string, number> = new Map(),
+    skipTracker: { count: number } = { count: 0 },
   ) {
     // Check if abort was requested
     if (signal?.aborted) {
@@ -664,6 +690,25 @@ IMPORTANT: You already have all the information you need about this character fr
             name: toolCall.function.name,
           };
         }
+        // Detect the model repeating an identical call (same tool, same args) within this
+        // turn's tool chain — without this it can loop indefinitely getting the same answer.
+        const signature = `${toolCall.function?.name}:${toolCall.function?.arguments || ''}`;
+        const priorCalls = seenCalls.get(signature) || 0;
+        seenCalls.set(signature, priorCalls + 1);
+
+        if (priorCalls > 0) {
+          skipTracker.count++;
+          console.warn(`FoundryAI | Skipping repeated tool call (seen ${priorCalls}x already, ${skipTracker.count} total skips this turn): ${signature.slice(0, 150)}`);
+          return {
+            role: 'tool' as const,
+            content: JSON.stringify({
+              error: `You already called ${toolCall.function?.name} with these exact same arguments earlier in this turn and got the same result — calling it again will not produce new information. Use the data you already have, or try different arguments/a different tool.`,
+            }),
+            tool_call_id: toolCall.id,
+            name: toolCall.function.name,
+          };
+        }
+
         console.log(`FoundryAI | Executing tool: ${toolCall.function?.name || 'UNDEFINED'} (id: ${toolCall.id || 'NO_ID'})`, toolCall.function?.arguments?.slice(0, 200));
         const result = await executeTool(toolCall);
         console.log(`FoundryAI | Tool result [${toolCall.function?.name}]:`, result.slice(0, 300));
@@ -684,6 +729,19 @@ IMPORTANT: You already have all the information you need about this character fr
       return;
     }
 
+    // Hard stop: the model is thrashing on repeated calls that produce no new information.
+    // The per-call skip message alone doesn't reliably make it give up, so force the issue
+    // rather than let this run away (especially with maxToolDepth=0, i.e. unlimited).
+    const HARD_STOP_SKIP_THRESHOLD = 3;
+    if (skipTracker.count >= HARD_STOP_SKIP_THRESHOLD) {
+      console.warn(`FoundryAI | Stopping tool loop — ${skipTracker.count} repeated/duplicate tool calls with no new information.`);
+      messages = [...messages, {
+        role: 'assistant',
+        content: '⚠️ Stopped after repeated tool calls produced no new information. Try rephrasing your request or asking a more specific question.',
+      }];
+      return;
+    }
+
     // Continue the conversation with tool results
     const continuedMessages = [...apiMessages, assistantMsg, ...toolResults];
 
@@ -693,7 +751,7 @@ IMPORTANT: You already have all the information you need about this character fr
         messages: continuedMessages,
         temperature,
         max_tokens: maxTokens,
-        tools: getEnabledTools(toolGroup),
+        tools: resolveActiveTools(toolSelection),
         tool_choice: 'auto',
       },
       signal,
@@ -709,7 +767,7 @@ IMPORTANT: You already have all the information you need about this character fr
 
     if (nextMessage?.tool_calls?.length) {
       // Recursive tool calls
-      await handleToolCalls(nextMessage, continuedMessages, model, temperature, maxTokens, toolGroup, depth + 1, signal);
+      await handleToolCalls(nextMessage, continuedMessages, model, temperature, maxTokens, toolSelection, depth + 1, signal, seenCalls, skipTracker);
     } else {
       messages = [...messages, { role: 'assistant', content: nextMessage?.content || '' }];
     }
@@ -784,6 +842,27 @@ IMPORTANT: You already have all the information you need about this character fr
                 uuidRef: r.uuidRef,
                 folder: r.folder,
               })),
+            };
+            return { ...msg, content: JSON.stringify(summary) };
+          }
+          // Asset/image paths (list_assets, extract_pdf_images, organize_images) are exact
+          // filesystem paths the model must reuse verbatim in later turns — truncating them
+          // like generic text previously caused the model to invent plausible-looking paths.
+          if (Array.isArray(parsed.assets) || Array.isArray(parsed.images)) {
+            const items = parsed.assets || parsed.images;
+            const summary = {
+              _condensed: true,
+              note: 'Full content was provided earlier. Paths below are exact — reuse them verbatim, never invent or guess a path.',
+              paths: items.map((item: any) => ({ path: item.path, type: item.type || item.category })),
+            };
+            return { ...msg, content: JSON.stringify(summary) };
+          }
+          // Single-asset results (render_pdf_page, generate_image, generate_scene)
+          if (typeof parsed.path === 'string') {
+            const summary = {
+              _condensed: true,
+              note: 'Full content was provided earlier. Path below is exact — reuse it verbatim, never invent or guess a path.',
+              path: parsed.path,
             };
             return { ...msg, content: JSON.stringify(summary) };
           }
@@ -1199,17 +1278,46 @@ IMPORTANT: You already have all the information you need about this character fr
 
     <!-- Input Area -->
     <div class="input-area">
-      <select
-        class="tool-group-select"
-        bind:value={selectedToolGroup}
+      {#if customToolNames}
+        <button
+          class="tool-group-select custom-tool-badge"
+          onclick={openToolModal}
+          disabled={isGenerating || !hasApiKey}
+          title="Custom tool selection active — click to edit"
+        >
+          <i class="fas fa-sliders-h"></i> Custom ({customToolNames.length})
+          <span
+            class="custom-tool-clear"
+            role="button"
+            tabindex="0"
+            onclick={(e) => { e.stopPropagation(); customToolNames = null; }}
+            onkeydown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); customToolNames = null; } }}
+            title="Clear custom selection"
+          >
+            <i class="fas fa-times"></i>
+          </span>
+        </button>
+      {:else}
+        <select
+          class="tool-group-select"
+          bind:value={selectedToolGroup}
+          disabled={isGenerating || !hasApiKey}
+          title="Choose which tool set is available for this message"
+          aria-label="Tool set"
+        >
+          {#each TOOL_GROUPS as group}
+            <option value={group.id} title={group.description}>{group.label}</option>
+          {/each}
+        </select>
+      {/if}
+      <button
+        class="toolbar-btn tool-customize-btn"
+        onclick={openToolModal}
         disabled={isGenerating || !hasApiKey}
-        title="Choose which tool set is available for this message"
-        aria-label="Tool set"
+        title="Customize which individual tools are available for this message"
       >
-        {#each TOOL_GROUPS as group}
-          <option value={group.id} title={group.description}>{group.label}</option>
-        {/each}
-      </select>
+        <i class="fas fa-sliders-h"></i>
+      </button>
       <textarea
         bind:this={inputEl}
         bind:value={inputText}
@@ -1672,6 +1780,40 @@ IMPORTANT: You already have all the information you need about this character fr
   .tool-group-select:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+
+  .custom-tool-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    justify-content: center;
+    color: #fff;
+    background: rgba(139, 92, 246, 0.25);
+    border-color: rgba(139, 92, 246, 0.5);
+    white-space: nowrap;
+  }
+
+  .custom-tool-clear {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 0.85em;
+  }
+
+  .custom-tool-clear:hover {
+    background: rgba(220, 38, 38, 0.5);
+    color: #fff;
+  }
+
+  .tool-customize-btn {
+    flex-shrink: 0;
+    min-height: 38px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
   }
 
   .input-area textarea {

@@ -16,6 +16,12 @@ export interface ApiProvider {
 	apiKey: string
 }
 
+export interface ToolPreset {
+	id: string
+	name: string
+	toolNames: string[]
+}
+
 export interface FoundryAISettings {
 	mcpBridgeEnabled: boolean
 	mcpServerUrl: string
@@ -66,6 +72,7 @@ export interface FoundryAISettings {
 	summarizeKeepMessages: number
 	captureSessionEvents: boolean
 	sessionEvents: string
+	toolPresets: ToolPreset[]
 }
 
 export function registerSettings(): void {
@@ -459,6 +466,15 @@ export function registerSettings(): void {
 		config: false,
 		type: Boolean,
 		default: true,
+	})
+
+	game.settings.register(MODULE_ID, 'toolPresets', {
+		name: 'Tool Presets',
+		hint: 'Saved custom tool selections for the in-chat "Customize Tools" picker',
+		scope: 'client',
+		config: false,
+		type: Array,
+		default: [],
 	})
 
 	// ---- TTS Settings ----

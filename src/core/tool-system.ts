@@ -259,9 +259,26 @@ const CORE_TOOLS: ToolDefinition[] = [
 	{
 		type: 'function',
 		function: {
+			name: 'list_actors_in_folder',
+			description: 'List every actor in a specific folder (id, name, type, img). Use this to enumerate "who is in folder X" — e.g. the party or a folder of NPCs — instead of search_actors, which is a relevance search over biography text and will not reliably return a complete or correct folder listing. Get folder_id from list_folders.',
+			parameters: {
+				type: 'object',
+				properties: {
+					folder_id: {
+						type: 'string',
+						description: 'The actor folder ID to list, e.g. from list_folders',
+					},
+				},
+				required: ['folder_id'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
 			name: 'create_journal',
 			description:
-				'Create a new journal entry in a specified folder. Supports multi-page journals and auto-formatted quest journals with styled headers, details grids, and GM notes. Session recaps MUST go in the "Sessions" folder. Notes and stored data MUST go in the "Notes" folder.',
+				'Create a new journal entry in a specified folder. Supports multi-page journals and auto-formatted quest journals with styled headers, details grids, and GM notes. Session recaps MUST go in the "Sessions" folder. The "Notes" folder is ONLY for short, curated plot-state bullets that should always be considered going forward — it is loaded into every future prompt in full, so NEVER put reference material, extracted PDF content, or stat-block dossiers there; put those in any other folder instead.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1133,7 +1150,7 @@ const ACTOR_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'update_actor',
 			description:
-				'Update an existing actor\'s data (biography, abilities, HP, AC, stats, etc.). Uses dot-notation paths like "system.attributes.hp.max".',
+				'Update an existing actor\'s data (biography, abilities, HP, AC, stats, portrait/token image, etc.). Uses dot-notation paths like "system.attributes.hp.max". To set the actor\'s sidebar portrait, pass a top-level "img" key with a path from list_assets — this is also how you apply an extracted/generated portrait to an actor. To set the token art shown on the canvas too, also set "prototypeToken.texture.src" to the same or a different path.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1141,7 +1158,7 @@ const ACTOR_TOOLS: ToolDefinition[] = [
 					data: {
 						type: 'object',
 						description:
-							'Key-value pairs of data to update. Use dot-notation for nested paths, e.g. { "system.attributes.hp.max": 50, "system.details.biography.value": "<p>New bio</p>" }',
+							'Key-value pairs of data to update. Use dot-notation for nested paths, e.g. { "system.attributes.hp.max": 50, "system.details.biography.value": "<p>New bio</p>" }. For portraits: { "img": "foundry-ai/images/portrait.png" }. For token art: { "prototypeToken.texture.src": "foundry-ai/images/portrait.png" }.',
 					},
 				},
 				required: ['actor_id', 'data'],
@@ -1482,8 +1499,14 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'list_assets',
-			description: 'List all previously generated images and maps saved locally. Check this before generating new images — an existing asset may already be suitable. Filenames describe the content.',
-			parameters: { type: 'object', properties: {} },
+			description: 'List image files stored on the Foundry server. With no arguments, lists only previously generated/extracted images and maps (foundry-ai/images, foundry-ai/maps) — check this before generating new images, an existing asset may already be suitable. Pass "directory" to instead browse any other server folder (e.g. "icons", "tokens", "systems/dnd5e/tokens", or an actor\'s own art folder) for existing artwork not made by this module. ALWAYS call this to get the exact "path" value before applying an image to an actor, item, or scene — never guess or reconstruct a path from memory.',
+			parameters: {
+				type: 'object',
+				properties: {
+					directory: { type: 'string', description: 'Optional server folder to browse recursively instead of the default generated-assets folders, e.g. "icons", "tokens", "systems/dnd5e/tokens".' },
+					search: { type: 'string', description: 'Optional case-insensitive substring to filter filenames by. Recommended when browsing large built-in folders like "icons".' },
+				},
+			},
 		},
 	},
 	{
@@ -1714,7 +1737,60 @@ export function getEnabledTools(group: ToolGroupId = 'all'): ToolDefinition[] {
 		if (getSetting('enableChatTools')) tools.push(...CHAT_TOOLS)
 	}
 
-	return tools
+	// Dedupe — e.g. CHAT_TOOLS is reachable via both "gameplay" and "automation",
+	// which would otherwise send the same tool name to the LLM twice.
+	const seen = new Set<string>()
+	return tools.filter(t => {
+		if (seen.has(t.function.name)) return false
+		seen.add(t.function.name)
+		return true
+	})
+}
+
+// ---- Per-tool selection (for the in-chat "customize tools" picker) ----
+
+export interface ToolCategory {
+	id: string
+	label: string
+	tools: ToolDefinition[]
+}
+
+/** Individual tool categories, used to render per-tool checkboxes grouped in the UI. */
+export const TOOL_CATEGORIES: ToolCategory[] = [
+	{ id: 'core', label: 'Core (search & read)', tools: CORE_TOOLS },
+	{ id: 'campaign', label: 'Campaign dashboards', tools: CAMPAIGN_TOOLS },
+	{ id: 'scene', label: 'Scenes', tools: SCENE_TOOLS },
+	{ id: 'dice', label: 'Dice', tools: DICE_TOOLS },
+	{ id: 'token', label: 'Tokens', tools: TOKEN_TOOLS },
+	{ id: 'combat', label: 'Combat', tools: COMBAT_TOOLS },
+	{ id: 'audio', label: 'Audio', tools: AUDIO_TOOLS },
+	{ id: 'chat', label: 'Chat & narration', tools: CHAT_TOOLS },
+	{ id: 'compendium', label: 'Compendium', tools: COMPENDIUM_TOOLS },
+	{ id: 'spatial', label: 'Spatial', tools: SPATIAL_TOOLS },
+	{ id: 'actor', label: 'Actors', tools: ACTOR_TOOLS },
+	{ id: 'item', label: 'Items', tools: ITEM_TOOLS },
+	{ id: 'macro', label: 'Macros', tools: MACRO_TOOLS },
+	{ id: 'image', label: 'Images & scene gen', tools: IMAGE_TOOLS },
+	{ id: 'pdf', label: 'PDFs', tools: PDF_TOOLS },
+]
+
+/** Tools currently allowed by the world-level category toggles — the pool the per-message tool picker can choose from. */
+export function getAvailableTools(): ToolDefinition[] {
+	return getEnabledTools('all')
+}
+
+/** Resolve tool definitions for an arbitrary set of tool names, preserving canonical order and dropping anything not currently available. */
+export function getToolsByNames(names: string[] | Set<string>): ToolDefinition[] {
+	const wanted = names instanceof Set ? names : new Set(names)
+	return getAvailableTools().filter(t => wanted.has(t.function.name))
+}
+
+/** A per-message tool selection: either one of the built-in TOOL_GROUPS, or an ad-hoc list of individual tool names. */
+export type ActiveToolSelection = { group: ToolGroupId } | { custom: string[] }
+
+export function resolveActiveTools(selection: ActiveToolSelection): ToolDefinition[] {
+	if ('custom' in selection) return getToolsByNames(selection.custom)
+	return getEnabledTools(selection.group)
 }
 
 // ---- Tool Execution ----
@@ -1757,6 +1833,8 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return handleGetJournal(args.journal_id)
 			case 'get_actor':
 				return handleGetActor(args.actor_id)
+			case 'list_actors_in_folder':
+				return handleListActorsInFolder(args.folder_id)
 			case 'create_journal':
 				return await handleCreateJournal(args.name, args.content, args.folder_name, args.folder_id, args.additional_pages, args.quest_meta)
 			case 'update_journal':
@@ -1900,7 +1978,7 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 
 			// Image & Scene generation tools
 			case 'list_assets':
-				return await handleListAssets()
+				return await handleListAssets(args.directory, args.search)
 			case 'describe_image':
 				return await handleDescribeImage(args.image_path, args.question)
 			case 'organize_images':
@@ -2128,6 +2206,34 @@ function handleGetActor(actorId: string): string {
 		type: actor?.type || 'Unknown',
 		folder: actor?.folder?.name || 'Root',
 		content,
+	})
+}
+
+function handleListActorsInFolder(folderId: string): string {
+	console.log(`FoundryAI | list_actors_in_folder: folderId="${folderId}"`)
+	if (!game.actors) {
+		return JSON.stringify({ error: 'Actor collection not available' })
+	}
+
+	if (!isActorFolderAllowed(folderId)) {
+		console.log(`FoundryAI | list_actors_in_folder: folder not allowed`)
+		return JSON.stringify({
+			error: `Folder not found: "${folderId}". folder_id must be an actual folder ID, not a folder name — call list_folders to get the correct ID.`,
+		})
+	}
+
+	const actors: Array<{ id: string; name: string; type: string; img: string | null }> = []
+	for (const actor of game.actors.values()) {
+		if (actor.folder?.id === folderId) {
+			actors.push({ id: actor.id, name: actor.name, type: actor.type, img: actor.img || null })
+		}
+	}
+
+	const folder = game.folders?.get(folderId)
+	return JSON.stringify({
+		folder: folder?.name || 'Unknown',
+		actors,
+		count: actors.length,
 	})
 }
 
@@ -3881,33 +3987,79 @@ function promptToSlug(prompt: string, maxWords = 7): string {
 		.join('-')
 }
 
-async function handleListAssets(): Promise<string> {
+/**
+ * Recursively browse a directory tree, collecting every file found at any depth.
+ * extract_pdf_images and organize_images both nest files a level or two below
+ * foundry-ai/images/ (per-PDF and per-category subfolders), so a flat browse()
+ * silently misses them — which previously left the AI with no way to look up
+ * real paths and led it to invent plausible-looking ones instead.
+ */
+const ASSET_IMAGE_EXT = /\.(png|webp|jpe?g|gif|svg|avif|webm)$/i
+const LIST_ASSETS_MAX_RESULTS = 300
+
+async function browseFilesRecursive(
+	FP: any,
+	dir: string,
+	type: string,
+	results: { path: string; name: string; type: string }[],
+	depth = 0,
+	maxResults = Infinity,
+): Promise<void> {
+	if (depth > 5 || results.length >= maxResults) return // safety guard against pathological/huge directory trees
+	let browse: any
+	try {
+		browse = await FP.browse('data', dir)
+	} catch {
+		return // directory may not exist yet
+	}
+	for (const file of browse.files ?? []) {
+		if (results.length >= maxResults) return
+		if (!ASSET_IMAGE_EXT.test(file)) continue
+		const name = file.split('/').pop() ?? file
+		results.push({ path: file, name, type })
+	}
+	for (const subdir of browse.dirs ?? []) {
+		if (results.length >= maxResults) return
+		await browseFilesRecursive(FP, subdir, type, results, depth + 1, maxResults)
+	}
+}
+
+async function handleListAssets(directory?: string, search?: string): Promise<string> {
 	try {
 		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
 		const results: { path: string; name: string; type: string }[] = []
 
-		const browseDirs = [
-			{ dir: 'foundry-ai/images', type: 'image' },
-			{ dir: 'foundry-ai/maps', type: 'map' },
-		]
+		const trimmedDir = directory?.trim().replace(/^\/+|\/+$/g, '')
+		const browseDirs = trimmedDir
+			? [{ dir: trimmedDir, type: 'image' }]
+			: [
+				{ dir: 'foundry-ai/images', type: 'image' },
+				{ dir: 'foundry-ai/maps', type: 'map' },
+			]
 
 		for (const { dir, type } of browseDirs) {
-			try {
-				const browse = await (FP as any).browse('data', dir)
-				for (const file of browse.files ?? []) {
-					const name = file.split('/').pop() ?? file
-					results.push({ path: file, name, type })
-				}
-			} catch {
-				// Directory may not exist yet
-			}
+			await browseFilesRecursive(FP, dir, type, results, 0, LIST_ASSETS_MAX_RESULTS)
+			if (results.length >= LIST_ASSETS_MAX_RESULTS) break
 		}
 
-		if (results.length === 0) return JSON.stringify({ assets: [], message: 'No generated assets found yet.' })
+		let assets = results
+		if (search?.trim()) {
+			const q = search.trim().toLowerCase()
+			assets = assets.filter(a => a.name.toLowerCase().includes(q))
+		}
 
+		if (assets.length === 0) {
+			return JSON.stringify({
+				assets: [],
+				message: trimmedDir ? `No image files found under "${trimmedDir}".` : 'No generated assets found yet.',
+			})
+		}
+
+		const truncated = results.length >= LIST_ASSETS_MAX_RESULTS
 		return JSON.stringify({
-			assets: results,
-			message: `Found ${results.length} generated asset(s). Filenames describe the content — use path when referencing an asset.`,
+			assets,
+			...(truncated ? { truncated: true } : {}),
+			message: `Found ${assets.length} asset(s)${truncated ? ` (stopped at ${LIST_ASSETS_MAX_RESULTS} — narrow with "search" or a more specific "directory")` : ''}. Use the "path" value exactly as given when referencing an asset — never guess or invent a path.`,
 		})
 	} catch (error: any) {
 		return JSON.stringify({ error: `Failed to list assets: ${error.message}` })
