@@ -1,8 +1,24 @@
 import { z } from 'zod';
 import dotenv from 'dotenv';
+import * as path from 'path';
+import * as fs from 'fs';
+import { fileURLToPath } from 'url';
 import { getFoundryDataDir, getDefaultComfyUIDir } from './utils/platform.js';
 
-dotenv.config();
+// Load .env relative to this module, not just process.cwd() — MCP hosts spawn
+// the server from arbitrary working directories, so a cwd-only lookup silently
+// misses server/.env. Later loads never override vars that are already set.
+const configModuleDir =
+  typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+for (const candidate of [
+  path.join(configModuleDir, '.env'), // next to the built file (dist/.env)
+  path.join(configModuleDir, '..', '.env'), // server/.env when running from dist/
+]) {
+  if (fs.existsSync(candidate)) {
+    dotenv.config({ path: candidate });
+  }
+}
+dotenv.config(); // cwd fallback
 
 const ConfigSchema = z.object({
   logLevel: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
@@ -44,6 +60,9 @@ const ConfigSchema = z.object({
     installPath: z.string(), // No default here - set in rawConfig
     host: z.string().default('127.0.0.1'),
     pythonCommand: z.string().default('python/python.exe'), // Will be platform-specific
+    // Set COMFYUI_AUTO_START=false when running your own ComfyUI instance —
+    // the server will then only connect (host:port), never try to spawn one.
+    autoStart: z.boolean().default(true),
   }),
   toolResponseMaxChars: z.number().min(256).max(500000).default(20000),
   server: z.object({
@@ -81,11 +100,14 @@ const rawConfig = {
     },
   },
   comfyui: {
-    // ComfyUI always runs locally on the same machine as the MCP server (localhost:31411)
+    // ComfyUI always runs locally on the same machine as the MCP server.
+    // Point at an existing instance with COMFYUI_PORT / COMFYUI_HOST (e.g. 8188),
+    // and set COMFYUI_AUTO_START=false so the server doesn't spawn its own.
     port: parseInt(process.env.COMFYUI_PORT || '31411', 10),
     installPath: process.env.COMFYUI_INSTALL_PATH || getDefaultComfyUIDir(),
     host: process.env.COMFYUI_HOST || '127.0.0.1',
     pythonCommand: process.env.COMFYUI_PYTHON_COMMAND || 'python/python.exe',
+    autoStart: process.env.COMFYUI_AUTO_START !== 'false',
   },
   toolResponseMaxChars: parseInt(process.env.TOOL_RESPONSE_MAX_CHARS || '20000', 10),
   server: {

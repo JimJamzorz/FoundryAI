@@ -1,0 +1,77 @@
+{
+	"_template": {
+		"description": "Image-to-image restyle/variation. Feed a reference image (uploaded via /upload/image) and a prompt; denoise controls how much changes (0.3 = subtle variation, 0.55 = same composition new details, 0.75 = loose inspiration). Uses only core ComfyUI nodes.",
+		"negative_default": "text, watermark, logo, caption, blurry, artifacts, low quality",
+		"defaults": {
+			"model": "dDBattlemapsSDXL10_upscaleV10.safetensors"
+		}
+	},
+	"1": {
+		"_meta": { "title": "MODEL" },
+		"class_type": "CheckpointLoaderSimple",
+		"inputs": {
+			"ckpt_name": "dDBattlemapsSDXL10_upscaleV10.safetensors"
+		}
+	},
+	"2": {
+		"_meta": { "title": "POSITIVE_PROMPT" },
+		"class_type": "CLIPTextEncode",
+		"inputs": {
+			"text": "",
+			"clip": ["1", 1]
+		}
+	},
+	"3": {
+		"_meta": { "title": "NEGATIVE_PROMPT" },
+		"class_type": "CLIPTextEncode",
+		"inputs": {
+			"text": "",
+			"clip": ["1", 1]
+		}
+	},
+	"10": {
+		"_meta": { "title": "REFERENCE_IMAGE" },
+		"class_type": "LoadImage",
+		"inputs": {
+			"image": "reference.png"
+		}
+	},
+	"11": {
+		"class_type": "VAEEncode",
+		"inputs": {
+			"pixels": ["10", 0],
+			"vae": ["1", 2]
+		}
+	},
+	"5": {
+		"_meta": { "title": "SAMPLER" },
+		"class_type": "KSampler",
+		"inputs": {
+			"seed": 0,
+			"steps": 20,
+			"cfg": 4.0,
+			"denoise": 0.55,
+			"sampler_name": "dpmpp_2m_sde",
+			"scheduler": "karras",
+			"model": ["1", 0],
+			"positive": ["2", 0],
+			"negative": ["3", 0],
+			"latent_image": ["11", 0]
+		}
+	},
+	"6": {
+		"class_type": "VAEDecode",
+		"inputs": {
+			"samples": ["5", 0],
+			"vae": ["1", 2]
+		}
+	},
+	"7": {
+		"_meta": { "title": "SAVE" },
+		"class_type": "SaveImage",
+		"inputs": {
+			"filename_prefix": "restyle",
+			"images": ["6", 0]
+		}
+	}
+}

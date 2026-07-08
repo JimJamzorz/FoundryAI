@@ -2061,9 +2061,16 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			// NOT an LLM tool — intentionally absent from TOOL_DEFINITIONS. This is a
 			// server-internal RPC: the map-generation backend pushes base64 PNG data
 			// through the MCP bridge (foundry-ai.tool.upload_generated_map) to save
-			// finished maps into foundry-ai/maps/. An LLM cannot supply imageData.
+			// finished images into foundry-ai/maps/ (or foundry-ai/images/ via the
+			// folder arg). An LLM cannot supply imageData.
 			case 'upload_generated_map':
-				return await handleUploadGeneratedMap(args.filename, args.imageData)
+				return await handleUploadGeneratedMap(args.filename, args.imageData, args.folder)
+			// NOT an LLM tool either — the inverse of upload_generated_map: the server
+			// pulls a Foundry asset's bytes (base64) to use as an img2img reference in
+			// ComfyUI. The browser client fetches it since only Foundry knows its own
+			// storage (which may not share a filesystem with the server).
+			case 'read_asset':
+				return await handleReadAsset(args.path)
 			case 'generate_image':
 				return await handleGenerateImage(args.prompt, args.size)
 			case 'generate_scene':
@@ -4773,8 +4780,8 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 	}
 }
 
-async function handleUploadGeneratedMap(filename: string, imageData: string): Promise<string> {
-	console.log(`FoundryAI | upload_generated_map: filename="${filename}"`)
+async function handleUploadGeneratedMap(filename: string, imageData: string, folder?: string): Promise<string> {
+	console.log(`FoundryAI | upload_generated_map: filename="${filename}", folder="${folder || 'maps'}"`)
 	try {
 		if (!filename || typeof filename !== 'string') {
 			return JSON.stringify({ success: false, error: 'filename is required' })
@@ -4782,6 +4789,10 @@ async function handleUploadGeneratedMap(filename: string, imageData: string): Pr
 		if (!imageData || typeof imageData !== 'string') {
 			return JSON.stringify({ success: false, error: 'imageData is required' })
 		}
+
+		// Allow-list destinations — this handler is reachable over the bridge,
+		// so it must not accept arbitrary upload paths.
+		const subfolder = folder === 'images' ? 'images' : 'maps'
 
 		const bytes = atob(imageData)
 		const arr = new Uint8Array(bytes.length)
@@ -4791,15 +4802,61 @@ async function handleUploadGeneratedMap(filename: string, imageData: string): Pr
 
 		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
 		await FP.createDirectory('data', 'foundry-ai').catch(() => {})
-		await FP.createDirectory('data', 'foundry-ai/maps').catch(() => {})
+		await FP.createDirectory('data', `foundry-ai/${subfolder}`).catch(() => {})
 
-		const uploadResult = await FP.upload('data', 'foundry-ai/maps', file, {}, { notify: false })
-		const savedPath = (uploadResult as any)?.path || `foundry-ai/maps/${filename}`
+		const uploadResult = await FP.upload('data', `foundry-ai/${subfolder}`, file, {}, { notify: false })
+		const savedPath = (uploadResult as any)?.path || `foundry-ai/${subfolder}/${filename}`
 
 		console.log(`FoundryAI | upload_generated_map: saved to "${savedPath}"`)
 		return JSON.stringify({ success: true, path: savedPath })
 	} catch (error: any) {
 		console.error('FoundryAI | upload_generated_map: failed', error)
+		return JSON.stringify({ success: false, error: error.message })
+	}
+}
+
+/**
+ * Bridge-only (see the executeTool case comment): fetch a Foundry image asset
+ * and return its bytes as base64 so the server can feed it to ComfyUI as an
+ * img2img / style reference.
+ */
+async function handleReadAsset(assetPath: string): Promise<string> {
+	console.log(`FoundryAI | read_asset: path="${assetPath}"`)
+	try {
+		if (!assetPath || typeof assetPath !== 'string') {
+			return JSON.stringify({ success: false, error: 'path is required' })
+		}
+
+		// The module runs on the Foundry origin, so data paths are directly fetchable.
+		let response = await fetch(assetPath)
+		if (!response.ok) {
+			// Paths from FilePicker may need URI encoding (spaces etc.)
+			response = await fetch(encodeURI(assetPath))
+		}
+		if (!response.ok) {
+			return JSON.stringify({
+				success: false,
+				error: `Could not fetch asset "${assetPath}" (HTTP ${response.status}). Use an exact path from list_assets.`,
+			})
+		}
+
+		const buffer = await response.arrayBuffer()
+
+		// Chunked btoa — String.fromCharCode(...bigArray) overflows the call stack
+		// on large images.
+		const bytes = new Uint8Array(buffer)
+		let binary = ''
+		const chunkSize = 0x8000
+		for (let i = 0; i < bytes.length; i += chunkSize) {
+			binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+		}
+		const imageData = btoa(binary)
+
+		const filename = assetPath.split('/').pop() || 'asset.png'
+		console.log(`FoundryAI | read_asset: read ${bytes.length} bytes from "${assetPath}"`)
+		return JSON.stringify({ success: true, filename, size: bytes.length, imageData })
+	} catch (error: any) {
+		console.error('FoundryAI | read_asset: failed', error)
 		return JSON.stringify({ success: false, error: error.message })
 	}
 }

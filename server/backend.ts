@@ -563,7 +563,18 @@ async function handleGenerateMapRequest(
       size: data.size || 'medium',
       grid_size: data.grid_size || 70,
       quality: data.quality || 'low',
+      model: typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined,
+      template:
+        typeof data.template === 'string' && data.template.trim() ? data.template.trim() : undefined,
     };
+
+    // Validate an explicit model against ComfyUI's installed checkpoints while we
+    // can still return a helpful error — a bad name failing inside the async job
+    // just produces an opaque "failed" status later. Skipped if ComfyUI isn't up
+    // yet (it auto-starts during processing); the job will surface any error then.
+    if (params.model) {
+      await validateModelInstalled(params.model, comfyuiClient, logger);
+    }
 
     const job = await jobQueue.createJob({ params });
     const jobId = job.id;
@@ -586,6 +597,267 @@ async function handleGenerateMapRequest(
       status: 'error',
       message: error.message,
     };
+  }
+}
+
+/**
+ * Reject a model name that isn't installed while we can still return a helpful
+ * error — a bad name failing inside the async job just produces an opaque
+ * "failed" status later. Accepts both namespaces: checkpoints (SDXL templates)
+ * and UNET models (Flux templates). Skipped when ComfyUI isn't reachable yet.
+ */
+async function validateModelInstalled(
+  model: string,
+  comfyuiClient: any,
+  logger: Logger
+): Promise<void> {
+  try {
+    const [checkpoints, unets]: [string[], string[]] = await Promise.all([
+      comfyuiClient.listCheckpoints(),
+      comfyuiClient.listUnets(),
+    ]);
+    const known = [...checkpoints, ...unets];
+    if (known.length > 0 && !known.includes(model)) {
+      throw new Error(
+        `Unknown model "${model}". Installed checkpoints: ${checkpoints.join(', ') || '(none)'}. Installed unet models: ${unets.join(', ') || '(none)'}`
+      );
+    }
+  } catch (validationError: any) {
+    if (validationError.message?.startsWith('Unknown model')) throw validationError;
+    logger.warn('Skipping model validation (ComfyUI not reachable yet)', { model });
+  }
+}
+
+async function handleGenerateStyledImageRequest(
+  message: any,
+  jobQueue: any,
+  comfyuiClient: any,
+  logger: Logger,
+  foundryClient: any
+): Promise<any> {
+  try {
+    logger.info('Styled image generation request received', { message });
+
+    if (!jobQueue || !comfyuiClient) {
+      throw new Error('Image generation components not initialized');
+    }
+
+    const data = message.data || message;
+
+    if (!data.prompt || typeof data.prompt !== 'string') {
+      throw new Error('Prompt is required and must be a string');
+    }
+    if (!data.reference_image || typeof data.reference_image !== 'string') {
+      throw new Error(
+        'reference_image is required — a Foundry asset path from list_assets, e.g. "foundry-ai/images/portrait.png"'
+      );
+    }
+
+    const denoise = data.denoise === undefined ? 0.55 : Number(data.denoise);
+    if (Number.isNaN(denoise) || denoise <= 0 || denoise > 1) {
+      throw new Error('denoise must be a number between 0 (exclusive) and 1');
+    }
+
+    const params = {
+      prompt: data.prompt.trim(),
+      size: data.size || 'medium',
+      grid_size: data.grid_size || 70,
+      // img2img at low step counts degrades badly, so default one tier higher than maps.
+      quality: data.quality || 'medium',
+      model: typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined,
+      template:
+        typeof data.template === 'string' && data.template.trim()
+          ? data.template.trim()
+          : 'img2img-restyle',
+      job_type: 'styled-image' as const,
+      reference_image: data.reference_image.trim(),
+      denoise,
+    };
+
+    if (params.model) {
+      await validateModelInstalled(params.model, comfyuiClient, logger);
+    }
+
+    const job = await jobQueue.createJob({ params });
+    const jobId = job.id;
+
+    processStyledImageInBackend(jobId, jobQueue, comfyuiClient, logger, foundryClient).catch(
+      error => {
+        logger.error('Background styled image generation failed', { jobId, error });
+      }
+    );
+
+    return {
+      status: 'success',
+      jobId: jobId,
+      message:
+        'Styled image generation started. On completion the image is saved to foundry-ai/images/ — the path appears in check-map-status.',
+    };
+  } catch (error: any) {
+    logger.error('Styled image generation request failed', { error: error.message });
+    return {
+      status: 'error',
+      message: error.message,
+    };
+  }
+}
+
+async function processStyledImageInBackend(
+  jobId: string,
+  jobQueue: any,
+  comfyuiClient: any,
+  logger: Logger,
+  foundryClient: any
+): Promise<void> {
+  try {
+    const job = await jobQueue.getJob(jobId);
+    if (!job) throw new Error(`Job ${jobId} not found`);
+    await jobQueue.markJobStarted(jobId);
+
+    // Ensure ComfyUI is up (same auto-start behavior as map jobs)
+    await jobQueue.updateJobProgress(jobId, 10, 'Checking ComfyUI...');
+    const healthInfo = await comfyuiClient.checkHealth();
+    if (!healthInfo.available) {
+      await jobQueue.updateJobProgress(jobId, 15, 'Starting ComfyUI...');
+      await comfyuiClient.startService();
+    }
+
+    // Pull the reference image out of Foundry storage via the bridge
+    await jobQueue.updateJobProgress(jobId, 25, 'Reading reference image from Foundry...');
+    const assetResult = await foundryClient.query('foundry-ai.tool.read_asset', {
+      path: job.params.reference_image,
+    });
+    if (!assetResult?.success || !assetResult.imageData) {
+      throw new Error(
+        `Could not read reference image "${job.params.reference_image}" from Foundry: ${assetResult?.error || 'no data returned'}`
+      );
+    }
+
+    // Push it into ComfyUI's input folder
+    await jobQueue.updateJobProgress(jobId, 35, 'Uploading reference to ComfyUI...');
+    const referenceBuffer = Buffer.from(assetResult.imageData, 'base64');
+    const referenceName = `ref_${jobId}_${assetResult.filename || 'reference.png'}`;
+    const storedName = await comfyuiClient.uploadImage(referenceBuffer, referenceName);
+
+    // Submit the img2img job
+    await jobQueue.updateJobProgress(jobId, 45, 'Submitting to ComfyUI...');
+    const sizePixels = comfyuiClient.getSizePixels(job.params.size);
+    const comfyuiJob = await comfyuiClient.submitJob({
+      prompt: job.params.prompt,
+      width: sizePixels,
+      height: sizePixels,
+      quality: job.params.quality,
+      model: job.params.model,
+      template: job.params.template || 'img2img-restyle',
+      referenceImage: storedName,
+      denoise: job.params.denoise,
+    });
+
+    const currentJob = await jobQueue.getJob(jobId);
+    if (currentJob) {
+      currentJob.comfyui_job_id = comfyuiJob.prompt_id;
+    }
+
+    // Poll to completion, mirroring progress to Foundry like map jobs do
+    await jobQueue.updateJobProgress(jobId, 50, 'Generating styled image...');
+    comfyuiClient.registerProgressCallback(
+      comfyuiJob.prompt_id,
+      (progress: { currentStep: number; totalSteps: number }) => {
+        const progressPercent = Math.floor((progress.currentStep / progress.totalSteps) * 100);
+        foundryClient.sendMessage({
+          type: 'map-generation-progress',
+          data: {
+            jobId: jobId,
+            progress: 50 + progressPercent * 0.4,
+            status: 'AI generating styled image...',
+            queueInfo: {
+              currentStep: progress.currentStep,
+              totalSteps: progress.totalSteps,
+              estimatedTimeRemaining: undefined,
+            },
+          },
+        });
+      }
+    );
+
+    let status = await comfyuiClient.getJobStatus(comfyuiJob.prompt_id);
+    while (status === 'queued' || status === 'running') {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      status = await comfyuiClient.getJobStatus(comfyuiJob.prompt_id);
+    }
+    comfyuiClient.unregisterProgressCallback(comfyuiJob.prompt_id);
+
+    if (status === 'failed') {
+      throw new Error('ComfyUI generation failed');
+    }
+
+    // Download the result and save it into Foundry (images, not maps — no scene)
+    await jobQueue.updateJobProgress(jobId, 90, 'Saving image to Foundry...');
+    const imageFilenames = await comfyuiClient.getJobImages(comfyuiJob.prompt_id);
+    if (!imageFilenames || imageFilenames.length === 0) {
+      throw new Error('No images found in ComfyUI job output');
+    }
+    const imageBuffer = await comfyuiClient.downloadImage(imageFilenames[0]);
+
+    const filename = `styled_${jobId}_${Date.now()}.png`;
+    const uploadResult = await foundryClient.query('foundry-ai.tool.upload_generated_map', {
+      filename,
+      imageData: imageBuffer.toString('base64'),
+      folder: 'images',
+    });
+    if (!uploadResult?.success) {
+      throw new Error(`Failed to upload image to Foundry: ${uploadResult?.error}`);
+    }
+
+    await jobQueue.updateJobProgress(jobId, 100, 'Complete');
+    await jobQueue.markJobComplete(jobId, {
+      generation_time_ms: Date.now() - (job.started_at || job.created_at),
+      image_url: uploadResult.path,
+    });
+
+    logger.info('Styled image generation completed', { jobId, path: uploadResult.path });
+  } catch (error: any) {
+    logger.error('Background styled image processing failed', { jobId, error });
+    await jobQueue.markJobFailed(jobId, error.message);
+    foundryClient.sendMessage({
+      type: 'map-generation-failed',
+      jobId: jobId,
+      error: error.message,
+    });
+  }
+}
+
+async function handleListImageModelsRequest(comfyuiClient: any, logger: Logger): Promise<any> {
+  try {
+    const health = await comfyuiClient.checkHealth();
+    if (!health.available) {
+      return {
+        status: 'error',
+        message:
+          'ComfyUI is not running, so installed models cannot be listed. It starts automatically when a generation job runs; try generate-map, or ask again after a job has started it.',
+      };
+    }
+
+    const [checkpoints, unets, loras, samplers, templates] = await Promise.all([
+      comfyuiClient.listCheckpoints(),
+      comfyuiClient.listUnets(),
+      comfyuiClient.listLoras(),
+      comfyuiClient.listSamplers(),
+      comfyuiClient.listWorkflowTemplates(),
+    ]);
+
+    return {
+      status: 'success',
+      checkpoints,
+      unet_models: unets,
+      loras,
+      samplers,
+      workflow_templates: templates,
+      note: 'Pass a checkpoint or unet filename (exactly as listed) as the "model" argument. Checkpoints suit the SDXL templates; unet_models (Flux) require a Flux template such as txt2img-flux.',
+    };
+  } catch (error: any) {
+    logger.error('list-image-models failed', { error: error.message });
+    return { status: 'error', message: error.message };
   }
 }
 
@@ -767,6 +1039,8 @@ async function processMapGenerationInBackend(
         width: sizePixels,
         height: sizePixels,
         quality: job.params.quality,
+        model: job.params.model,
+        template: job.params.template,
       });
       await fs2.appendFile(
         processDebugLog,
@@ -969,14 +1243,29 @@ async function startBackend(): Promise<void> {
 
     mapGenerationJobQueue = new JobQueue({ logger });
 
+    // Pass the full comfyui config through. installPath/pythonCommand are only
+    // forwarded when explicitly set via env — otherwise the client's own
+    // installation detection would be clobbered by the config-schema defaults.
+    const comfyClientConfig: any = {
+      port: config.comfyui?.port || 31411,
+      host: config.comfyui?.host || '127.0.0.1',
+      autoStart: config.comfyui?.autoStart ?? true,
+    };
+    if (process.env.COMFYUI_INSTALL_PATH) {
+      comfyClientConfig.installPath = process.env.COMFYUI_INSTALL_PATH;
+    }
+    if (process.env.COMFYUI_PYTHON_COMMAND) {
+      comfyClientConfig.pythonCommand = process.env.COMFYUI_PYTHON_COMMAND;
+    }
+
     mapGenerationComfyUIClient = new ComfyUIClient({
       logger,
-      config: {
-        port: config.comfyui?.port || 31411,
-      },
+      config: comfyClientConfig,
     });
 
-    logger.info('Map generation backend components initialized (ComfyUI on localhost:31411)');
+    logger.info(
+      `Map generation backend components initialized (ComfyUI on ${comfyClientConfig.host}:${comfyClientConfig.port}, autoStart=${comfyClientConfig.autoStart})`
+    );
     console.log('FoundryAI MCP Server | map generation components initialized');
 
     if (mapGenerationComfyUIClient && (mapGenerationComfyUIClient as any).config?.autoStart) {
@@ -1117,7 +1406,13 @@ async function startBackend(): Promise<void> {
   const mapTools = mapGenerationTools.getToolDefinitions();
 
   // Tools handled locally — all others forward to FoundryAI
-  const MAP_JOB_TOOLS = new Set(['generate-map', 'check-map-status', 'cancel-map-job']);
+  const MAP_JOB_TOOLS = new Set([
+    'generate-map',
+    'generate-styled-image',
+    'check-map-status',
+    'cancel-map-job',
+    'list-image-models',
+  ]);
 
   // Start Foundry connector (WebSocket server that FoundryAI's mcp-bridge.ts connects to)
   foundryClient.connect().catch(e => {
@@ -1218,6 +1513,20 @@ async function startBackend(): Promise<void> {
                       mapGenerationJobQueue,
                       mapGenerationComfyUIClient,
                       logger
+                    );
+                    break;
+
+                  case 'list-image-models':
+                    result = await handleListImageModelsRequest(mapGenerationComfyUIClient, logger);
+                    break;
+
+                  case 'generate-styled-image':
+                    result = await handleGenerateStyledImageRequest(
+                      args,
+                      mapGenerationJobQueue,
+                      mapGenerationComfyUIClient,
+                      logger,
+                      foundryClient
                     );
                     break;
                 }

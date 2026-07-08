@@ -23,6 +23,7 @@
     "lock.ts",
     "logger.ts",
     "comfyui-client.ts",
+    "workflow-templates.ts",
     "webrtc-peer.ts",
     "tools/**/*.ts",
     "utils/**/*.ts"

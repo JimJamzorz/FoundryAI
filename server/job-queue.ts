@@ -7,6 +7,18 @@ export interface GenerateMapInput {
   prompt: string;
   size: 'small' | 'medium' | 'large';
   grid_size: number;
+  scene_name?: string;
+  quality?: 'low' | 'medium' | 'high';
+  /** Checkpoint filename override (from list-image-models). */
+  model?: string;
+  /** Workflow template name override (server/workflows/*.json). */
+  template?: string;
+  /** 'map' (default) creates a scene on completion; 'styled-image' just saves the image. */
+  job_type?: 'map' | 'styled-image';
+  /** Foundry asset path used as the img2img reference (styled-image jobs). */
+  reference_image?: string;
+  /** img2img denoise 0–1 (styled-image jobs). */
+  denoise?: number;
 }
 
 export interface CreateJobParams {
@@ -332,10 +344,19 @@ export class JobQueue {
   }
 
   private generatePromptHash(params: GenerateMapInput): string {
+    // Every field that changes the output must be hashed — the hash dedupes
+    // "identical" requests, and e.g. the same prompt against two different
+    // reference images or models is NOT the same job.
     const hashInput = JSON.stringify({
       prompt: params.prompt.trim().toLowerCase(),
       size: params.size,
       grid_size: params.grid_size,
+      quality: params.quality,
+      model: params.model,
+      template: params.template,
+      job_type: params.job_type,
+      reference_image: params.reference_image,
+      denoise: params.denoise,
     });
 
     return createHash('sha256').update(hashInput).digest('hex').substring(0, 16);

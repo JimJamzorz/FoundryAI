@@ -12,6 +12,7 @@ import {
   isValidComfyUIPath,
   getDefaultPythonCommand as getComfyUIPythonCommand,
 } from './utils/comfyui-paths.js';
+import { WorkflowLibrary, WorkflowGraph, WorkflowPatches } from './workflow-templates.js';
 
 export interface ComfyUIWorkflowInput {
   prompt: string;
@@ -19,6 +20,16 @@ export interface ComfyUIWorkflowInput {
   height: number;
   seed?: number;
   quality?: 'low' | 'medium' | 'high';
+  /** Checkpoint filename from listCheckpoints(). Falls back to the template's default. */
+  model?: string;
+  /** Workflow template name (server/workflows/*.json). Default: txt2img-map, or img2img-restyle when referenceImage is set. */
+  template?: string;
+  /** ComfyUI-side image name (from uploadImage) for img2img / styled workflows. */
+  referenceImage?: string;
+  /** img2img denoise 0–1: how far to depart from the reference image. */
+  denoise?: number;
+  /** Override the template's default negative prompt. */
+  negativePrompt?: string;
 }
 
 export interface ComfyUIJobResponse {
@@ -60,10 +71,14 @@ export class ComfyUIClient {
     string,
     (progress: { currentStep: number; totalSteps: number }) => void
   > = new Map();
+  private workflows: WorkflowLibrary;
+  private objectInfoCache?: { data: any; fetchedAt: number };
+  private static readonly OBJECT_INFO_TTL_MS = 5 * 60 * 1000;
 
   constructor(options: { logger: Logger; config?: Partial<ComfyUIConfig> }) {
     this.logger = options.logger.child({ component: 'ComfyUIClient' });
     this.clientId = `ai-maps-server-${Date.now()}`;
+    this.workflows = new WorkflowLibrary(this.logger);
 
     // ComfyUI always runs locally on the same machine as the MCP server
     // Try to detect existing installation, fall back to default path
@@ -231,6 +246,15 @@ export class ComfyUIClient {
   }
 
   async startService(): Promise<void> {
+    // Externally-managed instance: never spawn our own — connecting is the
+    // user's responsibility, so fail with instructions instead of a mystery
+    // second ComfyUI on the wrong port.
+    if (!this.config.autoStart) {
+      throw new Error(
+        `ComfyUI is not reachable at ${this.baseUrl} and auto-start is disabled (COMFYUI_AUTO_START=false). Start your ComfyUI instance and try again.`
+      );
+    }
+
     // Skip process spawning if no install path (remote mode)
     if (!this.config.installPath) {
       this.logger.info('ComfyUI in remote mode - skipping service start');
@@ -387,9 +411,219 @@ export class ComfyUIClient {
     throw new Error('ComfyUI service failed to become ready within timeout');
   }
 
-  async submitJob(input: ComfyUIWorkflowInput): Promise<ComfyUIJobResponse> {
-    const workflow = this.buildWorkflow(input);
+  // ---- Resource discovery (/object_info) ----
 
+  /** Fetch (and cache) ComfyUI's node/model registry. */
+  async getObjectInfo(forceRefresh = false): Promise<any> {
+    const now = Date.now();
+    if (
+      !forceRefresh &&
+      this.objectInfoCache &&
+      now - this.objectInfoCache.fetchedAt < ComfyUIClient.OBJECT_INFO_TTL_MS
+    ) {
+      return this.objectInfoCache.data;
+    }
+
+    const response = await axios.get(`${this.baseUrl}/object_info`, { timeout: 15000 });
+    this.objectInfoCache = { data: response.data, fetchedAt: now };
+    return response.data;
+  }
+
+  /** Enum options for one input of one node class, e.g. checkpoints for CheckpointLoaderSimple.ckpt_name. */
+  private async getNodeInputOptions(classType: string, inputName: string): Promise<string[]> {
+    try {
+      const info = await this.getObjectInfo();
+      const options = info?.[classType]?.input?.required?.[inputName]?.[0];
+      return Array.isArray(options) ? options : [];
+    } catch (error: any) {
+      this.logger.warn('Failed to read node input options from object_info', {
+        classType,
+        inputName,
+        error: error.message,
+      });
+      return [];
+    }
+  }
+
+  async listCheckpoints(): Promise<string[]> {
+    return this.getNodeInputOptions('CheckpointLoaderSimple', 'ckpt_name');
+  }
+
+  async listLoras(): Promise<string[]> {
+    return this.getNodeInputOptions('LoraLoader', 'lora_name');
+  }
+
+  /** Diffusion models loaded via UNETLoader (Flux and friends) — separate namespace from checkpoints. */
+  async listUnets(): Promise<string[]> {
+    return this.getNodeInputOptions('UNETLoader', 'unet_name');
+  }
+
+  async listSamplers(): Promise<string[]> {
+    return this.getNodeInputOptions('KSampler', 'sampler_name');
+  }
+
+  /** Class types used by a workflow that this ComfyUI install doesn't have (missing custom nodes). */
+  async validateWorkflowNodes(graph: WorkflowGraph): Promise<string[]> {
+    const info = await this.getObjectInfo();
+    const missing = new Set<string>();
+    for (const node of Object.values(graph)) {
+      if (!info?.[node.class_type]) missing.add(node.class_type);
+    }
+    return [...missing];
+  }
+
+  /** Templates available for submitJob's `template` input. */
+  async listWorkflowTemplates(): Promise<
+    Array<{ name: string; description?: string; titles: string[]; class_types: string[] }>
+  > {
+    await this.workflows.ensureLoaded();
+    return this.workflows.list();
+  }
+
+  // ---- Image upload (for img2img / reference-image workflows) ----
+
+  /**
+   * Upload an image into ComfyUI's input folder. Returns the stored name to
+   * use as a LoadImage node's `image` input (via the REFERENCE_IMAGE patch).
+   */
+  async uploadImage(imageData: Buffer, filename: string): Promise<string> {
+    const FormDataCtor = (globalThis as any).FormData;
+    const BlobCtor = (globalThis as any).Blob;
+    if (!FormDataCtor || !BlobCtor) {
+      throw new Error('Native FormData/Blob unavailable — Node 18+ required for image upload');
+    }
+
+    const form = new FormDataCtor();
+    form.append('image', new BlobCtor([imageData], { type: 'image/png' }), filename);
+    form.append('overwrite', 'true');
+
+    const response = await axios.post(`${this.baseUrl}/upload/image`, form, { timeout: 30000 });
+    const storedName = response.data?.name || filename;
+    this.logger.info('Uploaded image to ComfyUI', { filename, storedName });
+    return storedName;
+  }
+
+  // ---- Job submission ----
+
+  async submitJob(input: ComfyUIWorkflowInput): Promise<ComfyUIJobResponse> {
+    let workflow: Record<string, any>;
+    try {
+      workflow = await this.buildWorkflowFromTemplate(input);
+    } catch (templateError: any) {
+      // Explicit template/model requests must fail loudly — silently generating
+      // with the default workflow would look like success with wrong output.
+      if (input.template || input.model || input.referenceImage) throw templateError;
+      this.logger.warn('Template workflow unavailable — using built-in fallback', {
+        error: templateError.message,
+      });
+      workflow = this.buildWorkflow(input);
+    }
+
+    return this.submitWorkflowGraph(workflow);
+  }
+
+  /**
+   * Build a graph from a workflow template, patching prompt/model/size/steps
+   * by node title. Throws if the template (or a required title) is missing.
+   */
+  private async buildWorkflowFromTemplate(input: ComfyUIWorkflowInput): Promise<WorkflowGraph> {
+    await this.workflows.ensureLoaded();
+
+    const templateName = input.template ?? (input.referenceImage ? 'img2img-restyle' : 'txt2img-map');
+    const template = this.workflows.get(templateName);
+    if (!template) {
+      throw new Error(
+        `Workflow template "${templateName}" not found. Available: ${this.workflows
+          .list()
+          .map(t => t.name)
+          .join(', ') || '(none)'}`
+      );
+    }
+
+    const meta = template.meta;
+    const quality = input.quality || 'low';
+    const defaultSteps = quality === 'high' ? 35 : quality === 'medium' ? 20 : 8;
+    // Templates for distilled models (Lightning etc.) override the step mapping.
+    const steps = meta.quality_steps?.[quality] ?? defaultSteps;
+    const positive = `${meta.prompt_prefix ?? ''}${input.prompt}${meta.prompt_suffix ?? ''}`;
+    const negative = input.negativePrompt ?? meta.negative_default ?? '';
+
+    const seed = input.seed ?? Math.floor(Math.random() * 1000000);
+
+    // Patch by title, but only titles the template actually has — architectures
+    // spread these inputs across different nodes (classic SDXL: one KSampler;
+    // Flux: RandomNoise + BasicScheduler + SamplerCustomAdvanced; no negative).
+    const patches: WorkflowPatches = {
+      POSITIVE_PROMPT: { text: positive },
+    };
+    if (template.titles.has('NEGATIVE_PROMPT')) {
+      patches.NEGATIVE_PROMPT = { text: negative };
+    }
+    if (template.titles.has('SAMPLER')) {
+      patches.SAMPLER = { seed, steps, denoise: input.denoise };
+    }
+    if (template.titles.has('NOISE')) {
+      patches.NOISE = { noise_seed: seed };
+    }
+    if (template.titles.has('SCHEDULER')) {
+      patches.SCHEDULER = { steps, denoise: input.denoise };
+    }
+
+    const model = input.model ?? meta.defaults?.model;
+    if (model && template.titles.has('MODEL')) {
+      // Checkpoint loaders take ckpt_name; UNET loaders (Flux etc.) take unet_name.
+      const modelNode = template.graph[template.titles.get('MODEL')!];
+      const modelKey =
+        'ckpt_name' in modelNode.inputs
+          ? 'ckpt_name'
+          : 'unet_name' in modelNode.inputs
+            ? 'unet_name'
+            : null;
+      if (!modelKey) {
+        throw new Error(
+          `MODEL node in template "${templateName}" has neither ckpt_name nor unet_name — cannot apply model "${model}"`
+        );
+      }
+      patches.MODEL = { [modelKey]: model };
+    }
+    if (template.titles.has('LATENT')) {
+      patches.LATENT = { width: input.width, height: input.height };
+    }
+    // Flux's ModelSamplingFlux node carries its own width/height — keep in sync.
+    if (template.titles.has('MODEL_SAMPLING')) {
+      patches.MODEL_SAMPLING = { width: input.width, height: input.height };
+    }
+    if (input.referenceImage) {
+      if (!template.titles.has('REFERENCE_IMAGE')) {
+        throw new Error(
+          `Template "${templateName}" has no REFERENCE_IMAGE node but a reference image was provided — use an img2img template`
+        );
+      }
+      patches.REFERENCE_IMAGE = { image: input.referenceImage };
+    }
+
+    const graph = this.workflows.instantiate(templateName, patches);
+
+    // Fail fast (with names) if the install is missing custom nodes the template needs.
+    try {
+      const missing = await this.validateWorkflowNodes(graph);
+      if (missing.length > 0) {
+        throw new Error(
+          `ComfyUI is missing node types required by template "${templateName}": ${missing.join(', ')}. Install the corresponding custom nodes.`
+        );
+      }
+    } catch (error: any) {
+      if (error.message?.includes('missing node types')) throw error;
+      // object_info unreachable — let submission surface the real connectivity error.
+      this.logger.debug('Skipping node validation (object_info unavailable)', {
+        error: error.message,
+      });
+    }
+
+    return graph;
+  }
+
+  async submitWorkflowGraph(workflow: Record<string, any>): Promise<ComfyUIJobResponse> {
     try {
       const response = await axios.post(
         `${this.baseUrl}/prompt`,
