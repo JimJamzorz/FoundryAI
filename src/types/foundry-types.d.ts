@@ -265,6 +265,10 @@ interface RollTable extends FoundryDocument {
 	draw: (options?: Record<string, any>) => Promise<any>
 }
 
+declare namespace RollTable {
+	function create(data: Record<string, any>): Promise<RollTable>
+}
+
 interface Macro extends FoundryDocument {
 	type: string
 	command: string

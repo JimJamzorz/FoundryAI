@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Tool System - OpenAI-compatible function calling tools for the LLM
+   Tool System — OpenAI-compatible function calling tools for the LLM
    ========================================================================== */
 
 import { embeddingService } from './embedding-service'
@@ -106,6 +106,24 @@ function isMacroFolderAllowed(folderId: string | undefined | null): boolean {
 		`FoundryAI | isMacroFolderAllowed: folderId="${folderId}", allowed=[${allowed.join(',')}], resolved=[${allAllowed.join(',')}], isAllowed=${isAllowed}`,
 	)
 	return isAllowed
+}
+
+/**
+ * Distinct from "not found": the document exists but its folder isn't in the
+ * allow-list. Surfacing this separately lets the caller tell a permission
+ * problem (fixable in settings) apart from a bad/stale ID (not fixable by
+ * retrying) instead of guessing from an identical generic error.
+ */
+function actorFolderDeniedError(actor: Actor): string {
+	return JSON.stringify({
+		error: `Permission denied: actor "${actor.name}" is in folder "${actor.folder?.name || 'Root'}", which isn't in FoundryAI's allowed actor folders. Enable it in FoundryAI settings, or use search_actors / list_actors_in_folder for actors you do have access to.`,
+	})
+}
+
+function journalFolderDeniedError(entry: JournalEntry): string {
+	return JSON.stringify({
+		error: `Permission denied: journal "${entry.name}" is in folder "${entry.folder?.name || 'Root'}", which isn't in FoundryAI's allowed journal folders. Enable it in FoundryAI settings, or use search_journals / list_journals_in_folder for journals you do have access to.`,
+	})
 }
 
 const FOLDER_SETTING_KEYS = {
@@ -226,13 +244,21 @@ const CORE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'get_journal',
 			description:
-				'Retrieve the full text of every page in a journal entry. Accepts either the Foundry document ID or the exact journal name. This is the ONLY tool needed to read journal content — call it directly after search_journals returns a documentId, or directly by name if you already know it.',
+				'Retrieve the full text of every page in a journal entry. Accepts either the Foundry document ID or the exact journal name. This is the ONLY tool needed to read journal content — call it directly after search_journals returns a documentId, or directly by name if you already know it. Long entries are truncated to max_length characters; when the response has truncated: true, call again with offset set to next_offset to fetch the rest.',
 			parameters: {
 				type: 'object',
 				properties: {
 					journal_id: {
 						type: 'string',
 						description: 'The Foundry document ID of the journal entry, OR the exact journal name',
+					},
+					max_length: {
+						type: 'number',
+						description: 'Maximum number of characters to return (default: 20000)',
+					},
+					offset: {
+						type: 'number',
+						description: 'Character offset to start reading from — use the next_offset from a truncated response to continue (default: 0)',
 					},
 				},
 				required: ['journal_id'],
@@ -243,13 +269,13 @@ const CORE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'get_actor',
-			description: 'Get details about a specific actor (NPC/character) by ID.',
+			description: 'Get full details about a specific actor (NPC/character) by document ID. Requires an ID, not a name — get it from the Available Actors / Player Characters lists in the system prompt, search_actors, or list_actors_in_folder.',
 			parameters: {
 				type: 'object',
 				properties: {
 					actor_id: {
 						type: 'string',
-						description: 'The Foundry VTT document ID of the actor',
+						description: 'The Foundry VTT document ID of the actor (NOT the actor name)',
 					},
 				},
 				required: ['actor_id'],
@@ -343,7 +369,7 @@ const CORE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'update_journal',
 			description:
-				'Update an existing journal entry. By default updates the first text page. Pass page_id to update a specific page (get page IDs from list_journals_in_folder), or new_page_name to append a brand-new page instead of overwriting.',
+				'Update an existing journal entry. WARNING: this REPLACES the target page\'s entire content — to append or edit, first read the current content with get_journal and resubmit the full modified HTML, or pass new_page_name to add a brand-new page without touching existing ones. By default targets the first text page; pass page_id (from list_journals_in_folder) to target a specific page.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -422,16 +448,55 @@ const CORE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'roll_table',
-			description: 'Roll on a roll table by its ID and return the result.',
+			description: 'Roll on a roll table by its document ID and return the result. Get the table_id from list_rolltables. Compendium tables (via search_compendium with type "RollTable") must be imported with import_from_compendium before rolling.',
 			parameters: {
 				type: 'object',
 				properties: {
 					table_id: {
 						type: 'string',
-						description: 'The ID of the roll table',
+						description: 'The document ID of the roll table (NOT the table name) — from list_rolltables',
 					},
 				},
 				required: ['table_id'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'list_rolltables',
+			description: 'List all roll tables in the world with their IDs, formulas, and entry counts. Call this first to find the table_id for roll_table.',
+			parameters: {
+				type: 'object',
+				properties: {},
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'create_rolltable',
+			description: 'Create a new roll table from weighted text entries — random encounters, loot, rumors, complications, etc. The die formula and result ranges are computed automatically from the weights (weight 2 = twice as likely as weight 1). Roll it afterwards with roll_table.',
+			parameters: {
+				type: 'object',
+				properties: {
+					name: { type: 'string', description: 'The table name, e.g. "Forest Random Encounters"' },
+					description: { type: 'string', description: 'Optional description of what the table is for and when to roll it' },
+					results: {
+						type: 'array',
+						description: 'The table entries. Order is preserved; ranges are assigned automatically.',
+						items: {
+							type: 'object',
+							properties: {
+								text: { type: 'string', description: 'The result text, e.g. "2d4 goblins arguing over a stolen pie"' },
+								weight: { type: 'number', description: 'Relative likelihood (default 1). Whole numbers only.' },
+							},
+							required: ['text'],
+						},
+					},
+					folder_name: { type: 'string', description: 'Optional roll-table folder to create the table in (created if missing)' },
+				},
+				required: ['name', 'results'],
 			},
 		},
 	},
@@ -477,7 +542,7 @@ const SCENE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'activate_scene',
-			description: 'Switch the active scene to a different one. All players will be moved to this scene.',
+			description: 'Switch the active scene. DISRUPTIVE: instantly moves every connected player to the new scene — only call when the DM has clearly asked to switch or transition, and confirm first if there is any ambiguity. To inspect a scene without affecting players, use view_scene instead.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -494,7 +559,7 @@ const SCENE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'update_scene',
-			description: 'Update an existing scene\'s properties — rename it, change its background image, or adjust grid settings. To change the background, either pass image_path (an already-generated image) or prompt (generates a new image). Do NOT call generate_image separately before this — pass the prompt directly.',
+			description: 'Update an existing scene\'s properties — rename it, change its background image, adjust grid settings, or set the darkness level for mood (e.g. darken the scene as night falls or the party descends into a crypt). To change the background, either pass image_path (an already-generated image) or prompt (generates a new image). Do NOT call generate_image separately before this — pass the prompt directly.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -509,6 +574,7 @@ const SCENE_TOOLS: ToolDefinition[] = [
 					},
 					grid_distance: { type: 'number', description: 'Grid square distance value (e.g. 5 for 5ft squares)' },
 					grid_units: { type: 'string', description: 'Grid distance units (e.g. "ft")' },
+					darkness: { type: 'number', description: 'Scene darkness level from 0 (fully lit) to 1 (pitch black). E.g. 0 for daytime, 0.5 for dusk, 0.85 for night.' },
 				},
 				required: ['scene_id'],
 			},
@@ -544,7 +610,7 @@ const DICE_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'roll_check',
-			description: 'Roll an ability check or saving throw for a specific actor.',
+			description: 'Roll an ability check or saving throw for a specific actor using the game system\'s own roll logic (D&D 5e ability list; on other systems falls back to a plain 1d20 + ability modifier). Skill checks are not supported — for "roll Perception for the goblin", get the modifier from get_actor and use roll_dice instead. Does NOT post to chat.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -576,7 +642,7 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'place_token',
 			description:
-				'Place a new token on the active scene from an actor. Tokens are placed HIDDEN by default so the DM can approve placement before revealing.',
+				'Place a new token on the active scene from an actor. Coordinates are CANVAS PIXELS (top-left of the token), not grid squares — call get_scene_info first to see existing token positions and the scene\'s pixels-per-square, then compute pixel positions from those (e.g. "2 squares right" = x + 2 × pixels-per-square). Tokens are placed HIDDEN by default so the DM can approve placement before revealing.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -586,11 +652,11 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 					},
 					x: {
 						type: 'number',
-						description: 'X position on the canvas (grid coordinates)',
+						description: 'X position in canvas pixels (see get_scene_info for reference positions and grid pixel size)',
 					},
 					y: {
 						type: 'number',
-						description: 'Y position on the canvas (grid coordinates)',
+						description: 'Y position in canvas pixels',
 					},
 					hidden: {
 						type: 'boolean',
@@ -605,21 +671,21 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'move_token',
-			description: 'Move an existing token to a new position on the canvas.',
+			description: 'Move an existing token to a new position. Coordinates are CANVAS PIXELS, same space as the token positions reported by get_scene_info — to move relative to the current position, read it from get_scene_info and offset by multiples of the scene\'s pixels-per-square.',
 			parameters: {
 				type: 'object',
 				properties: {
 					token_id: {
 						type: 'string',
-						description: 'The ID of the token to move',
+						description: 'The ID of the token to move (from get_scene_info)',
 					},
 					x: {
 						type: 'number',
-						description: 'New X position',
+						description: 'New X position in canvas pixels',
 					},
 					y: {
 						type: 'number',
-						description: 'New Y position',
+						description: 'New Y position in canvas pixels',
 					},
 				},
 				required: ['token_id', 'x', 'y'],
@@ -636,7 +702,7 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 				properties: {
 					token_id: {
 						type: 'string',
-						description: 'The ID of the token to hide',
+						description: 'The ID of the token to hide (from get_scene_info)',
 					},
 				},
 				required: ['token_id'],
@@ -653,7 +719,7 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 				properties: {
 					token_id: {
 						type: 'string',
-						description: 'The ID of the token to reveal',
+						description: 'The ID of the token to reveal (from get_scene_info or a place_token result)',
 					},
 				},
 				required: ['token_id'],
@@ -664,13 +730,13 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'remove_token',
-			description: 'Remove a token from the scene entirely.',
+			description: 'Remove a token from the scene entirely. This deletes only the token, not the underlying actor.',
 			parameters: {
 				type: 'object',
 				properties: {
 					token_id: {
 						type: 'string',
-						description: 'The ID of the token to remove',
+						description: 'The ID of the token to remove (from get_scene_info)',
 					},
 				},
 				required: ['token_id'],
@@ -687,14 +753,14 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 				properties: {
 					token_id: {
 						type: 'string',
-						description: 'The ID of the token to update',
+						description: 'The ID of the token to update (from get_scene_info)',
 					},
 					name: { type: 'string', description: 'New display name' },
 					width: { type: 'number', description: 'Width in grid squares' },
 					height: { type: 'number', description: 'Height in grid squares' },
-					elevation: { type: 'number', description: 'Elevation in feet' },
-					light_dim: { type: 'number', description: 'Dim light radius in feet' },
-					light_bright: { type: 'number', description: 'Bright light radius in feet' },
+					elevation: { type: 'number', description: 'Elevation in grid distance units (e.g. feet)' },
+					light_dim: { type: 'number', description: 'Dim light radius in grid distance units (e.g. feet)' },
+					light_bright: { type: 'number', description: 'Bright light radius in grid distance units (e.g. feet)' },
 					light_color: { type: 'string', description: 'Light color hex (e.g. "#ff9900")' },
 				},
 				required: ['token_id'],
@@ -705,6 +771,17 @@ const TOKEN_TOOLS: ToolDefinition[] = [
 
 // == Combat Tools ==
 const COMBAT_TOOLS: ToolDefinition[] = [
+	{
+		type: 'function',
+		function: {
+			name: 'get_combat_status',
+			description: 'Get the LIVE state of the current combat: round number, whose turn it is, and every combatant with initiative order, HP, conditions, combatant_id, and token_id. The Combat State section in the system prompt is a snapshot from when the conversation loaded and goes stale as turns advance — call this before making decisions mid-combat.',
+			parameters: {
+				type: 'object',
+				properties: {},
+			},
+		},
+	},
 	{
 		type: 'function',
 		function: {
@@ -802,17 +879,17 @@ const COMBAT_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'apply_damage',
-			description: 'Apply damage or healing to a token/actor.',
+			description: 'Apply damage or healing to a token\'s actor. The "type" field decides the direction; "amount" is always a positive number of HP. Damage is floored at 0 HP; healing is capped at max HP.',
 			parameters: {
 				type: 'object',
 				properties: {
 					token_id: {
 						type: 'string',
-						description: 'The token ID of the target',
+						description: 'The token ID of the target (from get_scene_info)',
 					},
 					amount: {
 						type: 'number',
-						description: 'Amount of damage (positive) or healing (negative)',
+						description: 'Amount of HP, always positive — direction is set by "type", e.g. { amount: 8, type: "healing" } to heal 8',
 					},
 					type: {
 						type: 'string',
@@ -834,7 +911,7 @@ const COMBAT_TOOLS: ToolDefinition[] = [
 				properties: {
 					token_id: {
 						type: 'string',
-						description: 'The token ID to apply the condition to',
+						description: 'The token ID to apply the condition to (from get_scene_info)',
 					},
 					condition: {
 						type: 'string',
@@ -959,7 +1036,7 @@ const CHAT_TOOLS: ToolDefinition[] = [
 					whisper_to: {
 						type: 'array',
 						items: { type: 'string' },
-						description: 'Player names to whisper to. Omit for public message.',
+						description: 'Foundry USER names to whisper to (case-insensitive exact match). Omit for a public message. WARNING: names that match no user are silently dropped — if none match, the message is posted PUBLICLY, so double-check user names before whispering anything secret.',
 					},
 				},
 				required: ['content'],
@@ -974,13 +1051,13 @@ const COMPENDIUM_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'search_compendium',
-			description: 'Search across all compendium packs (SRD monsters, items, spells, etc.) by name.',
+			description: 'Search across all compendium packs (SRD monsters, items, spells, etc.) by NAME SUBSTRING — this is not a semantic search like search_journals. Use short, literal names: "goblin" or "fireball", never a description like "a fearsome goblin warlord". If a query returns nothing, retry with a shorter fragment of the name.',
 			parameters: {
 				type: 'object',
 				properties: {
 					query: {
 						type: 'string',
-						description: 'Search name or partial name',
+						description: 'Name or partial name to match, e.g. "goblin", "cure wounds"',
 					},
 					type: {
 						type: 'string',
@@ -1051,16 +1128,16 @@ const SPATIAL_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'measure_distance',
-			description: 'Measure the distance between two tokens or two points on the map.',
+			description: 'Measure the distance between two tokens or two points on the active scene. Returns the distance in grid units (e.g. feet). REQUIRED: an origin (from_token_id, OR both from_x and from_y in canvas pixels) AND a destination (to_token_id, OR both to_x and to_y). Prefer token IDs from get_scene_info — omitted coordinates default to (0, 0), which silently gives a wrong answer.',
 			parameters: {
 				type: 'object',
 				properties: {
-					from_token_id: { type: 'string', description: 'Token ID of the origin' },
-					to_token_id: { type: 'string', description: 'Token ID of the destination' },
-					from_x: { type: 'number', description: 'Origin X (if not using token)' },
-					from_y: { type: 'number', description: 'Origin Y (if not using token)' },
-					to_x: { type: 'number', description: 'Destination X (if not using token)' },
-					to_y: { type: 'number', description: 'Destination Y (if not using token)' },
+					from_token_id: { type: 'string', description: 'Token ID of the origin (from get_scene_info). Use this OR from_x/from_y.' },
+					to_token_id: { type: 'string', description: 'Token ID of the destination. Use this OR to_x/to_y.' },
+					from_x: { type: 'number', description: 'Origin X in canvas pixels (only if not using from_token_id)' },
+					from_y: { type: 'number', description: 'Origin Y in canvas pixels (only if not using from_token_id)' },
+					to_x: { type: 'number', description: 'Destination X in canvas pixels (only if not using to_token_id)' },
+					to_y: { type: 'number', description: 'Destination Y in canvas pixels (only if not using to_token_id)' },
 				},
 			},
 		},
@@ -1069,14 +1146,14 @@ const SPATIAL_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'tokens_in_range',
-			description: 'Find all tokens within a certain distance of a point or token.',
+			description: 'Find all tokens within a certain distance of a token or point on the active scene. NOTE the mixed units: the center is a token ID or canvas-pixel coordinates, but range is in grid units (e.g. 30 for 30ft). Provide token_id OR both x and y — omitted coordinates default to (0, 0).',
 			parameters: {
 				type: 'object',
 				properties: {
-					token_id: { type: 'string', description: 'Center token ID (or use x/y)' },
-					x: { type: 'number', description: 'Center X (if not using token)' },
-					y: { type: 'number', description: 'Center Y (if not using token)' },
-					range: { type: 'number', description: 'Range in grid distance units (e.g. feet)' },
+					token_id: { type: 'string', description: 'Center token ID (from get_scene_info). Use this OR x/y.' },
+					x: { type: 'number', description: 'Center X in canvas pixels (only if not using token_id)' },
+					y: { type: 'number', description: 'Center Y in canvas pixels (only if not using token_id)' },
+					range: { type: 'number', description: 'Range in grid distance units, e.g. 30 for 30ft — NOT pixels' },
 				},
 				required: ['range'],
 			},
@@ -1086,7 +1163,7 @@ const SPATIAL_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'create_scene_region',
-			description: 'Place a shaped scene region on the canvas (for spell areas, zones of effect, etc.).',
+			description: 'Place a shaped scene region on the canvas (for spell areas, zones of effect, etc.). NOTE the mixed units: x/y are canvas pixels (same space as token positions from get_scene_info), while distance and width are in grid units (e.g. 20 for a 20ft radius).',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1095,9 +1172,9 @@ const SPATIAL_TOOLS: ToolDefinition[] = [
 						enum: ['circle', 'cone', 'ray', 'rect'],
 						description: 'Region shape',
 					},
-					x: { type: 'number', description: 'X position (canvas pixels)' },
-					y: { type: 'number', description: 'Y position (canvas pixels)' },
-					distance: { type: 'number', description: 'Size/distance in grid units (e.g. 20 for 20ft radius)' },
+					x: { type: 'number', description: 'Origin X in canvas pixels (circle/cone/ray origin; rect center)' },
+					y: { type: 'number', description: 'Origin Y in canvas pixels' },
+					distance: { type: 'number', description: 'Size/distance in grid units (e.g. 20 for 20ft radius) — NOT pixels' },
 					direction: {
 						type: 'number',
 						description: 'Direction in degrees for cone/ray. 0=right, 90=down, 180=left, 270=up',
@@ -1165,20 +1242,10 @@ const ACTOR_TOOLS: ToolDefinition[] = [
 			},
 		},
 	},
-	{
-		type: 'function',
-		function: {
-			name: 'delete_actor',
-			description: 'Permanently delete an actor from the world. This cannot be undone.',
-			parameters: {
-				type: 'object',
-				properties: {
-					actor_id: { type: 'string', description: 'The ID of the actor to delete' },
-				},
-				required: ['actor_id'],
-			},
-		},
-	},
+	// Deliberately no delete_actor tool: deleting world content is the DM's job.
+	// The AI creates and updates; stale actors sitting unused are harmless (they're
+	// only surfaced when folder allow-lists pick them up), while an AI-initiated
+	// delete is unrecoverable. Same policy applies to journals and scenes.
 	{
 		type: 'function',
 		function: {
@@ -1333,13 +1400,17 @@ const ITEM_TOOLS: ToolDefinition[] = [
 		type: 'function',
 		function: {
 			name: 'list_items',
-			description: 'List world items, optionally filtered by type.',
+			description: 'List world items, optionally filtered by type and/or a name substring. When looking for a specific item, always pass name — do not page through the full list.',
 			parameters: {
 				type: 'object',
 				properties: {
 					type: {
 						type: 'string',
 						description: 'Filter by item type (e.g. "weapon", "spell", "feat"). Omit for all items.',
+					},
+					name: {
+						type: 'string',
+						description: 'Case-insensitive name substring to filter by, e.g. "healing" matches "Potion of Healing"',
 					},
 					max_results: {
 						type: 'number',
@@ -1422,7 +1493,7 @@ const MACRO_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'execute_macro',
 			description:
-				'Execute a macro by ID and return its result. For script macros, the return value of the script is captured.',
+				'Execute a macro by ID and return its result. For script macros, the return value of the script is captured. CAUTION: script macros run arbitrary JavaScript with GM privileges — before executing a macro you did not create in this conversation, read its script with get_macro and make sure it does what the DM expects.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1550,7 +1621,7 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'generate_image',
 			description:
-				'Generate an image from a text prompt using AI image generation. Returns the image URL. Can be used for token art, item art, portraits, etc.',
+				'Generate an image from a text prompt using AI image generation and save it to Foundry storage. Returns the saved image "path" (e.g. "foundry-ai/images/red-dragon-1234.png") — use that exact path with update_actor (portrait/token art), update_item, update_scene, or generate_scene\'s image_path. Use for token art, item art, portraits, etc. For new battle-map scenes, prefer generate_scene, which generates the image itself.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1830,7 +1901,7 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			case 'search_actors':
 				return await handleSearchActors(args.query, args.max_results)
 			case 'get_journal':
-				return handleGetJournal(args.journal_id)
+				return handleGetJournal(args.journal_id, args.max_length, args.offset)
 			case 'get_actor':
 				return handleGetActor(args.actor_id)
 			case 'list_actors_in_folder':
@@ -1847,6 +1918,10 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return handleGetSceneInfo()
 			case 'roll_table':
 				return await handleRollTable(args.table_id)
+			case 'list_rolltables':
+				return handleListRolltables()
+			case 'create_rolltable':
+				return await handleCreateRolltable(args)
 
 			// Scene tools
 			case 'list_scenes':
@@ -1879,6 +1954,8 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handleUpdateToken(args)
 
 			// Combat tools
+			case 'get_combat_status':
+				return handleGetCombatStatus()
 			case 'start_combat':
 				return await handleStartCombat(args.token_ids)
 			case 'end_combat':
@@ -1933,8 +2010,6 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handleCreateActor(args.name, args.type, args.data, args.img, args.folder_name, args.folder_id)
 			case 'update_actor':
 				return await handleUpdateActor(args.actor_id, args.data)
-			case 'delete_actor':
-				return await handleDeleteActor(args.actor_id)
 			case 'add_items_to_actor':
 				return await handleAddItemsToActor(args.actor_id, args.items)
 			case 'remove_item_from_actor':
@@ -1952,7 +2027,7 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			case 'delete_item':
 				return await handleDeleteItem(args.item_id)
 			case 'list_items':
-				return handleListItems(args.type, args.max_results)
+				return handleListItems(args.type, args.max_results, args.name)
 
 			// Macro tools
 			case 'list_macros':
@@ -1983,6 +2058,10 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handleDescribeImage(args.image_path, args.question)
 			case 'organize_images':
 				return await handleOrganizeImages(args.image_paths, args.destination_root)
+			// NOT an LLM tool — intentionally absent from TOOL_DEFINITIONS. This is a
+			// server-internal RPC: the map-generation backend pushes base64 PNG data
+			// through the MCP bridge (foundry-ai.tool.upload_generated_map) to save
+			// finished maps into foundry-ai/maps/. An LLM cannot supply imageData.
 			case 'upload_generated_map':
 				return await handleUploadGeneratedMap(args.filename, args.imageData)
 			case 'generate_image':
@@ -2154,7 +2233,9 @@ async function handleSearchActors(query: string, maxResults?: number): Promise<s
 	return JSON.stringify({ results })
 }
 
-function handleGetJournal(journalId: string): string {
+const GET_JOURNAL_DEFAULT_MAX_LENGTH = 20000
+
+function handleGetJournal(journalId: string, maxLength?: number, offset?: number): string {
 	console.log(`FoundryAI | get_journal: id/name="${journalId}"`)
 	// Try by ID first, then fall back to exact name match
 	let entry = game.journal?.get(journalId)
@@ -2171,15 +2252,23 @@ function handleGetJournal(journalId: string): string {
 
 	if (!isJournalFolderAllowed(entry.folder?.id)) {
 		console.log(`FoundryAI | get_journal: folder not allowed`)
-		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
+		return journalFolderDeniedError(entry)
 	}
 
-	const content = collectionReader.getJournalContent(journalId)
+	const fullContent = collectionReader.getJournalContent(journalId) || ''
+	const start = Math.max(0, offset || 0)
+	const limit = maxLength && maxLength > 0 ? maxLength : GET_JOURNAL_DEFAULT_MAX_LENGTH
+	const content = fullContent.slice(start, start + limit)
+	const truncated = start + limit < fullContent.length
+
 	return JSON.stringify({
 		id: journalId,
 		name: entry?.name || 'Unknown',
 		folder: entry?.folder?.name || 'Root',
 		content,
+		total_length: fullContent.length,
+		truncated,
+		...(truncated ? { next_offset: start + limit } : {}),
 	})
 }
 
@@ -2196,7 +2285,7 @@ function handleGetActor(actorId: string): string {
 
 	if (!isActorFolderAllowed(actor.folder?.id)) {
 		console.log(`FoundryAI | get_actor: folder not allowed`)
-		return JSON.stringify({ error: `Actor not found: ${actorId}` })
+		return actorFolderDeniedError(actor)
 	}
 
 	const content = collectionReader.getActorContent(actorId)
@@ -2380,7 +2469,7 @@ async function handleUpdateJournal(
 		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
 	}
 	if (!isJournalFolderAllowed(entry.folder?.id)) {
-		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
+		return journalFolderDeniedError(entry)
 	}
 
 	// Mode 1: Append a brand-new page
@@ -2497,7 +2586,11 @@ function handleListFolders(type: string): string {
 
 function handleGetSceneInfo(): string {
 	console.log(`FoundryAI | get_scene_info: called`)
-	return collectionReader.getCurrentSceneInfo()
+	const info = collectionReader.getCurrentSceneInfo()
+	if (info === 'No active scene.') {
+		return JSON.stringify({ error: 'No active scene.' })
+	}
+	return JSON.stringify({ info })
 }
 
 async function handleRollTable(tableId: string): Promise<string> {
@@ -2521,6 +2614,91 @@ async function handleRollTable(tableId: string): Promise<string> {
 		})
 	} catch (error: any) {
 		return JSON.stringify({ error: `Failed to roll table: ${error.message}` })
+	}
+}
+
+function handleListRolltables(): string {
+	console.log('FoundryAI | list_rolltables')
+	if (!game.tables || game.tables.size === 0) {
+		return JSON.stringify({
+			tables: [],
+			count: 0,
+			message: 'No roll tables exist in this world yet. You can create one with create_rolltable.',
+		})
+	}
+
+	const tables = Array.from(game.tables.values()).map((t) => ({
+		id: t.id,
+		name: t.name,
+		folder: (t as any).folder?.name || 'Root',
+		formula: t.formula,
+		result_count: t.results?.size ?? 0,
+		description: String((t as any).description || '')
+			.replace(/<[^>]+>/g, '')
+			.trim()
+			.slice(0, 150),
+	}))
+
+	return JSON.stringify({ tables, count: tables.length })
+}
+
+async function handleCreateRolltable(args: Record<string, any>): Promise<string> {
+	console.log(`FoundryAI | create_rolltable: name="${args.name}"`)
+	const entries: Array<{ text: string; weight?: number }> = args.results
+	if (!Array.isArray(entries) || entries.length === 0) {
+		return JSON.stringify({ error: 'results must be a non-empty array of { text, weight? } entries' })
+	}
+	if (entries.some((e) => !e.text || typeof e.text !== 'string')) {
+		return JSON.stringify({ error: 'Every result entry needs a non-empty "text" string' })
+	}
+
+	try {
+		// Assign contiguous ranges from weights: weight N occupies N faces of the die.
+		let low = 1
+		const resultData = entries.map((e) => {
+			const weight = Math.max(1, Math.round(e.weight ?? 1))
+			const entry = {
+				// v12+ uses string result types; fall back for older CONST shapes.
+				type: (globalThis as any).CONST?.TABLE_RESULT_TYPES?.TEXT ?? 'text',
+				text: e.text,
+				weight,
+				range: [low, low + weight - 1],
+			}
+			low += weight
+			return entry
+		})
+		const dieSize = low - 1
+
+		const data: Record<string, any> = {
+			name: args.name,
+			description: args.description || '',
+			formula: `1d${dieSize}`,
+			replacement: true,
+			displayRoll: true,
+			results: resultData,
+		}
+
+		if (args.folder_name) {
+			let folder = game.folders?.find((f: any) => f.type === 'RollTable' && f.name === args.folder_name)
+			if (!folder) {
+				folder = await Folder.create({ name: args.folder_name, type: 'RollTable', parent: null } as any)
+			}
+			if (folder?.id) data.folder = folder.id
+		}
+
+		const table = await RollTable.create(data)
+		if (!table) return JSON.stringify({ error: 'Failed to create roll table' })
+
+		return JSON.stringify({
+			success: true,
+			table_id: table.id,
+			name: table.name,
+			formula: data.formula,
+			result_count: resultData.length,
+			message: `Created roll table "${table.name}" (${data.formula}, ${resultData.length} entries). Roll it with roll_table.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `Failed to create roll table: ${error.message}` })
 	}
 }
 
@@ -2600,6 +2778,10 @@ async function handleUpdateScene(args: Record<string, any>): Promise<string> {
 
 		if (args.grid_distance || args.grid_units) {
 			updates.grid = { ...scene.grid, ...(args.grid_distance ? { distance: args.grid_distance } : {}), ...(args.grid_units ? { units: args.grid_units } : {}) }
+		}
+
+		if (args.darkness !== undefined) {
+			updates['environment.darknessLevel'] = Math.max(0, Math.min(1, args.darkness))
 		}
 
 		let newBackground: string | null = null
@@ -2749,7 +2931,7 @@ async function handlePlaceToken(actorId: string, x: number, y: number, hidden?: 
 
 	if (!isActorFolderAllowed(actor.folder?.id)) {
 		console.log(`FoundryAI | place_token: folder not allowed`)
-		return JSON.stringify({ error: `Actor not found: ${actorId}` })
+		return actorFolderDeniedError(actor)
 	}
 
 	const scene = getActiveScene()
@@ -2858,6 +3040,54 @@ async function handleUpdateToken(args: Record<string, any>): Promise<string> {
 // ===============================
 // COMBAT TOOL HANDLERS
 // ===============================
+
+function handleGetCombatStatus(): string {
+	console.log('FoundryAI | get_combat_status')
+	const combat = game.combat
+	if (!combat) {
+		return JSON.stringify({ active: false, message: 'No active combat.' })
+	}
+	if (!combat.started) {
+		return JSON.stringify({
+			active: false,
+			message: 'A combat encounter exists but has not started (no initiative rolled / first turn not begun).',
+			combatant_count: combat.combatants?.size ?? 0,
+		})
+	}
+
+	const currentId = combat.combatant?.id ?? null
+	const combatants = combat.turns.map((c, idx) => {
+		const actor = c.actor as any
+		const hp = actor?.system?.attributes?.hp
+		const conditions: string[] = actor?.effects?.size
+			? (Array.from(actor.effects.values()) as any[])
+					.filter((e) => !e.disabled)
+					.map((e) => e.name)
+					.filter(Boolean)
+			: []
+
+		return {
+			combatant_id: c.id,
+			token_id: c.tokenId,
+			name: c.name,
+			turn_order: idx,
+			is_current_turn: c.id === currentId,
+			initiative: c.initiative,
+			hp: hp ? `${hp.value ?? '?'}/${hp.max ?? '?'}` : undefined,
+			defeated: c.defeated || undefined,
+			hidden: c.hidden || undefined,
+			conditions: conditions.length ? conditions : undefined,
+		}
+	})
+
+	return JSON.stringify({
+		active: true,
+		round: combat.round,
+		turn: combat.turn,
+		current_combatant: combat.combatant?.name ?? null,
+		combatants,
+	})
+}
 
 async function handleStartCombat(tokenIds?: string[]): Promise<string> {
 	console.log(`FoundryAI | start_combat: called with ${tokenIds?.length || 0} tokenIds`)
@@ -3013,6 +3243,10 @@ async function handleApplyDamage(tokenId: string, amount: number, type: string):
 
 	const currentHp = hp.value ?? 0
 	const maxHp = hp.max ?? currentHp
+
+	// Direction comes from `type`; treat amount as a magnitude. Without this, a
+	// negative amount with type "damage" would *heal* — and bypass the max-HP cap.
+	amount = Math.abs(amount)
 
 	let newHp: number
 	if (type === 'healing') {
@@ -3619,7 +3853,7 @@ async function handleUpdateActor(actorId: string, data: Record<string, any>): Pr
 	if (!actor) return JSON.stringify({ error: `Actor not found: ${actorId}` })
 
 	if (!isActorFolderAllowed(actor.folder?.id)) {
-		return JSON.stringify({ error: `Actor not found: ${actorId}` })
+		return actorFolderDeniedError(actor)
 	}
 
 	await actor.update(data)
@@ -3632,24 +3866,6 @@ async function handleUpdateActor(actorId: string, data: Record<string, any>): Pr
 	})
 }
 
-async function handleDeleteActor(actorId: string): Promise<string> {
-	console.log(`FoundryAI | delete_actor: actorId="${actorId}"`)
-	const actor = game.actors?.get(actorId)
-	if (!actor) return JSON.stringify({ error: `Actor not found: ${actorId}` })
-
-	if (!isActorFolderAllowed(actor.folder?.id)) {
-		return JSON.stringify({ error: `Actor not found: ${actorId}` })
-	}
-
-	const actorName = actor.name
-	await actor.delete()
-
-	return JSON.stringify({
-		success: true,
-		message: `Deleted actor "${actorName}"`,
-	})
-}
-
 async function handleAddItemsToActor(
 	actorId: string,
 	items: Array<{ name: string; type: string; img?: string; data?: Record<string, any> }>,
@@ -3659,7 +3875,7 @@ async function handleAddItemsToActor(
 	if (!actor) return JSON.stringify({ error: `Actor not found: ${actorId}` })
 
 	if (!isActorFolderAllowed(actor.folder?.id)) {
-		return JSON.stringify({ error: `Actor not found: ${actorId}` })
+		return actorFolderDeniedError(actor)
 	}
 
 	const itemData = items.map((item) => {
@@ -3694,7 +3910,7 @@ async function handleRemoveItemFromActor(actorId: string, itemId: string): Promi
 	if (!actor) return JSON.stringify({ error: `Actor not found: ${actorId}` })
 
 	if (!isActorFolderAllowed(actor.folder?.id)) {
-		return JSON.stringify({ error: `Actor not found: ${actorId}` })
+		return actorFolderDeniedError(actor)
 	}
 
 	const item = actor.items?.get(itemId)
@@ -3715,7 +3931,7 @@ async function handleUpdateActorItem(actorId: string, itemId: string, data: Reco
 	if (!actor) return JSON.stringify({ error: `Actor not found: ${actorId}` })
 
 	if (!isActorFolderAllowed(actor.folder?.id)) {
-		return JSON.stringify({ error: `Actor not found: ${actorId}` })
+		return actorFolderDeniedError(actor)
 	}
 
 	const item = actor.items?.get(itemId)
@@ -3826,15 +4042,17 @@ async function handleDeleteItem(itemId: string): Promise<string> {
 	})
 }
 
-function handleListItems(type?: string, maxResults?: number): string {
-	console.log(`FoundryAI | list_items: type="${type}", maxResults=${maxResults}`)
+function handleListItems(type?: string, maxResults?: number, name?: string): string {
+	console.log(`FoundryAI | list_items: type="${type}", maxResults=${maxResults}, name="${name}"`)
 	if (!game.items) return JSON.stringify({ error: 'Items collection not available' })
 
 	const max = maxResults || 20
+	const nameLower = name?.toLowerCase()
 	const items: Array<{ id: string; name: string; type: string; folder: string }> = []
 
 	for (const item of game.items.values()) {
 		if (type && item.type !== type) continue
+		if (nameLower && !item.name?.toLowerCase().includes(nameLower)) continue
 		items.push({
 			id: item.id,
 			name: item.name,
@@ -4676,7 +4894,16 @@ async function handleGenerateScene(args: Record<string, any>): Promise<string> {
 
 			const mapPrompt = `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
 
-			const result = await openRouterService.generateImage(mapPrompt, imageModel, mapSize)
+			let result: { url?: string; b64_json?: string }
+			try {
+				result = await openRouterService.generateImage(mapPrompt, imageModel, mapSize)
+			} catch (genError: any) {
+				const assetsJson = JSON.parse(await handleListAssets())
+				return JSON.stringify({
+					error: `Image generation failed: ${genError.message}. This may be a transient issue with the image-gen backend — try generate_scene again in a moment, or set image_path to one of the existing_assets below to reuse a pre-made map instead of generating a new one.`,
+					existing_assets: assetsJson.assets ?? [],
+				})
+			}
 			const filename = `map-${promptToSlug(args.prompt)}-${Date.now()}.png`
 
 			await FP.createDirectory('data', 'foundry-ai').catch(() => {})

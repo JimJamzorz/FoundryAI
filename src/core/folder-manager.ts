@@ -114,7 +114,10 @@ async function getOrCreateFolder(name: string, parentId: string | null, color?: 
 	}
 	if (color) data.color = color
 
-	const folder = await Folder.create(data)
+	// `as any`: the local Folder.create type stub only knows { name, type, parent },
+	// but Foundry v13 document data uses `folder` for the parent ID (same workaround
+	// as the Folder.create call in tool-system.ts).
+	const folder = await Folder.create(data as any)
 	console.log(`FoundryAI | Created folder: ${name}${parentId ? ' (subfolder)' : ''}`)
 	return folder
 }

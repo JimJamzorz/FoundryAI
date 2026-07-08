@@ -1,5 +1,5 @@
 /* ==========================================================================
-   System Prompt Builder
+   System Prompt Builder.
    Constructs the system prompt with campaign context, tool instructions,
    and DM-assistant personality.
    ========================================================================== */
@@ -280,6 +280,18 @@ function getWorldContext(): string | null {
 		/* ignore */
 	}
 
+	// Available actors inventory — TOOL_INSTRUCTIONS rule 15 and the
+	// list_actors_in_folder guidance both reference this section, so it must
+	// actually be injected here.
+	try {
+		const actorIndex = getActorInventory()
+		if (actorIndex) {
+			parts.push(actorIndex)
+		}
+	} catch {
+		/* ignore */
+	}
+
 	// Campaign notes — short, curated plot-state bullets only (see getNotesContent).
 	// Long entries are listed by name/ID instead of dumped, so a single oversized
 	// note can't blow up every prompt the way a full PDF-derived note used to.
@@ -441,14 +453,23 @@ function getNotesContent(): string | null {
 }
 
 /**
- * Build a compact inventory of all actors grouped by folder.
+ * Build a compact inventory of actors grouped by folder.
+ * Respects the actorFolders allow-list (same policy as getJournalInventory):
+ * if folders are selected, only actors inside them (or their children) are listed.
  */
 function getActorInventory(): string | null {
 	if (!game.actors || game.actors.size === 0) return null
 
+	const allowedFolders = getSetting('actorFolders') || []
+	const allAllowedFolderIds = allowedFolders.length > 0 ? collectionReader.resolveWithChildren(allowedFolders) : null // null = no restriction
+
 	const byFolder = new Map<string, Array<{ id: string; name: string; type: string }>>()
 
 	for (const actor of game.actors.values()) {
+		if (allAllowedFolderIds !== null) {
+			const folderId = actor.folder?.id
+			if (!folderId || !allAllowedFolderIds.includes(folderId)) continue
+		}
 		const folderName = actor.folder?.name || 'Uncategorized'
 		if (!byFolder.has(folderName)) byFolder.set(folderName, [])
 		byFolder.get(folderName)!.push({
@@ -522,7 +543,7 @@ You have access to tools that let you interact with the Foundry VTT world. **You
    - NEVER create journals in the root. Always specify the appropriate folder_name.
    - The FoundryAI folder structure is: FoundryAI/ → Notes, Chat History, Sessions, Actors, PDFs
 8. **Token placement:** Tokens placed via place_token are HIDDEN by default. Describe what you placed and ask the DM to confirm before revealing.
-9. **Combat management:** When running combat, use next_turn to advance turns and announce whose turn it is. Use apply_damage and apply_condition to track effects.
+9. **Combat management:** When running combat, use next_turn to advance turns and announce whose turn it is. Use apply_damage and apply_condition to track effects. The "Combat State" section above is a snapshot from when this conversation loaded — call get_combat_status for the live round, turn, and combatant HP before making mid-combat decisions.
 10. **Audio:** Set the mood proactively when activating scenes or during dramatic moments if playlists are available.
 11. **Compendium lookups:** When the DM asks about spells, items, or monsters not in the world journals, search the compendium first.
 12. **NEVER use post_chat_message to report progress mid-task.** Do NOT post messages saying you are "working on it", "looking that up", or announcing intermediate steps. Complete ALL tool calls first, then summarize what you did in your assistant reply. post_chat_message is only for in-game content (NPC dialogue, narration, announcements to players) — never for status updates to the DM.

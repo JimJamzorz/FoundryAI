@@ -331,9 +331,13 @@ export class CollectionReader {
 
 		const parts = [`Active Scene: ${scene.name} (id: ${scene.id})`]
 
-		// Scene metadata
+		// Scene metadata. Include the grid's pixel size — token positions below are in
+		// canvas pixels, and the AI needs pixels-per-square to convert "N squares" into
+		// pixel offsets for place_token / move_token.
 		if (scene.grid) {
-			parts.push(`Grid: ${scene.grid.distance || 5}${scene.grid.units || 'ft'} per square`)
+			parts.push(
+				`Grid: ${scene.grid.distance || 5}${scene.grid.units || 'ft'} per square, ${scene.grid.size || 100}px per square (token positions are in canvas pixels)`,
+			)
 		}
 		if (scene.weather) {
 			parts.push(`Weather: ${scene.weather}`)

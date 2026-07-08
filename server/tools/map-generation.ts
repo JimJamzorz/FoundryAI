@@ -18,7 +18,8 @@ export class MapGenerationTools {
     return [
       {
         name: 'generate-map',
-        description: 'Start AI map generation using D&D Battlemaps SDXL (async)',
+        description:
+          'Start AI battle-map generation using D&D Battlemaps SDXL. Async: returns a job_id immediately and runs in the background — when the job completes, the image is saved to Foundry and a new scene is created automatically, with progress shown in Foundry as it runs. After starting a job, just tell the user it is underway; do NOT poll check-map-status to "finish" it.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -50,7 +51,7 @@ export class MapGenerationTools {
       {
         name: 'check-map-status',
         description:
-          'Check status of map generation job. Progress updates appear automatically in Foundry VTT. DO NOT check frequently - this wastes tokens. Only check if user explicitly asks for status.',
+          'Check status of a map generation job by job_id (from generate-map). Progress updates appear automatically in Foundry VTT and the scene is created automatically on completion, so polling is never needed — only call this if the user explicitly asks how the job is going or whether it failed.',
         inputSchema: {
           type: 'object',
           properties: {
