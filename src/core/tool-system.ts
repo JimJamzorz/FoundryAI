@@ -133,6 +133,13 @@ const FOLDER_SETTING_KEYS = {
 	Macro: 'macroFolders',
 } as const
 
+const CREATABLE_FOLDER_TYPES = {
+	actor: 'Actor',
+	scene: 'Scene',
+} as const
+
+type CreatableFolderType = keyof typeof CREATABLE_FOLDER_TYPES
+
 /**
  * Resolve (creating if needed) the destination folder for a create_* tool call, and
  * verify the result is actually visible to future tool calls before the caller reports
@@ -429,6 +436,33 @@ const CORE_TOOLS: ToolDefinition[] = [
 						description: 'Filter by folder type',
 					},
 				},
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'create_folder',
+			description:
+				'Create an empty actor or scene folder. Use this when the DM asks to organize actors/NPCs/monsters or scenes/locations into a new folder without creating any documents yet. Newly created folders are automatically made accessible to FoundryAI when folder restrictions are active.',
+			parameters: {
+				type: 'object',
+				properties: {
+					name: {
+						type: 'string',
+						description: 'The folder name to create, e.g. "NPCs", "Villains", "Spoilers", or "Chapter 3 Scenes"',
+					},
+					type: {
+						type: 'string',
+						enum: ['actor', 'scene'],
+						description: 'Which Foundry document type this folder will contain',
+					},
+					parent_folder_id: {
+						type: 'string',
+						description: 'Optional parent folder ID for a nested folder. Omit to create a top-level folder.',
+					},
+				},
+				required: ['name', 'type'],
 			},
 		},
 	},
@@ -1914,6 +1948,8 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return handleListJournalsInFolder(args.folder_id)
 			case 'list_folders':
 				return handleListFolders(args.type || 'all')
+			case 'create_folder':
+				return await handleCreateFolder(args.name, args.type, args.parent_folder_id)
 			case 'get_scene_info':
 				return handleGetSceneInfo()
 			case 'roll_table':
@@ -2589,6 +2625,71 @@ function handleListFolders(type: string): string {
 	}
 
 	return JSON.stringify(result)
+}
+
+async function handleCreateFolder(
+	name: string,
+	type: CreatableFolderType,
+	parentFolderId?: string,
+): Promise<string> {
+	console.log(`FoundryAI | create_folder: name="${name}", type="${type}", parentFolderId="${parentFolderId || ''}"`)
+
+	if (!name || typeof name !== 'string' || name.trim().length === 0) {
+		return JSON.stringify({ error: 'Folder name is required.' })
+	}
+
+	const docType = CREATABLE_FOLDER_TYPES[type]
+	if (!docType) {
+		return JSON.stringify({ error: 'Folder type must be "actor" or "scene".' })
+	}
+
+	const parent = parentFolderId ? game.folders?.get(parentFolderId) : null
+	if (parentFolderId && !parent) {
+		return JSON.stringify({ error: `Parent folder not found: ${parentFolderId}` })
+	}
+	if (parent && (parent as any).type !== docType) {
+		return JSON.stringify({
+			error: `Parent folder "${parent.name}" is a ${(parent as any).type} folder, but ${type} folders must be nested under ${docType} folders.`,
+		})
+	}
+
+	const trimmedName = name.trim()
+	const existing = game.folders?.find((f: any) => {
+		if (f.type !== docType || f.name !== trimmedName) return false
+		if (parentFolderId) return f.folder?.id === parentFolderId
+		return !f.folder
+	})
+
+	const settingKey = FOLDER_SETTING_KEYS[docType]
+	let folder = existing
+	let created = false
+
+	if (!folder) {
+		folder = await Folder.create({
+			name: trimmedName,
+			type: docType,
+			folder: parentFolderId || null,
+			parent: parentFolderId || null,
+		} as any)
+		created = true
+	}
+
+	const allowed = getSetting(settingKey) || []
+	if (created && folder?.id && allowed.length > 0 && !allowed.includes(folder.id)) {
+		await setSetting(settingKey, [...allowed, folder.id])
+		console.log(`FoundryAI | create_folder: granted access to new ${type} folder "${trimmedName}" (${folder.id})`)
+	}
+
+	return JSON.stringify({
+		success: true,
+		created,
+		id: folder?.id,
+		name: folder?.name || trimmedName,
+		type,
+		document_type: docType,
+		parent_folder_id: folder?.folder?.id || null,
+		message: `${created ? 'Created' : 'Found existing'} ${type} folder "${trimmedName}".`,
+	})
 }
 
 function handleGetSceneInfo(): string {

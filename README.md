@@ -94,6 +94,7 @@ FoundryAI provides **70+ tools** across 15 categories that the AI can call auton
 | `update_journal`          | Update a journal page or append a new one                                      |
 | `list_journals_in_folder` | List all journal entries in a folder, with page IDs                            |
 | `list_folders`            | List accessible journal, actor, and scene folders                              |
+| `create_folder`           | Create an empty actor or scene folder                                          |
 | `get_scene_info`          | Get active scene details (grid, tokens, positions, conditions)                 |
 | `roll_table`              | Roll on a roll table and return the result                                     |
 | `list_rolltables`         | List all roll tables with IDs, formulas, and entry counts                      |
