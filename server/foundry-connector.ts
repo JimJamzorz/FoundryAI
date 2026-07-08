@@ -359,6 +359,37 @@ export class FoundryConnector {
     }
   }
 
+  /**
+   * Foundry tools that legitimately run long: vision requests (OpenRouter),
+   * multi-page PDF rendering, image generation, and large base64 image
+   * transfers (chunked over WebRTC). These get a generous timeout; everything
+   * else keeps the short default so a hung Foundry client still fails fast.
+   */
+  private static readonly SLOW_FOUNDRY_TOOLS = new Set([
+    'describe_image',
+    'organize_images',
+    'render_pdf_page',
+    'render_pdf_pages',
+    'render_pdf_region',
+    'process_pdf',
+    'generate_image',
+    'generate_scene',
+    'update_scene',
+    'upload_generated_map',
+    'read_asset',
+  ]);
+
+  private static readonly DEFAULT_QUERY_TIMEOUT_MS = 10_000;
+  private static readonly SLOW_QUERY_TIMEOUT_MS = 120_000;
+
+  private getQueryTimeoutMs(method: string): number {
+    const prefix = 'foundry-ai.tool.';
+    const toolName = method.startsWith(prefix) ? method.slice(prefix.length) : method;
+    return FoundryConnector.SLOW_FOUNDRY_TOOLS.has(toolName)
+      ? FoundryConnector.SLOW_QUERY_TIMEOUT_MS
+      : FoundryConnector.DEFAULT_QUERY_TIMEOUT_MS;
+  }
+
   async query(method: string, data?: any): Promise<any> {
     // Check connection based on active connection type
     const isConnected =
@@ -378,11 +409,13 @@ export class FoundryConnector {
       connectionType: this.activeConnectionType,
     });
 
+    const timeoutMs = this.getQueryTimeoutMs(method);
+
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingQueries.delete(queryId);
-        reject(new Error(`Query timeout: ${method}`));
-      }, 10000); // 10 second timeout
+        reject(new Error(`Query timeout after ${timeoutMs / 1000}s: ${method}`));
+      }, timeoutMs);
 
       this.pendingQueries.set(queryId, { resolve, reject, timeout });
 

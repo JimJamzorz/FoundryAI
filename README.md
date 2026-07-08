@@ -226,7 +226,11 @@ FoundryAI provides **70+ tools** across 15 categories that the AI can call auton
 | `list_pdfs`          | List PDFs uploaded to `foundry-ai/pdfs/`                       |
 | `process_pdf`        | Convert a PDF into a journal entry (one page per PDF page)     |
 | `render_pdf_page`    | Render a PDF page to an image (for portraits, maps, or vision) |
-| `extract_pdf_images` | Extract embedded images/maps from a PDF as PNG files           |
+| `render_pdf_pages`   | Render up to 5 explicit PDF pages as reliable fallback images  |
+| `render_pdf_region`  | Render a cropped PDF page region using percentage coordinates  |
+| `extract_pdf_images` | Start a background extraction job; skips decorative assets and vision-crops fallback pages |
+| `check_pdf_extraction_status` | Check PDF extraction job progress and retrieve result paths |
+| `cancel_pdf_extraction` | Best-effort cancellation for queued/running PDF extraction jobs |
 
 ## Folder Structure
 

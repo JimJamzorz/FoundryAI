@@ -5,6 +5,16 @@ import fs from 'fs'
 
 /** Copies module.json and languages/ into dist/ after build */
 function foundryModulePlugin(): Plugin {
+	function copyDir(src: string, dst: string) {
+		if (!fs.existsSync(dst)) fs.mkdirSync(dst, { recursive: true })
+		for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+			const srcPath = path.resolve(src, entry.name)
+			const dstPath = path.resolve(dst, entry.name)
+			if (entry.isDirectory()) copyDir(srcPath, dstPath)
+			else fs.copyFileSync(srcPath, dstPath)
+		}
+	}
+
 	return {
 		name: 'foundry-module-copy',
 		closeBundle() {
@@ -27,7 +37,14 @@ function foundryModulePlugin(): Plugin {
 				path.resolve(distDir, 'pdf.worker.min.mjs'),
 			)
 
-			console.log('✔ Copied module.json, languages/, and pdf.worker.min.mjs into dist/')
+			// Copy PDF.js auxiliary assets. JPX/JPEG2000 image decoding needs
+			// openjpeg.wasm; without this, rendered pages can silently miss artwork.
+			const pdfjsAssetRoot = path.resolve(distDir, 'pdfjs')
+			copyDir(path.resolve(__dirname, 'node_modules/pdfjs-dist/wasm'), path.resolve(pdfjsAssetRoot, 'wasm'))
+			copyDir(path.resolve(__dirname, 'node_modules/pdfjs-dist/cmaps'), path.resolve(pdfjsAssetRoot, 'cmaps'))
+			copyDir(path.resolve(__dirname, 'node_modules/pdfjs-dist/standard_fonts'), path.resolve(pdfjsAssetRoot, 'standard_fonts'))
+
+			console.log('✔ Copied module.json, languages/, and PDF.js worker/assets into dist/')
 		},
 	}
 }

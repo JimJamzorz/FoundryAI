@@ -1583,16 +1583,82 @@ const PDF_TOOLS: ToolDefinition[] = [
 	{
 		type: 'function',
 		function: {
+			name: 'render_pdf_pages',
+			description: 'Render up to 5 explicit PDF pages to image files and save them to Foundry storage. Use this reliable fallback when embedded image extraction fails on compressed/JPX/JPEG2000 PDF art. Requires a small explicit page list.',
+			parameters: {
+				type: 'object',
+				properties: {
+					pdf_path: { type: 'string', description: 'Path to the PDF file' },
+					pages: { type: 'array', items: { type: 'number' }, description: 'Required 1-indexed page numbers to render. Maximum 5 pages.' },
+				},
+				required: ['pdf_path', 'pages'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'render_pdf_region',
+			description: 'Render a cropped region from a single PDF page to an image file. Use this to capture a map, portrait, handout, or art panel from a rendered page when raw embedded image extraction fails. Coordinates are percentages of the page from top-left, between 0 and 1.',
+			parameters: {
+				type: 'object',
+				properties: {
+					pdf_path: { type: 'string', description: 'Path to the PDF file' },
+					page_number: { type: 'number', description: '1-indexed page number to render' },
+					x: { type: 'number', description: 'Left edge of crop as a page percentage from 0 to 1' },
+					y: { type: 'number', description: 'Top edge of crop as a page percentage from 0 to 1' },
+					width: { type: 'number', description: 'Crop width as a page percentage from 0 to 1' },
+					height: { type: 'number', description: 'Crop height as a page percentage from 0 to 1' },
+				},
+				required: ['pdf_path', 'page_number', 'x', 'y', 'width', 'height'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
 			name: 'extract_pdf_images',
-			description: 'Extract embedded images (maps, illustrations, artwork) from a PDF and save them as PNG files to Foundry storage. Unlike render_pdf_page which captures a whole page, this pulls raw image objects out of the PDF so you get clean maps without text overlays. Use this to rip maps from adventure books for use as scene backgrounds. Returns paths to all extracted images; use organize_images afterwards to classify and rename them.',
+			description:
+				'Start a background job for best-effort extraction of embedded images (maps, illustrations, artwork) from a small explicit page list in a PDF. Returns a job_id immediately; use check_pdf_extraction_status only if the user asks for progress or results. If embedded extraction saves nothing for a page, the job renders that page and asks vision to crop the main illustration; if vision cannot identify a good crop, it saves the full-page fallback. WARNING: This can run for a while and may make vision requests. Do NOT retry automatically. Do NOT call this on an entire PDF. Prefer render_pdf_page/render_pdf_region for targeted page capture. Only call extract_pdf_images with a small explicit page list after user confirmation. Maximum 5 pages per job.',
 			parameters: {
 				type: 'object',
 				properties: {
 					pdf_path: { type: 'string', description: 'Path to the PDF file — e.g. "foundry-ai/pdfs/adventure.pdf"' },
-					pages: { type: 'array', items: { type: 'number' }, description: '1-indexed page numbers to extract from. Omit to scan all pages.' },
+					pages: { type: 'array', items: { type: 'number' }, description: 'Required 1-indexed page numbers to extract from. Must be explicit and contain no more than 5 pages. Do not omit this field.' },
 					min_size: { type: 'number', description: 'Minimum pixel dimension (width or height) to keep an image. Defaults to 300. Use a larger value to skip decorative borders and icons.' },
+					fallback: { type: 'string', enum: ['render_page_when_empty', 'none'], description: 'Fallback behavior when embedded extraction saves no images on a page. Defaults to render_page_when_empty.' },
+					include_decorative: { type: 'boolean', description: 'Set true only if you explicitly want PDF construction assets like parchment backgrounds, page borders, or empty decorative frames. Defaults to false.' },
 				},
-				required: ['pdf_path'],
+				required: ['pdf_path', 'pages'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'check_pdf_extraction_status',
+			description:
+				'Check a PDF image extraction background job by job_id. Poll only if the user asks for progress/results; extraction jobs run independently after extract_pdf_images returns.',
+			parameters: {
+				type: 'object',
+				properties: {
+					job_id: { type: 'string', description: 'Job ID returned by extract_pdf_images' },
+				},
+				required: ['job_id'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'cancel_pdf_extraction',
+			description: 'Best-effort cancellation for a queued or running PDF image extraction job.',
+			parameters: {
+				type: 'object',
+				properties: {
+					job_id: { type: 'string', description: 'Job ID returned by extract_pdf_images' },
+				},
+				required: ['job_id'],
 			},
 		},
 	},
@@ -2084,8 +2150,16 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handleProcessPdf(args)
 			case 'render_pdf_page':
 				return await handleRenderPdfPage(args.pdf_path, args.page_number)
+			case 'render_pdf_pages':
+				return await handleRenderPdfPages(args.pdf_path, args.pages)
+			case 'render_pdf_region':
+				return await handleRenderPdfRegion(args)
 			case 'extract_pdf_images':
 				return await handleExtractPdfImages(args)
+			case 'check_pdf_extraction_status':
+				return handleCheckPdfExtractionStatus(args.job_id)
+			case 'cancel_pdf_extraction':
+				return handleCancelPdfExtraction(args.job_id)
 
 			// Image & Scene generation tools
 			case 'list_assets':
@@ -4511,7 +4585,20 @@ async function getPdfjsLib(): Promise<any> {
 	const pdfjs = await import('pdfjs-dist')
 	// Resolve worker file relative to this module — works wherever Foundry serves the module from
 	pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdf.worker.min.mjs', import.meta.url).href
+	;(globalThis as any).pdfjsLib = pdfjs
 	return pdfjs
+}
+
+function getPdfDocumentOptions(data: ArrayBuffer): Record<string, any> {
+	return {
+		data,
+		cMapUrl: new URL('pdfjs/cmaps/', import.meta.url).href,
+		cMapPacked: true,
+		standardFontDataUrl: new URL('pdfjs/standard_fonts/', import.meta.url).href,
+		wasmUrl: new URL('pdfjs/wasm/', import.meta.url).href,
+		useWasm: true,
+		useWorkerFetch: true,
+	}
 }
 
 function escapeHtml(str: string): string {
@@ -4539,7 +4626,7 @@ async function handleProcessPdf(args: Record<string, any>): Promise<string> {
 		if (!response.ok) return JSON.stringify({ error: `Could not fetch PDF: ${response.status} ${response.statusText}` })
 
 		const arrayBuffer = await response.arrayBuffer()
-		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+		const pdf = await pdfjsLib.getDocument(getPdfDocumentOptions(arrayBuffer)).promise
 		const numPages: number = pdf.numPages
 
 		const pages: any[] = []
@@ -4650,51 +4737,422 @@ async function handleProcessPdf(args: Record<string, any>): Promise<string> {
 	}
 }
 
+type PdfPageRenderResult = {
+	path: string
+	page: number
+	total_pages: number
+	width: number
+	height: number
+	source: 'rendered_page' | 'rendered_region' | 'rendered_page_fallback'
+	crop?: { x: number; y: number; width: number; height: number }
+}
+
+type PdfRenderedCanvasResult = {
+	canvas: HTMLCanvasElement
+	page: number
+	total_pages: number
+	width: number
+	height: number
+	crop?: { x: number; y: number; width: number; height: number }
+}
+
+function normalizePageList(pages: unknown, maxPages: number): { pages?: number[]; error?: string } {
+	if (!Array.isArray(pages) || pages.length === 0) {
+		return { error: `A small explicit pages array is required (maximum ${maxPages}).` }
+	}
+	const normalized = [...new Set(pages
+		.map((page) => Number(page))
+		.filter((page) => Number.isInteger(page) && page >= 1))]
+	if (normalized.length === 0) return { error: 'Pages must be 1-indexed positive integers.' }
+	if (normalized.length > maxPages) return { error: `At most ${maxPages} pages can be processed per call. You requested ${normalized.length}.` }
+	return { pages: normalized }
+}
+
+async function loadPdfDocument(pdfPath: string): Promise<any> {
+	const pdfjsLib = await getPdfjsLib()
+	const pdfUrl = `${window.location.origin}/${pdfPath}`
+	const response = await fetch(pdfUrl)
+	if (!response.ok) throw new Error(`Could not fetch PDF: ${response.status} ${response.statusText}`)
+	const arrayBuffer = await response.arrayBuffer()
+	return pdfjsLib.getDocument(getPdfDocumentOptions(arrayBuffer)).promise
+}
+
+async function saveCanvasAsPng(
+	canvas: HTMLCanvasElement,
+	filename: string,
+	outputDirectory = 'foundry-ai/images',
+): Promise<string> {
+	const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
+	const blob: Blob = await new Promise(resolve => canvas.toBlob(b => resolve(b!), 'image/png'))
+	const file = new File([blob], filename, { type: 'image/png' })
+
+	await FP.createDirectory('data', 'foundry-ai').catch(() => {})
+	await FP.createDirectory('data', 'foundry-ai/images').catch(() => {})
+	if (outputDirectory !== 'foundry-ai/images') {
+		await FP.createDirectory('data', outputDirectory).catch(() => {})
+	}
+
+	const uploadResult = await FP.upload('data', outputDirectory, file, {}, { notify: false })
+	return (uploadResult as any)?.path || `${outputDirectory}/${filename}`
+}
+
+function analyzeEmbeddedPdfCanvas(canvas: HTMLCanvasElement): { skip: boolean; reason?: string } {
+	const width = canvas.width
+	const height = canvas.height
+	if (width < 2 || height < 2) return { skip: true, reason: 'too_small' }
+
+	const ctx = canvas.getContext('2d', { willReadFrequently: true } as any)
+	if (!ctx) return { skip: false }
+
+	const sampleW = Math.min(96, width)
+	const sampleH = Math.min(96, height)
+	const sampleCanvas = document.createElement('canvas')
+	sampleCanvas.width = sampleW
+	sampleCanvas.height = sampleH
+	const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true } as any) as CanvasRenderingContext2D
+	sampleCtx.drawImage(canvas, 0, 0, sampleW, sampleH)
+	const data = sampleCtx.getImageData(0, 0, sampleW, sampleH).data
+
+	let visible = 0
+	let lowSatVisible = 0
+	let veryLightVisible = 0
+	let sum = 0
+	let sumSq = 0
+	let edgePixels = 0
+	let centerPixels = 0
+	let edgeDetail = 0
+	let centerDetail = 0
+	let centerSum = 0
+	let centerSumSq = 0
+	let centerDarkPixels = 0
+
+	const luminanceAt = (idx: number) => 0.2126 * data[idx] + 0.7152 * data[idx + 1] + 0.0722 * data[idx + 2]
+
+	for (let y = 0; y < sampleH; y++) {
+		for (let x = 0; x < sampleW; x++) {
+			const i = (y * sampleW + x) * 4
+			const alpha = data[i + 3]
+			if (alpha < 20) continue
+
+			const r = data[i]
+			const g = data[i + 1]
+			const b = data[i + 2]
+			const max = Math.max(r, g, b)
+			const min = Math.min(r, g, b)
+			const luma = luminanceAt(i)
+			const saturation = max === 0 ? 0 : (max - min) / max
+			const inEdge = x < sampleW * 0.16 || x > sampleW * 0.84 || y < sampleH * 0.16 || y > sampleH * 0.84
+			const inCenter = x > sampleW * 0.28 && x < sampleW * 0.72 && y > sampleH * 0.28 && y < sampleH * 0.72
+
+			visible++
+			sum += luma
+			sumSq += luma * luma
+			if (saturation < 0.18) lowSatVisible++
+			if (luma > 190) veryLightVisible++
+
+			let localDetail = 0
+			if (x + 1 < sampleW) localDetail += Math.abs(luma - luminanceAt(i + 4))
+			if (y + 1 < sampleH) localDetail += Math.abs(luma - luminanceAt(i + sampleW * 4))
+			if (inEdge) {
+				edgePixels++
+				edgeDetail += localDetail
+			}
+			if (inCenter) {
+				centerPixels++
+				centerDetail += localDetail
+				centerSum += luma
+				centerSumSq += luma * luma
+				if (luma < 45) centerDarkPixels++
+			}
+		}
+	}
+
+	if (visible === 0) return { skip: true, reason: 'transparent_or_empty' }
+
+	const mean = sum / visible
+	const variance = Math.max(0, sumSq / visible - mean * mean)
+	const stdDev = Math.sqrt(variance)
+	const lowSatRatio = lowSatVisible / visible
+	const veryLightRatio = veryLightVisible / visible
+	const edgeAvgDetail = edgePixels ? edgeDetail / edgePixels : 0
+	const centerAvgDetail = centerPixels ? centerDetail / centerPixels : 0
+	const centerMean = centerPixels ? centerSum / centerPixels : 0
+	const centerStdDev = centerPixels ? Math.sqrt(Math.max(0, centerSumSq / centerPixels - centerMean * centerMean)) : 0
+	const centerDarkRatio = centerPixels ? centerDarkPixels / centerPixels : 0
+
+	if (lowSatRatio > 0.94 && veryLightRatio > 0.72 && stdDev < 24) {
+		return { skip: true, reason: 'decorative_page_background' }
+	}
+
+	if (centerDarkRatio > 0.86 && centerMean < 45 && centerStdDev < 30 && edgeAvgDetail > centerAvgDetail * 1.8) {
+		return { skip: true, reason: 'decorative_border_or_empty_frame' }
+	}
+
+	if (edgeAvgDetail > centerAvgDetail * 2.8 && centerAvgDetail < 16 && stdDev < 75) {
+		return { skip: true, reason: 'decorative_border_or_empty_frame' }
+	}
+
+	return { skip: false }
+}
+
+function clampPdfCrop(args: Record<string, any>): { x: number; y: number; width: number; height: number; error?: string } {
+	const x = Number(args.x)
+	const y = Number(args.y)
+	const width = Number(args.width)
+	const height = Number(args.height)
+	if (![x, y, width, height].every(Number.isFinite)) {
+		return { x: 0, y: 0, width: 0, height: 0, error: 'Crop x, y, width, and height must be numbers between 0 and 1.' }
+	}
+	if (width <= 0 || height <= 0 || x < 0 || y < 0 || x >= 1 || y >= 1) {
+		return { x, y, width, height, error: 'Crop must start within the page and have positive width and height.' }
+	}
+	const clampedWidth = Math.min(width, 1 - x)
+	const clampedHeight = Math.min(height, 1 - y)
+	return { x, y, width: clampedWidth, height: clampedHeight }
+}
+
+async function renderPdfPageToImage(
+	pdf: any,
+	pdfPath: string,
+	pageNumber: number,
+	options: {
+		outputDirectory?: string
+		scale?: number
+		source?: PdfPageRenderResult['source']
+		crop?: { x: number; y: number; width: number; height: number }
+		filenamePart?: string
+	} = {},
+): Promise<PdfPageRenderResult> {
+	const rendered = await renderPdfPageCanvas(pdf, pageNumber, {
+		scale: options.scale,
+		crop: options.crop,
+	})
+	const source = options.source ?? (options.crop ? 'rendered_region' : 'rendered_page')
+	const slug = promptToSlug(pdfPath)
+	const suffix = options.filenamePart ?? source
+	const filename = `pdf-${slug}-p${pageNumber}-${suffix}-${Date.now()}.png`
+	const savedPath = await saveCanvasAsPng(rendered.canvas, filename, options.outputDirectory)
+
+	return {
+		path: savedPath,
+		page: pageNumber,
+		total_pages: pdf.numPages,
+		width: rendered.width,
+		height: rendered.height,
+		source,
+		...(options.crop ? { crop: options.crop } : {}),
+	}
+}
+
+async function renderPdfPageCanvas(
+	pdf: any,
+	pageNumber: number,
+	options: {
+		scale?: number
+		crop?: { x: number; y: number; width: number; height: number }
+	} = {},
+): Promise<PdfRenderedCanvasResult> {
+	if (pageNumber < 1 || pageNumber > pdf.numPages) {
+		throw new Error(`Page ${pageNumber} is out of range — PDF has ${pdf.numPages} pages.`)
+	}
+
+	const page = await pdf.getPage(pageNumber)
+	const viewport = page.getViewport({ scale: options.scale ?? 2.0 })
+	const fullCanvas = document.createElement('canvas')
+	fullCanvas.width = viewport.width
+	fullCanvas.height = viewport.height
+	const fullCtx = fullCanvas.getContext('2d')!
+	await page.render({ canvasContext: fullCtx, viewport }).promise
+
+	let outputCanvas = fullCanvas
+	if (options.crop) {
+		const sx = Math.floor(options.crop.x * fullCanvas.width)
+		const sy = Math.floor(options.crop.y * fullCanvas.height)
+		const sw = Math.max(1, Math.floor(options.crop.width * fullCanvas.width))
+		const sh = Math.max(1, Math.floor(options.crop.height * fullCanvas.height))
+		outputCanvas = document.createElement('canvas')
+		outputCanvas.width = sw
+		outputCanvas.height = sh
+		outputCanvas.getContext('2d')!.drawImage(fullCanvas, sx, sy, sw, sh, 0, 0, sw, sh)
+	}
+
+	return {
+		canvas: outputCanvas,
+		page: pageNumber,
+		total_pages: pdf.numPages,
+		width: outputCanvas.width,
+		height: outputCanvas.height,
+		...(options.crop ? { crop: options.crop } : {}),
+	}
+}
+
 async function handleRenderPdfPage(pdfPath: string, pageNumber: number): Promise<string> {
 	console.log(`FoundryAI | render_pdf_page: path="${pdfPath}", page=${pageNumber}`)
 	try {
-		const pdfjsLib = await getPdfjsLib()
-		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
-
-		const pdfUrl = `${window.location.origin}/${pdfPath}`
-		const response = await fetch(pdfUrl)
-		if (!response.ok) return JSON.stringify({ error: `Could not fetch PDF: ${response.status} ${response.statusText}` })
-
-		const arrayBuffer = await response.arrayBuffer()
-		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
-
-		if (pageNumber < 1 || pageNumber > pdf.numPages) {
-			return JSON.stringify({ error: `Page ${pageNumber} is out of range — PDF has ${pdf.numPages} pages.` })
-		}
-
-		const page = await pdf.getPage(pageNumber)
-		const viewport = page.getViewport({ scale: 2.0 })
-
-		const canvas = document.createElement('canvas')
-		canvas.width = viewport.width
-		canvas.height = viewport.height
-		const ctx = canvas.getContext('2d')!
-		await page.render({ canvasContext: ctx, viewport }).promise
-
-		const blob: Blob = await new Promise(resolve => canvas.toBlob(b => resolve(b!), 'image/png'))
-		const filename = `pdf-${promptToSlug(pdfPath)}-p${pageNumber}-${Date.now()}.png`
-		const file = new File([blob], filename, { type: 'image/png' })
-
-		await FP.createDirectory('data', 'foundry-ai').catch(() => {})
-		await FP.createDirectory('data', 'foundry-ai/images').catch(() => {})
-		const uploadResult = await FP.upload('data', 'foundry-ai/images', file, {}, { notify: false })
-		const savedPath = (uploadResult as any)?.path || `foundry-ai/images/${filename}`
-
+		const pdf = await loadPdfDocument(pdfPath)
+		const image = await renderPdfPageToImage(pdf, pdfPath, pageNumber, { source: 'rendered_page' })
 		return JSON.stringify({
 			success: true,
-			path: savedPath,
-			page: pageNumber,
-			total_pages: pdf.numPages,
-			message: `Rendered page ${pageNumber} of ${pdf.numPages} to ${savedPath}. Use describe_image to analyse it, update_actor to use it as a portrait, or update_scene to use it as a map background.`,
+			...image,
+			message: `Rendered page ${pageNumber} of ${image.total_pages} to ${image.path}. Use describe_image to analyse it, update_actor to use it as a portrait, or update_scene to use it as a map background.`,
 		})
 	} catch (error: any) {
 		return JSON.stringify({ error: `PDF page render failed: ${error.message}` })
 	}
+}
+
+async function handleRenderPdfPages(pdfPath: string, pages: unknown): Promise<string> {
+	console.log(`FoundryAI | render_pdf_pages: path="${pdfPath}"`)
+	try {
+		const pageResult = normalizePageList(pages, 5)
+		if (pageResult.error) return JSON.stringify({ error: pageResult.error })
+		const pdf = await loadPdfDocument(pdfPath)
+		const validPages = pageResult.pages!.filter((page) => page <= pdf.numPages)
+		if (validPages.length === 0) {
+			return JSON.stringify({ error: `None of the requested pages exist in this PDF. It has ${pdf.numPages} page(s).` })
+		}
+
+		const images: PdfPageRenderResult[] = []
+		for (const page of validPages) {
+			images.push(await renderPdfPageToImage(pdf, pdfPath, page, { source: 'rendered_page' }))
+		}
+
+		return JSON.stringify({
+			success: true,
+			rendered_count: images.length,
+			images,
+			message: `Rendered ${images.length} PDF page(s). Use describe_image to inspect them, or render_pdf_region to crop a specific panel/map from a page.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `PDF pages render failed: ${error.message}` })
+	}
+}
+
+async function handleRenderPdfRegion(args: Record<string, any>): Promise<string> {
+	console.log(`FoundryAI | render_pdf_region: path="${args.pdf_path}", page=${args.page_number}`)
+	try {
+		const crop = clampPdfCrop(args)
+		if (crop.error) return JSON.stringify({ error: crop.error })
+		const pdf = await loadPdfDocument(args.pdf_path)
+		const image = await renderPdfPageToImage(pdf, args.pdf_path, Number(args.page_number), {
+			source: 'rendered_region',
+			crop,
+			filenamePart: 'region',
+		})
+		return JSON.stringify({
+			success: true,
+			...image,
+			message: `Rendered cropped region from page ${image.page} to ${image.path}.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `PDF region render failed: ${error.message}` })
+	}
+}
+
+type VisionCrop = {
+	label: string
+	x: number
+	y: number
+	width: number
+	height: number
+	confidence: number
+}
+
+function parseVisionCropCandidates(text: string): VisionCrop[] {
+	const match = text.match(/\[[\s\S]*\]/) || text.match(/\{[\s\S]*\}/)
+	if (!match) return []
+
+	try {
+		const parsed = JSON.parse(match[0])
+		const rawCandidates = Array.isArray(parsed) ? parsed : parsed.regions || parsed.candidates || []
+		if (!Array.isArray(rawCandidates)) return []
+
+		return rawCandidates
+			.map((candidate: any) => ({
+				label: String(candidate.label || candidate.description || 'illustration'),
+				x: Number(candidate.x),
+				y: Number(candidate.y),
+				width: Number(candidate.width),
+				height: Number(candidate.height),
+				confidence: Number(candidate.confidence ?? candidate.score ?? 0.5),
+			}))
+			.filter((candidate: VisionCrop) => {
+				const area = candidate.width * candidate.height
+				return (
+					[candidate.x, candidate.y, candidate.width, candidate.height, candidate.confidence].every(Number.isFinite) &&
+					candidate.x >= 0 &&
+					candidate.y >= 0 &&
+					candidate.x < 1 &&
+					candidate.y < 1 &&
+					candidate.width > 0.05 &&
+					candidate.height > 0.05 &&
+					candidate.x + candidate.width <= 1.08 &&
+					candidate.y + candidate.height <= 1.08 &&
+					area >= 0.015 &&
+					area <= 0.75 &&
+					candidate.confidence >= 0.45
+				)
+			})
+			.map((candidate: VisionCrop) => ({
+				...candidate,
+				width: Math.min(candidate.width, 1 - candidate.x),
+				height: Math.min(candidate.height, 1 - candidate.y),
+			}))
+			.sort((a: VisionCrop, b: VisionCrop) => b.confidence - a.confidence)
+	} catch {
+		return []
+	}
+}
+
+/** Longest edge sent to the vision model for crop suggestions. Region detection
+ *  doesn't need full resolution, and a 2x-scale page render can be a multi-MB
+ *  base64 payload — downscaling cuts cost and latency with no accuracy loss
+ *  (crops are normalized 0–1, so they apply cleanly back to the full canvas). */
+const VISION_CROP_MAX_EDGE = 1024
+
+function downscaleCanvasForVision(canvas: HTMLCanvasElement, maxEdge = VISION_CROP_MAX_EDGE): HTMLCanvasElement {
+	const longest = Math.max(canvas.width, canvas.height)
+	if (longest <= maxEdge) return canvas
+	const ratio = maxEdge / longest
+	const scaled = document.createElement('canvas')
+	scaled.width = Math.max(1, Math.round(canvas.width * ratio))
+	scaled.height = Math.max(1, Math.round(canvas.height * ratio))
+	scaled.getContext('2d')!.drawImage(canvas, 0, 0, scaled.width, scaled.height)
+	return scaled
+}
+
+async function suggestIllustrationCropFromCanvas(canvas: HTMLCanvasElement): Promise<{ crop?: VisionCrop; raw?: string; error?: string }> {
+	try {
+		const dataUrl = downscaleCanvasForVision(canvas).toDataURL('image/png')
+		const raw = await openRouterService.describeImage(
+			dataUrl,
+			'Identify the main illustration/artwork regions on this RPG book page. Ignore text, captions, page numbers, parchment background, page borders, and decorative empty frames. Return only JSON as an array like [{"label":"main illustration","x":0.12,"y":0.25,"width":0.42,"height":0.35,"confidence":0.9}]. Coordinates must be normalized from the top-left of the full page image, between 0 and 1. If there is no clear illustration, return [].',
+		)
+		const candidates = parseVisionCropCandidates(raw)
+		return { crop: candidates[0], raw }
+	} catch (error: any) {
+		return { error: error?.message || String(error) }
+	}
+}
+
+function cropCanvasByNormalizedRegion(
+	sourceCanvas: HTMLCanvasElement,
+	crop: { x: number; y: number; width: number; height: number },
+	padding = 0.01,
+): HTMLCanvasElement {
+	const x = Math.max(0, crop.x - padding)
+	const y = Math.max(0, crop.y - padding)
+	const width = Math.min(crop.width + padding * 2, 1 - x)
+	const height = Math.min(crop.height + padding * 2, 1 - y)
+	const sx = Math.floor(x * sourceCanvas.width)
+	const sy = Math.floor(y * sourceCanvas.height)
+	const sw = Math.max(1, Math.floor(width * sourceCanvas.width))
+	const sh = Math.max(1, Math.floor(height * sourceCanvas.height))
+	const outputCanvas = document.createElement('canvas')
+	outputCanvas.width = sw
+	outputCanvas.height = sh
+	outputCanvas.getContext('2d')!.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, sw, sh)
+	return outputCanvas
 }
 
 type ImageOrganization = {
@@ -4732,30 +5190,173 @@ async function classifyImageForOrganization(blob: Blob, imageName: string): Prom
 	}
 }
 
+type PdfExtractionJobStatus = 'queued' | 'running' | 'complete' | 'failed' | 'cancelled'
+
+type PdfExtractionJob = {
+	id: string
+	status: PdfExtractionJobStatus
+	args: Record<string, any>
+	progress_percent: number
+	current_stage: string
+	created_at: number
+	started_at?: number
+	completed_at?: number
+	result?: any
+	error?: string
+	cancel_requested?: boolean
+}
+
+const PDF_EXTRACTION_JOBS = new Map<string, PdfExtractionJob>()
+
+function prunePdfExtractionJobs() {
+	const jobs = [...PDF_EXTRACTION_JOBS.values()].sort((a, b) => b.created_at - a.created_at)
+	for (const job of jobs.slice(25)) {
+		if (job.status !== 'running' && job.status !== 'queued') PDF_EXTRACTION_JOBS.delete(job.id)
+	}
+}
+
+function serializePdfExtractionJob(job: PdfExtractionJob): Record<string, any> {
+	return {
+		id: job.id,
+		status: job.status,
+		progress_percent: job.progress_percent,
+		current_stage: job.current_stage,
+		pdf_path: job.args.pdf_path,
+		pages: job.args.pages,
+		created_at: new Date(job.created_at).toISOString(),
+		started_at: job.started_at ? new Date(job.started_at).toISOString() : undefined,
+		completed_at: job.completed_at ? new Date(job.completed_at).toISOString() : undefined,
+		result: job.result,
+		error: job.error,
+		cancel_requested: job.cancel_requested || undefined,
+	}
+}
+
+function validatePdfExtractionArgs(args: Record<string, any>): { args?: Record<string, any>; error?: Record<string, any> } {
+	const pageResult = normalizePageList(args.pages, 5)
+	if (pageResult.error) {
+		return {
+			error: {
+				error: pageResult.error,
+				hint: 'Use a small explicit page list. Do not scan an entire PDF, and do not retry automatically after a timeout.',
+			},
+		}
+	}
+	return {
+		args: {
+			...args,
+			pages: pageResult.pages,
+			fallback: args.fallback === 'none' ? 'none' : 'render_page_when_empty',
+		},
+	}
+}
+
 async function handleExtractPdfImages(args: Record<string, any>): Promise<string> {
 	console.log(`FoundryAI | extract_pdf_images: path="${args.pdf_path}"`)
+	const validation = validatePdfExtractionArgs(args)
+	if (validation.error) return JSON.stringify(validation.error)
+
+	prunePdfExtractionJobs()
+	const jobId = `pdf_extract_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+	const job: PdfExtractionJob = {
+		id: jobId,
+		status: 'queued',
+		args: validation.args!,
+		progress_percent: 0,
+		current_stage: 'Queued',
+		created_at: Date.now(),
+	}
+	PDF_EXTRACTION_JOBS.set(jobId, job)
+
+	window.setTimeout(() => {
+		processPdfExtractionJob(jobId).catch((error) => {
+			const current = PDF_EXTRACTION_JOBS.get(jobId)
+			if (!current || current.status === 'cancelled') return
+			current.status = 'failed'
+			current.error = error?.message || String(error)
+			current.current_stage = 'Failed'
+			current.completed_at = Date.now()
+			console.error(`FoundryAI | extract_pdf_images job ${jobId} failed`, error)
+		})
+	}, 0)
+
+	return JSON.stringify({
+		success: true,
+		job_id: jobId,
+		status: 'queued',
+		pdf_path: job.args.pdf_path,
+		pages: job.args.pages,
+		message: `Extraction started in background for page(s) ${job.args.pages.join(', ')}. Do not retry automatically; use check_pdf_extraction_status with this job_id if you need progress or results.`,
+	})
+}
+
+async function processPdfExtractionJob(jobId: string): Promise<void> {
+	const job = PDF_EXTRACTION_JOBS.get(jobId)
+	if (!job) return
+
+	job.status = 'running'
+	job.started_at = Date.now()
+	job.progress_percent = 5
+	job.current_stage = 'Starting PDF image extraction'
+
 	try {
+		const resultText = await runPdfExtractionJob(job)
+		if (job.cancel_requested || (job as PdfExtractionJob).status === 'cancelled') return
+		const result = JSON.parse(resultText)
+		if (result?.error) {
+			job.status = 'failed'
+			job.error = result.error
+			job.result = result
+			job.current_stage = 'Failed'
+			job.completed_at = Date.now()
+			return
+		}
+		job.result = result
+		job.status = 'complete'
+		job.progress_percent = 100
+		job.current_stage = 'Complete'
+		job.completed_at = Date.now()
+	} catch (error: any) {
+		if (job.cancel_requested || (job as PdfExtractionJob).status === 'cancelled') return
+		job.status = 'failed'
+		job.error = error?.message || String(error)
+		job.current_stage = 'Failed'
+		job.completed_at = Date.now()
+	}
+}
+
+async function runPdfExtractionJob(job: PdfExtractionJob): Promise<string> {
+	const args = job.args
+	const requestedPages = args.pages as number[]
+
+	try {
+		if (job.cancel_requested) {
+			job.status = 'cancelled'
+			job.current_stage = 'Cancelled before start'
+			job.completed_at = Date.now()
+			return JSON.stringify({ success: false, cancelled: true })
+		}
+
 		console.log('FoundryAI | extract_pdf_images: loading PDF.js')
+		// pdfjsLib is still needed below for the OPS constants; loadPdfDocument
+		// (shared with the render_pdf_* tools) handles fetch + document parsing.
 		const pdfjsLib = await getPdfjsLib()
-		console.log('FoundryAI | extract_pdf_images: PDF.js loaded')
 		const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
 
-		const pdfUrl = `${window.location.origin}/${args.pdf_path}`
-		console.log(`FoundryAI | extract_pdf_images: fetching PDF from "${pdfUrl}"`)
-		const response = await fetch(pdfUrl)
-		console.log(`FoundryAI | extract_pdf_images: fetch completed (${response.status} ${response.statusText})`)
-		if (!response.ok) return JSON.stringify({ error: `Could not fetch PDF: ${response.status} ${response.statusText}` })
-
-		const arrayBuffer = await response.arrayBuffer()
-		console.log(`FoundryAI | extract_pdf_images: read PDF body (${arrayBuffer.byteLength} bytes); loading document`)
-		const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+		job.progress_percent = 15
+		job.current_stage = 'Loading PDF'
+		console.log(`FoundryAI | extract_pdf_images: loading PDF "${args.pdf_path}"`)
+		const pdf = await loadPdfDocument(args.pdf_path)
 		const numPages: number = pdf.numPages
 		const minSize: number = args.min_size ?? 300
 		const imageResolveTimeoutMs = 10_000
+		const fallback = args.fallback === 'none' ? 'none' : 'render_page_when_empty'
+		const includeDecorative = args.include_decorative === true
 
-		const pagesToProcess: number[] = args.pages
-			? (args.pages as number[]).filter((n: number) => n >= 1 && n <= numPages)
-			: Array.from({ length: numPages }, (_, i) => i + 1)
+		const pagesToProcess: number[] = requestedPages.filter((n: number) => n <= numPages)
+		if (pagesToProcess.length === 0) {
+			return JSON.stringify({ error: `None of the requested pages exist in this PDF. It has ${numPages} page(s).` })
+		}
 		console.log(`FoundryAI | extract_pdf_images: PDF loaded (${numPages} page(s)); processing pages [${pagesToProcess.join(', ')}] with min_size=${minSize}`)
 		const slug = promptToSlug(args.pdf_path)
 		const outputDirectory = `foundry-ai/images/${slug}`
@@ -4766,9 +5367,29 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 		await FP.createDirectory('data', outputDirectory).catch(() => {})
 		console.log(`FoundryAI | extract_pdf_images: output directory ready at "${outputDirectory}"`)
 
-		const savedImages: Array<{ path: string; page: number; width: number; height: number }> = []
+		const savedImages: Array<{ path: string; page: number; width: number; height: number; source: 'embedded_image' | 'rendered_page_fallback' | 'vision_cropped_page_region'; image_object?: string; crop?: Record<string, any> }> = []
+		const diagnostics: Array<{
+			page: number
+			image_objects_found: number
+			embedded_saved: number
+			timed_out: number
+			skipped: number
+			skipped_reasons: Record<string, number>
+			fallback_rendered: boolean
+			vision_crop_used?: boolean
+			vision_crop_error?: string
+		}> = []
 
 		for (const pageNum of pagesToProcess) {
+			if (job.cancel_requested) {
+				job.status = 'cancelled'
+				job.current_stage = `Cancelled before page ${pageNum}`
+				job.completed_at = Date.now()
+				return JSON.stringify({ success: false, cancelled: true })
+			}
+			const pageIndex = pagesToProcess.indexOf(pageNum)
+			job.progress_percent = 20 + Math.round((pageIndex / pagesToProcess.length) * 70)
+			job.current_stage = `Processing page ${pageNum} of ${numPages}`
 			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: loading page`)
 			const page = await pdf.getPage(pageNum)
 			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: building operator list`)
@@ -4787,13 +5408,29 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: found ${seen.size} unique image XObject(s)`)
 
 			let imgIndex = 0
+			let timedOutCount = 0
+			let skippedCount = 0
+			const skippedReasons: Record<string, number> = {}
+			const markSkipped = (reason: string) => {
+				skippedCount++
+				skippedReasons[reason] = (skippedReasons[reason] || 0) + 1
+			}
+			const savedBeforePage = savedImages.length
 			for (const imgName of seen) {
+				if (job.cancel_requested) {
+					job.status = 'cancelled'
+					job.current_stage = `Cancelled on page ${pageNum}`
+					job.completed_at = Date.now()
+					return JSON.stringify({ success: false, cancelled: true })
+				}
 				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: resolving image "${imgName}"`)
+				let timedOut = false
 				const imgData = await new Promise<any | undefined>((resolve) => {
 					let settled = false
 					const timeoutId = window.setTimeout(() => {
 						if (settled) return
 						settled = true
+						timedOut = true
 						console.warn(`FoundryAI | extract_pdf_images: page ${pageNum}: timed out after ${imageResolveTimeoutMs}ms resolving image "${imgName}"; skipping it`)
 						resolve(undefined)
 					}, imageResolveTimeoutMs)
@@ -4807,8 +5444,10 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 				})
 				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: image "${imgName}" resolved (${imgData?.width ?? 'unknown'}x${imgData?.height ?? 'unknown'}, kind=${imgData?.kind ?? 'unknown'}, bitmap=${Boolean(imgData?.bitmap)})`)
 
+				if (timedOut) timedOutCount++
 				if (!imgData || imgData.width < minSize || imgData.height < minSize) {
 					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: skipping image "${imgName}" (missing or below min_size)`)
+					markSkipped('missing_or_below_min_size')
 					continue
 				}
 
@@ -4842,22 +5481,80 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 					ctx.drawImage(imgData.bitmap as CanvasImageSource, 0, 0, imgData.width, imgData.height)
 				} else {
 					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: skipping image "${imgName}" (unsupported pixel format kind=${imgData.kind})`)
+					markSkipped('unsupported_pixel_format')
 					continue
 				}
 
+				if (!includeDecorative) {
+					const analysis = analyzeEmbeddedPdfCanvas(canvas)
+					if (analysis.skip) {
+						const reason = analysis.reason || 'decorative_or_low_content'
+						console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: skipping image "${imgName}" (${reason})`)
+						markSkipped(reason)
+						continue
+					}
+				}
+
 				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: encoding image "${imgName}" as PNG`)
-				const blob: Blob = await new Promise(resolve => canvas.toBlob(b => resolve(b!), 'image/png'))
 				const imageNumber = ++imgIndex
 				const filename = `pdf-${slug}-p${pageNum}-img${imageNumber}-${Date.now()}.png`
-				const file = new File([blob], filename, { type: 'image/png' })
 
-				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: uploading image "${imgName}" as "${outputDirectory}/${filename}" (${blob.size} bytes)`)
-				const uploadResult = await FP.upload('data', outputDirectory, file, {}, { notify: false })
-				const savedPath = (uploadResult as any)?.path || `${outputDirectory}/${filename}`
-				savedImages.push({ path: savedPath, page: pageNum, width: imgData.width, height: imgData.height })
+				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: uploading image "${imgName}" as "${outputDirectory}/${filename}"`)
+				const savedPath = await saveCanvasAsPng(canvas, filename, outputDirectory)
+				savedImages.push({ path: savedPath, page: pageNum, width: imgData.width, height: imgData.height, source: 'embedded_image', image_object: imgName })
 				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: saved image "${imgName}" to "${savedPath}"`)
 			}
-			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: complete (${imgIndex} eligible image(s))`)
+			const embeddedSaved = savedImages.length - savedBeforePage
+			let fallbackRendered = false
+			let visionCropUsed = false
+			let visionCropError: string | undefined
+			if (embeddedSaved === 0 && fallback === 'render_page_when_empty') {
+				job.current_stage = `Rendering fallback for page ${pageNum}`
+				console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: no embedded images saved; rendering full-page fallback`)
+				const rendered = await renderPdfPageCanvas(pdf, pageNum)
+				job.current_stage = `Finding illustration crop for page ${pageNum}`
+				const cropSuggestion = await suggestIllustrationCropFromCanvas(rendered.canvas)
+				if (cropSuggestion.crop) {
+					const cropCanvas = cropCanvasByNormalizedRegion(rendered.canvas, cropSuggestion.crop)
+					const filename = `pdf-${slug}-p${pageNum}-vision-crop-${Date.now()}.png`
+					const savedPath = await saveCanvasAsPng(cropCanvas, filename, outputDirectory)
+					savedImages.push({
+						path: savedPath,
+						page: pageNum,
+						width: cropCanvas.width,
+						height: cropCanvas.height,
+						source: 'vision_cropped_page_region',
+						crop: cropSuggestion.crop,
+					})
+					visionCropUsed = true
+					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: saved vision crop to "${savedPath}"`)
+				} else {
+					visionCropError = cropSuggestion.error || 'vision_returned_no_valid_crop'
+					const filename = `pdf-${slug}-p${pageNum}-fallback-${Date.now()}.png`
+					const savedPath = await saveCanvasAsPng(rendered.canvas, filename, outputDirectory)
+					savedImages.push({
+						path: savedPath,
+						page: pageNum,
+						width: rendered.width,
+						height: rendered.height,
+						source: 'rendered_page_fallback',
+					})
+					fallbackRendered = true
+					console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: saved rendered fallback to "${savedPath}"`)
+				}
+			}
+			diagnostics.push({
+				page: pageNum,
+				image_objects_found: seen.size,
+				embedded_saved: embeddedSaved,
+				timed_out: timedOutCount,
+				skipped: skippedCount,
+				skipped_reasons: skippedReasons,
+				fallback_rendered: fallbackRendered,
+				...(visionCropUsed ? { vision_crop_used: true } : {}),
+				...(visionCropError ? { vision_crop_error: visionCropError } : {}),
+			})
+			console.log(`FoundryAI | extract_pdf_images: page ${pageNum}: complete (${embeddedSaved} embedded image(s), fallback=${fallbackRendered})`)
 		}
 
 		if (savedImages.length === 0) {
@@ -4865,7 +5562,8 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 				success: true,
 				extracted_count: 0,
 				images: [],
-				message: `No embedded images found larger than ${minSize}px on the scanned pages. The PDF may use vector art or the images may be smaller than min_size. Try render_pdf_page to capture a whole page instead.`,
+				diagnostics,
+				message: `No embedded images found larger than ${minSize}px on the scanned pages, and fallback rendering was disabled. Try render_pdf_page or render_pdf_region to capture the visible page art.`,
 			})
 		}
 
@@ -4873,12 +5571,38 @@ async function handleExtractPdfImages(args: Record<string, any>): Promise<string
 			success: true,
 			extracted_count: savedImages.length,
 			images: savedImages,
-			message: `Extracted ${savedImages.length} image(s). Use organize_images to classify and rename them, or update_scene with a path to set one as a map background.`,
+			diagnostics,
+			message: `Saved ${savedImages.length} image(s). Results marked source="embedded_image" are raw PDF images; source="rendered_page_fallback" are full-page renders used when embedded extraction failed.`,
 		})
 	} catch (error: any) {
 		console.error('FoundryAI | extract_pdf_images: failed', error)
-		return JSON.stringify({ error: `PDF image extraction failed: ${error.message}` })
+		throw new Error(`PDF image extraction failed: ${error.message}`)
 	}
+}
+
+function handleCheckPdfExtractionStatus(jobId: string): string {
+	const job = PDF_EXTRACTION_JOBS.get(jobId)
+	if (!job) {
+		return JSON.stringify({
+			error: `PDF extraction job not found: ${jobId}. Jobs are held in memory and do not survive a Foundry reload/refresh — if the world reloaded since the job started, it is gone. Check list_assets to see whether images were already saved before the reload, and start a new extract_pdf_images job for anything missing.`,
+		})
+	}
+	return JSON.stringify({ success: true, job: serializePdfExtractionJob(job) })
+}
+
+function handleCancelPdfExtraction(jobId: string): string {
+	const job = PDF_EXTRACTION_JOBS.get(jobId)
+	if (!job) return JSON.stringify({ error: `PDF extraction job not found: ${jobId}` })
+	if (job.status === 'complete' || job.status === 'failed' || job.status === 'cancelled') {
+		return JSON.stringify({ success: false, job: serializePdfExtractionJob(job), message: `Job is already ${job.status}.` })
+	}
+	job.cancel_requested = true
+	if (job.status === 'queued') {
+		job.status = 'cancelled'
+		job.current_stage = 'Cancelled before start'
+		job.completed_at = Date.now()
+	}
+	return JSON.stringify({ success: true, job: serializePdfExtractionJob(job), message: 'PDF extraction cancellation requested.' })
 }
 
 async function handleUploadGeneratedMap(filename: string, imageData: string, folder?: string): Promise<string> {
