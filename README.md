@@ -87,11 +87,12 @@ FoundryAI provides **70+ tools** across 15 categories that the AI can call auton
 | ------------------------- | ------------------------------------------------------------------------------ |
 | `search_journals`         | Semantically search indexed journal entries (sourcebooks, notes, lore)         |
 | `search_actors`           | Semantically search indexed actors (NPCs, monsters, characters)                |
-| `get_journal`             | Get the full content of a journal entry by ID or exact name                    |
+| `get_journal`             | Get journal content plus first-class page IDs, names, types, and content       |
 | `get_actor`               | Get details about a specific actor by ID                                       |
 | `list_actors_in_folder`   | List every actor in a folder (the reliable way to answer "who is in folder X") |
-| `create_journal`          | Create a new journal entry (multi-page and quest formats supported)            |
-| `update_journal`          | Update a journal page or append a new one                                      |
+| `create_journal`          | Create a journal entry and return created page IDs/names                       |
+| `update_journal`          | Update by page ID or exact page name; replace, append, prepend, or section-edit |
+| `list_journal_pages`      | List page IDs, names, sort order, type, and content length for one journal     |
 | `list_journals_in_folder` | List all journal entries in a folder, with page IDs                            |
 | `list_folders`            | List accessible journal, actor, and scene folders                              |
 | `create_folder`           | Create an empty actor or scene folder                                          |

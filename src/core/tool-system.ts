@@ -252,7 +252,7 @@ const CORE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'get_journal',
 			description:
-				'Retrieve the full text of every page in a journal entry. Accepts either the Foundry document ID or the exact journal name. This is the ONLY tool needed to read journal content — call it directly after search_journals returns a documentId, or directly by name if you already know it. Long entries are truncated to max_length characters; when the response has truncated: true, call again with offset set to next_offset to fetch the rest.',
+				'Retrieve the full text of every page in a journal entry. Accepts either the Foundry document ID or the exact journal name. Returns a pages array with page IDs, names, types, sort order, and page content so a page can be safely targeted later. Long combined content is truncated to max_length characters; when the response has truncated: true, call again with offset set to next_offset to fetch the rest.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -377,7 +377,7 @@ const CORE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'update_journal',
 			description:
-				'Update an existing journal entry. WARNING: this REPLACES the target page\'s entire content — to append or edit, first read the current content with get_journal and resubmit the full modified HTML, or pass new_page_name to add a brand-new page without touching existing ones. By default targets the first text page; pass page_id (from list_journals_in_folder) to target a specific page.',
+				'Update an existing journal entry page. Target by page_id, or by page_name with match_mode "exact". Supports replace_page, append_page, prepend_page, and replace_section_by_heading modes. Pass new_page_name to add a brand-new page without touching existing ones. By default targets the first text page and replaces it.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -391,7 +391,7 @@ const CORE_TOOLS: ToolDefinition[] = [
 					},
 					page_id: {
 						type: 'string',
-						description: 'ID of a specific page to update (from list_journals_in_folder). If omitted, updates the first text page.',
+						description: 'ID of a specific page to update (from get_journal, list_journal_pages, or list_journals_in_folder). If omitted, page_name is used; if both are omitted, updates the first text page.',
 					},
 					new_page_name: {
 						type: 'string',
@@ -399,10 +399,49 @@ const CORE_TOOLS: ToolDefinition[] = [
 					},
 					page_name: {
 						type: 'string',
-						description: 'Optionally rename the page being updated.',
+						description: 'Exact page name to update when page_id is omitted. For backward compatibility, when page_id is provided this can still rename the updated page; prefer rename_page_name for renames.',
+					},
+					match_mode: {
+						type: 'string',
+						enum: ['exact'],
+						description: 'How to match page_name. Currently only exact is supported.',
+					},
+					mode: {
+						type: 'string',
+						enum: ['replace_page', 'append_page', 'prepend_page', 'replace_section_by_heading'],
+						description: 'Update behavior for the target page. Defaults to replace_page.',
+					},
+					heading: {
+						type: 'string',
+						description: 'Heading text to replace when mode is replace_section_by_heading. Matches an h1-h6 heading by visible text.',
+					},
+					rename_page_name: {
+						type: 'string',
+						description: 'Optional new name for the updated page.',
+					},
+					include_pages: {
+						type: 'boolean',
+						description: 'When true, include the full page list in the response for debugging. Defaults to false.',
 					},
 				},
 				required: ['journal_id', 'content'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'list_journal_pages',
+			description: 'List pages in one journal entry, returning page names, IDs, sort order, type, and text length. Use this before updating a specific page.',
+			parameters: {
+				type: 'object',
+				properties: {
+					journal_id: {
+						type: 'string',
+						description: 'The Foundry document ID of the journal entry, OR the exact journal name',
+					},
+				},
+				required: ['journal_id'],
 			},
 		},
 	},
@@ -2041,7 +2080,9 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			case 'create_journal':
 				return await handleCreateJournal(args.name, args.content, args.folder_name, args.folder_id, args.additional_pages, args.quest_meta)
 			case 'update_journal':
-				return await handleUpdateJournal(args.journal_id, args.content, args.page_id, args.new_page_name, args.page_name)
+				return await handleUpdateJournal(args.journal_id, args.content, args.page_id, args.new_page_name, args.page_name, args.match_mode, args.mode, args.heading, args.rename_page_name, args.include_pages)
+			case 'list_journal_pages':
+				return handleListJournalPages(args.journal_id)
 			case 'list_journals_in_folder':
 				return handleListJournalsInFolder(args.folder_id)
 			case 'list_folders':
@@ -2384,13 +2425,104 @@ async function handleSearchActors(query: string, maxResults?: number): Promise<s
 
 const GET_JOURNAL_DEFAULT_MAX_LENGTH = 20000
 
-function handleGetJournal(journalId: string, maxLength?: number, offset?: number): string {
-	console.log(`FoundryAI | get_journal: id/name="${journalId}"`)
-	// Try by ID first, then fall back to exact name match
+type JournalUpdateMode = 'replace_page' | 'append_page' | 'prepend_page' | 'replace_section_by_heading'
+
+function resolveJournalEntry(journalId: string): JournalEntry | undefined {
 	let entry = game.journal?.get(journalId)
 	if (!entry) {
 		entry = game.journal?.find((j: any) => j.name?.toLowerCase() === journalId.toLowerCase())
 	}
+	return entry
+}
+
+function getPageTextContent(page: JournalEntryPage): string {
+	return page.type === 'text' ? page.text?.content || '' : ''
+}
+
+function serializeJournalPage(page: JournalEntryPage) {
+	return {
+		id: page.id,
+		name: page.name,
+		type: page.type,
+		sort: page.sort ?? 0,
+		content: getPageTextContent(page),
+		content_length: getPageTextContent(page).length,
+	}
+}
+
+function listJournalPages(entry: JournalEntry) {
+	return Array.from(entry.pages?.values() || []).map((page) => serializeJournalPage(page))
+}
+
+function findJournalPageByExactName(entry: JournalEntry, pageName: string): JournalEntryPage | null {
+	const matches = Array.from(entry.pages?.values() || []).filter((page) => page.name === pageName)
+	if (matches.length === 0) return null
+	if (matches.length > 1) {
+		throw new Error(`Multiple pages named "${pageName}" found; use page_id instead.`)
+	}
+	return matches[0]
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function normalizeHeadingText(value: string): string {
+	return value.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function replaceSectionByHeading(existingContent: string, heading: string | undefined, replacementContent: string): string | null {
+	if (!heading?.trim()) {
+		throw new Error('heading is required when mode is replace_section_by_heading')
+	}
+
+	const headingRegex = /<h([1-6])\b[^>]*>[\s\S]*?<\/h\1>/gi
+	let match: RegExpExecArray | null
+	while ((match = headingRegex.exec(existingContent)) !== null) {
+		if (normalizeHeadingText(match[0]) !== normalizeHeadingText(heading)) continue
+
+		const level = Number(match[1])
+		const rest = existingContent.slice(match.index + match[0].length)
+		const nextHeading = new RegExp(`<h([1-${level}])\\b[^>]*>[\\s\\S]*?<\\/h\\1>`, 'i').exec(rest)
+		const sectionEnd = nextHeading ? match.index + match[0].length + nextHeading.index : existingContent.length
+		return `${existingContent.slice(0, match.index)}${replacementContent}${existingContent.slice(sectionEnd)}`
+	}
+
+	const markdownHeading = new RegExp(`(^|\\n)(#{1,6})\\s+${escapeRegExp(heading.trim())}\\s*(\\n|$)`, 'i')
+	const markdownMatch = markdownHeading.exec(existingContent)
+	if (!markdownMatch?.index && markdownMatch?.index !== 0) return null
+
+	const sectionStart = markdownMatch.index + markdownMatch[1].length
+	const level = markdownMatch[2].length
+	const restStart = sectionStart + markdownMatch[0].length - markdownMatch[1].length
+	const rest = existingContent.slice(restStart)
+	const nextHeading = new RegExp(`\\n#{1,${level}}\\s+`, 'i').exec(rest)
+	const sectionEnd = nextHeading ? restStart + nextHeading.index : existingContent.length
+	return `${existingContent.slice(0, sectionStart)}${replacementContent}${existingContent.slice(sectionEnd)}`
+}
+
+function buildUpdateJournalResponse(
+	entry: JournalEntry,
+	page: JournalEntryPage | undefined,
+	pageName: string,
+	mode: JournalUpdateMode,
+	message: string,
+	includePages?: boolean,
+) {
+	return {
+		success: true,
+		journal_id: entry.id,
+		page_id: page?.id || '',
+		page_name: pageName,
+		mode,
+		message,
+		...(includePages ? { pages: listJournalPages(entry) } : {}),
+	}
+}
+
+function handleGetJournal(journalId: string, maxLength?: number, offset?: number): string {
+	console.log(`FoundryAI | get_journal: id/name="${journalId}"`)
+	const entry = resolveJournalEntry(journalId)
 	if (!entry) {
 		console.log(`FoundryAI | get_journal: not found in game.journal`)
 		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
@@ -2404,16 +2536,17 @@ function handleGetJournal(journalId: string, maxLength?: number, offset?: number
 		return journalFolderDeniedError(entry)
 	}
 
-	const fullContent = collectionReader.getJournalContent(journalId) || ''
+	const fullContent = collectionReader.getJournalContent(entry.id) || ''
 	const start = Math.max(0, offset || 0)
 	const limit = maxLength && maxLength > 0 ? maxLength : GET_JOURNAL_DEFAULT_MAX_LENGTH
 	const content = fullContent.slice(start, start + limit)
 	const truncated = start + limit < fullContent.length
 
 	return JSON.stringify({
-		id: journalId,
+		id: entry.id,
 		name: entry?.name || 'Unknown',
 		folder: entry?.folder?.name || 'Root',
+		pages: listJournalPages(entry),
 		content,
 		total_length: fullContent.length,
 		truncated,
@@ -2598,6 +2731,7 @@ async function handleCreateJournal(
 		name: journal.name,
 		folder: folderName || 'Root',
 		pageCount,
+		pages: listJournalPages(journal),
 		message: `Created journal entry "${name}" in folder "${folderName || 'Root'}" with ${pageCount} page(s)`,
 	})
 }
@@ -2608,12 +2742,17 @@ async function handleUpdateJournal(
 	pageId?: string,
 	newPageName?: string,
 	pageName?: string,
+	matchMode?: string,
+	mode?: JournalUpdateMode,
+	heading?: string,
+	renamePageName?: string,
+	includePages?: boolean,
 ): Promise<string> {
 	console.log(
-		`FoundryAI | update_journal: journalId="${journalId}", pageId="${pageId}", newPageName="${newPageName}", content length=${content?.length}`,
+		`FoundryAI | update_journal: journalId="${journalId}", pageId="${pageId}", pageName="${pageName}", newPageName="${newPageName}", mode="${mode}", content length=${content?.length}`,
 	)
 
-	const entry = game.journal?.get(journalId)
+	const entry = resolveJournalEntry(journalId)
 	if (!entry) {
 		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
 	}
@@ -2628,49 +2767,90 @@ async function handleUpdateJournal(
 		])
 		const newPage = created?.[0]
 		embeddingService.queueReindex(journalId, 'journal')
-		return JSON.stringify({
-			success: true,
-			id: journalId,
-			pageId: newPage?.id || '',
-			pageName: newPageName,
-			message: `Added new page "${newPageName}" to "${entry.name}"`,
-		})
+		return JSON.stringify(buildUpdateJournalResponse(entry, newPage, newPageName, 'replace_page', `Added new page "${newPageName}" to "${entry.name}"`, includePages))
 	}
 
-	// Mode 2: Update a specific page by ID
+	let targetPage: JournalEntryPage | null = null
+	let legacyRenamePageName: string | undefined
+
 	if (pageId) {
-		const page = entry.pages?.get(pageId)
-		if (!page) {
+		targetPage = entry.pages?.get(pageId) || null
+		if (!targetPage) {
 			return JSON.stringify({ error: `Page not found: ${pageId}` })
 		}
-		const updateData: Record<string, any> = { 'text.content': content }
-		if (pageName) updateData.name = pageName
-		await page.update(updateData)
-		embeddingService.queueReindex(journalId, 'journal')
-		return JSON.stringify({
-			success: true,
-			id: journalId,
-			pageId: page.id,
-			pageName: page.name,
-			message: `Updated page "${page.name}" in "${entry.name}"`,
-		})
+		legacyRenamePageName = pageName
+	} else if (pageName) {
+		if (matchMode && matchMode !== 'exact') {
+			return JSON.stringify({ error: `Unsupported match_mode: ${matchMode}. Only "exact" is supported.` })
+		}
+		try {
+			targetPage = findJournalPageByExactName(entry, pageName)
+		} catch (error) {
+			return JSON.stringify({ error: error instanceof Error ? error.message : String(error) })
+		}
+		if (!targetPage) {
+			return JSON.stringify({ error: `Page not found by exact name: ${pageName}` })
+		}
+	} else {
+		targetPage = entry.pages?.find((p: any) => p.type === 'text') || entry.pages.contents?.[0] || null
 	}
 
-	// Mode 3: Update first text page (backward-compatible default)
-	const firstPage = entry.pages?.find((p: any) => p.type === 'text') || entry.pages.contents?.[0]
-	if (!firstPage) {
+	if (!targetPage) {
 		return JSON.stringify({ error: 'Journal has no pages to update' })
 	}
-	const updateData: Record<string, any> = { 'text.content': content }
-	if (pageName) updateData.name = pageName
-	await firstPage.update(updateData)
-	embeddingService.queueReindex(journalId, 'journal')
+
+	const updateMode = mode || 'replace_page'
+	const existingContent = getPageTextContent(targetPage)
+	let nextContent = content
+	if (updateMode === 'append_page') {
+		nextContent = `${existingContent}${existingContent ? '\n' : ''}${content}`
+	} else if (updateMode === 'prepend_page') {
+		nextContent = `${content}${content ? '\n' : ''}${existingContent}`
+	} else if (updateMode === 'replace_section_by_heading') {
+		try {
+			const replaced = replaceSectionByHeading(existingContent, heading, content)
+			if (replaced === null) return JSON.stringify({ error: `Heading not found: ${heading}` })
+			nextContent = replaced
+		} catch (error) {
+			return JSON.stringify({ error: error instanceof Error ? error.message : String(error) })
+		}
+	} else if (updateMode !== 'replace_page') {
+		return JSON.stringify({ error: `Unsupported update mode: ${updateMode}` })
+	}
+
+	const updateData: Record<string, any> = { 'text.content': nextContent }
+	const nextPageName = renamePageName || legacyRenamePageName
+	if (nextPageName) updateData.name = nextPageName
+	await targetPage.update(updateData)
+	embeddingService.queueReindex(entry.id, 'journal')
+	return JSON.stringify(
+		buildUpdateJournalResponse(
+			entry,
+			targetPage,
+			nextPageName || targetPage.name,
+			updateMode,
+			`Updated page "${nextPageName || targetPage.name}" in "${entry.name}"`,
+			includePages,
+		),
+	)
+}
+
+function handleListJournalPages(journalId: string): string {
+	console.log(`FoundryAI | list_journal_pages: id/name="${journalId}"`)
+	const entry = resolveJournalEntry(journalId)
+	if (!entry) {
+		return JSON.stringify({ error: `Journal entry not found: ${journalId}` })
+	}
+	if (!isJournalFolderAllowed(entry.folder?.id)) {
+		return journalFolderDeniedError(entry)
+	}
+
 	return JSON.stringify({
-		success: true,
-		id: journalId,
-		pageId: firstPage.id,
-		pageName: firstPage.name,
-		message: `Updated journal entry "${entry.name}"`,
+		id: entry.id,
+		name: entry.name,
+		folder: entry.folder?.name || 'Root',
+		pages: listJournalPages(entry),
+		count: entry.pages?.size || 0,
 	})
 }
 
@@ -2685,10 +2865,10 @@ function handleListJournalsInFolder(folderId: string): string {
 		return JSON.stringify({ error: `Folder not accessible: ${folderId}` })
 	}
 
-	const entries: Array<{ id: string; name: string }> = []
+	const entries: Array<{ id: string; name: string; pages: ReturnType<typeof listJournalPages> }> = []
 	for (const entry of game.journal.values()) {
 		if (entry.folder?.id === folderId) {
-			entries.push({ id: entry.id, name: entry.name })
+			entries.push({ id: entry.id, name: entry.name, pages: listJournalPages(entry) })
 		}
 	}
 
