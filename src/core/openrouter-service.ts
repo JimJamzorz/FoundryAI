@@ -153,6 +153,15 @@ export type StreamCallback = (chunk: {
 
 const DEFAULT_PROVIDER: ProviderConfig = { baseUrl: OPENROUTER_BASE, apiKey: '' }
 
+/**
+ * Shown when a provider rejects the request because its prompt template can't
+ * render tool definitions (common with local models — e.g. Gemma has no
+ * tool-calling template and LM Studio's Jinja render fails). We retry once
+ * without tools and prepend this so the user knows why the AI has no hands.
+ */
+const TOOLS_UNSUPPORTED_NOTICE =
+	"> ⚠️ *The summoned spirit peers into your enchanted toolbox and shrugs — this model does not understand FoundryAI's tools, so it answers with words alone. Bind a tool-trained model (Qwen, Llama, or Mistral Instruct serve well) to give it hands.*\n\n"
+
 export class OpenRouterService {
 	private chat: ProviderConfig = DEFAULT_PROVIDER
 	private embedding: ProviderConfig = DEFAULT_PROVIDER
@@ -263,6 +272,23 @@ export class OpenRouterService {
 		return null
 	}
 
+	/** Extract a human-readable message from a failed response, tolerating the
+	 *  different error shapes providers use ({message}, {error:{message}}, {error:"..."}). */
+	private async readErrorMessage(response: Response): Promise<string> {
+		const error = await response.json().catch(() => ({ message: response.statusText }))
+		return String(error?.message || error?.error?.message || error?.error || 'Unknown error')
+	}
+
+	/**
+	 * Does this failure look like "the provider's prompt template can't render
+	 * tools"? LM Studio surfaces Jinja render failures as HTTP 400 with wording
+	 * like "Error rendering prompt with jinja template" — models without a
+	 * tool-calling template (Gemma etc.) hit this whenever tools are attached.
+	 */
+	private isToolTemplateError(status: number, message: string): boolean {
+		return status === 400 && /jinja|prompt template|template|tool/i.test(message)
+	}
+
 	async chatCompletion(request: ChatCompletionRequest, signal?: AbortSignal): Promise<ChatCompletionResponse> {
 		if (!this.isConfigured) throw new Error('No API provider configured')
 
@@ -276,21 +302,52 @@ export class OpenRouterService {
 			`FoundryAI | API chatCompletion — model: ${body.model}, messages: ${body.messages.length}, tools: ${body.tools?.length || 0}`,
 		)
 
-		const response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
+		let response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
 			method: 'POST',
 			headers: this.headersFor(this.chat),
 			body: JSON.stringify(body),
 			signal,
 		})
 
+		let toolsFallback = false
 		if (!response.ok) {
-			const error = await response.json().catch(() => ({ message: response.statusText }))
-			console.error(`FoundryAI | API error (${response.status}):`, error)
-			throw new Error(`API error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`)
+			const errMsg = await this.readErrorMessage(response)
+			if (body.tools?.length && this.isToolTemplateError(response.status, errMsg)) {
+				console.warn(`FoundryAI | Provider rejected tools (no tool template?): "${errMsg}" — retrying without tools`)
+				const { tools: _tools, tool_choice: _toolChoice, ...bareBody } = body
+				response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
+					method: 'POST',
+					headers: this.headersFor(this.chat),
+					body: JSON.stringify(bareBody),
+					signal,
+				})
+				if (!response.ok) {
+					const retryMsg = await this.readErrorMessage(response)
+					console.error(`FoundryAI | API error after tools-free retry (${response.status}):`, retryMsg)
+					throw new Error(`API error (${response.status}): ${retryMsg}`)
+				}
+				toolsFallback = true
+				ui.notifications?.warn("FoundryAI: this model doesn't support tool calling — replied without tools.")
+			} else {
+				console.error(`FoundryAI | API error (${response.status}):`, errMsg)
+				throw new Error(`API error (${response.status}): ${errMsg}`)
+			}
 		}
 
 		const result = await response.json()
 		const message = result.choices?.[0]?.message
+
+		if (toolsFallback && message) {
+			// Tools were never offered on the retry, so skip tool-call recovery and
+			// tell the user (in-fiction) why the AI answered without acting.
+			message.content = TOOLS_UNSUPPORTED_NOTICE + (message.content || '')
+			console.log('FoundryAI | API chatCompletion response (tools-free fallback):', {
+				model: result.model,
+				finishReason: result.choices?.[0]?.finish_reason,
+				usage: result.usage,
+			})
+			return result
+		}
 
 		// Recover tool calls the server failed to structure before we ever log/return —
 		// otherwise this looks identical to the model just giving up with an empty answer.
@@ -335,7 +392,7 @@ export class OpenRouterService {
 			`FoundryAI | API stream — model: ${body.model}, messages: ${body.messages.length}, tools: ${body.tools?.length || 0}`,
 		)
 
-		const response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
+		let response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
 			method: 'POST',
 			headers: this.headersFor(this.chat),
 			body: JSON.stringify(body),
@@ -343,9 +400,29 @@ export class OpenRouterService {
 		})
 
 		if (!response.ok) {
-			const error = await response.json().catch(() => ({ message: response.statusText }))
-			console.error(`FoundryAI | Stream API error (${response.status}):`, error)
-			throw new Error(`API error (${response.status}): ${error.message || error.error?.message || 'Unknown error'}`)
+			const errMsg = await this.readErrorMessage(response)
+			if (body.tools?.length && this.isToolTemplateError(response.status, errMsg)) {
+				console.warn(`FoundryAI | Provider rejected tools on stream (no tool template?): "${errMsg}" — retrying without tools`)
+				const { tools: _tools, tool_choice: _toolChoice, ...bareBody } = body
+				response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
+					method: 'POST',
+					headers: this.headersFor(this.chat),
+					body: JSON.stringify(bareBody),
+					signal,
+				})
+				if (!response.ok) {
+					const retryMsg = await this.readErrorMessage(response)
+					console.error(`FoundryAI | Stream API error after tools-free retry (${response.status}):`, retryMsg)
+					throw new Error(`API error (${response.status}): ${retryMsg}`)
+				}
+				ui.notifications?.warn("FoundryAI: this model doesn't support tool calling — replying without tools.")
+				// Lead the stream with the in-fiction notice so the user sees why
+				// the AI is answering without acting on the world.
+				onChunk({ content: TOOLS_UNSUPPORTED_NOTICE, done: false })
+			} else {
+				console.error(`FoundryAI | Stream API error (${response.status}):`, errMsg)
+				throw new Error(`API error (${response.status}): ${errMsg}`)
+			}
 		}
 
 		if (!response.body) throw new Error('No response body for streaming request')

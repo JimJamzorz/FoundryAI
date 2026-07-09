@@ -12,9 +12,10 @@ import { ensureFoundryAIFolders } from '@core/folder-manager'
 import { registerCampaignHooks } from '@core/campaign-hooks'
 import { registerSessionEventHooks } from '@core/session-event-hooks'
 import { sessionEventBuffer } from '@core/session-event-buffer'
-import { openPopoutChat } from '@ui/svelte-application'
+import { openPopoutChat, openToolRunnerDialog } from '@ui/svelte-application'
 import { buildSystemPrompt } from '@core/system-prompt'
 import ChatWindow from '@ui/components/ChatWindow.svelte'
+import ToolRunner from '@ui/components/ToolRunner.svelte'
 
 // Import styles so Vite bundles them
 import './styles/foundry-ai.scss'
@@ -233,6 +234,21 @@ function registerSceneControlButton() {
 				onChange: (_event: Event, _active: boolean) => {
 					openPopoutChat(ChatWindow)
 				},
+			}
+
+			// GM-only debug console: run any FoundryAI tool by hand through the
+			// same executeTool path the LLM uses.
+			if (game.user?.isGM) {
+				tokenGroup.tools[`${MODULE_ID}-tool-console`] = {
+					name: `${MODULE_ID}-tool-console`,
+					title: 'FoundryAI Tool Console',
+					icon: 'fas fa-terminal',
+					button: true,
+					order: 101,
+					onChange: (_event: Event, _active: boolean) => {
+						openToolRunnerDialog(ToolRunner)
+					},
+				}
 			}
 		}
 	})

@@ -5349,7 +5349,7 @@ async function runPdfExtractionJob(job: PdfExtractionJob): Promise<string> {
 		const pdf = await loadPdfDocument(args.pdf_path)
 		const numPages: number = pdf.numPages
 		const minSize: number = args.min_size ?? 300
-		const imageResolveTimeoutMs = 10_000
+		const imageResolveTimeoutMs = 30_000
 		const fallback = args.fallback === 'none' ? 'none' : 'render_page_when_empty'
 		const includeDecorative = args.include_decorative === true
 

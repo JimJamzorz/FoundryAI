@@ -316,6 +316,39 @@ export function openToolSelectionDialog(component: Component<any>, props: Record
 	return app
 }
 
+/**
+ * Create and render the GM tool console (manually run any FoundryAI tool).
+ */
+let toolRunnerInstance: SvelteApplication | null = null
+
+export function openToolRunnerDialog(component: Component<any>, props: Record<string, any> = {}): SvelteApplication {
+	if (toolRunnerInstance?.rendered) {
+		toolRunnerInstance.bringToFront()
+		return toolRunnerInstance
+	}
+
+	toolRunnerInstance = new SvelteApplication(component, props, {
+		id: 'foundry-ai-tool-runner',
+		window: {
+			frame: true,
+			positioned: true,
+			title: 'FoundryAI Tool Console',
+			icon: 'fas fa-terminal',
+			minimizable: true,
+			resizable: true,
+			contentTag: 'section',
+			contentClasses: ['foundry-ai-content'],
+		},
+		position: {
+			width: 900,
+			height: 720,
+		},
+	})
+
+	toolRunnerInstance.render(true)
+	return toolRunnerInstance
+}
+
 /** Close the popout chat if open */
 export function closePopoutChat(): void {
 	if (popoutInstance?.rendered) {

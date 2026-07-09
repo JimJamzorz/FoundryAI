@@ -682,6 +682,10 @@ declare module '*.svelte' {
 	export default component
 }
 
+// ---- CSS/SCSS Module Declarations ----
+declare module '*.scss'
+declare module '*.css'
+
 // ---- Micromark ----
 declare module 'micromark' {
 	export function micromark(value: string, options?: any): string
