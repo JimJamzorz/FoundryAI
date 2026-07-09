@@ -9,6 +9,7 @@ import { openRouterService } from './openrouter-service'
 import type { ToolDefinition, ToolCall } from './openrouter-service'
 import { getRootFolderId, getSubfolderId } from './folder-manager'
 import { generateCampaignDashboardHTML } from './campaign-management'
+import { comfyTemplateNames } from './comfy-workflows'
 
 // ---- Folder Permission Helpers ----
 // These check whether a document's folder is in the user's allowed list.
@@ -601,6 +602,11 @@ const SCENE_TOOLS: ToolDefinition[] = [
 					name: { type: 'string', description: 'New name for the scene' },
 					image_path: { type: 'string', description: 'Path to an already-generated image to use as the new background' },
 					prompt: { type: 'string', description: 'Generate a new background image from this description and apply it to the scene' },
+					workflow: {
+						type: 'string',
+						enum: comfyTemplateNames(),
+						description: 'ComfyUI workflow for background generation via prompt. Default: txt2img-map (battle-map tuned).',
+					},
 					size: {
 						type: 'string',
 						enum: ['1024x1024', '1792x1024', '1024x1792'],
@@ -1721,7 +1727,7 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'generate_image',
 			description:
-				'Generate an image from a text prompt using AI image generation and save it to Foundry storage. Returns the saved image "path" (e.g. "foundry-ai/images/red-dragon-1234.png") — use that exact path with update_actor (portrait/token art), update_item, update_scene, or generate_scene\'s image_path. Use for token art, item art, portraits, etc. For new battle-map scenes, prefer generate_scene, which generates the image itself.',
+				`Generate an image from a text prompt via the configured ComfyUI instance and save it to Foundry storage. Returns the saved image "path" (e.g. "foundry-ai/images/red-dragon-1234.png") — use that exact path with update_actor (portrait/token art), update_item, update_scene, or generate_scene's image_path. Use for token art, item art, portraits, etc. For new battle-map scenes, prefer generate_scene, which generates the image itself. Available workflows: ${comfyTemplateNames().join(', ') || '(none bundled)'}.`,
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1729,6 +1735,27 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 						type: 'string',
 						description:
 							'Detailed description of the image to generate. Be specific about style, lighting, perspective, and content.',
+					},
+					workflow: {
+						type: 'string',
+						enum: comfyTemplateNames(),
+						description:
+							'Which ComfyUI workflow to generate with. txt2img-flux = detailed general art (portraits, items, handouts); txt2img-lightning = fast drafts; txt2img-map = top-down battle maps; img2img-restyle / img2img-flux = generate FROM a reference_image. Default: txt2img-flux, or img2img-restyle when reference_image is set.',
+					},
+					reference_image: {
+						type: 'string',
+						description:
+							'Optional Foundry asset path (exactly as returned by list_assets or extract_pdf_images) to use as the img2img reference — keeps the output visually consistent with existing art, or makes variations of it. Requires an img2img workflow (auto-selected if workflow is omitted); output dimensions follow the reference image, not size. Do NOT guess paths.',
+					},
+					denoise: {
+						type: 'number',
+						description:
+							'With reference_image: how far to depart from it, 0–1. 0.3 = subtle variation, 0.55 = same composition with new details (default), 0.75 = loose inspiration.',
+					},
+					quality: {
+						type: 'string',
+						enum: ['low', 'medium', 'high'],
+						description: 'Generation quality (diffusion steps). Default: medium.',
 					},
 					size: {
 						type: 'string',
@@ -1759,6 +1786,11 @@ const IMAGE_TOOLS: ToolDefinition[] = [
 					image_path: {
 						type: 'string',
 						description: 'Path to an already-generated image (e.g. from a prior generate_image call). When provided, skips image generation and uses this image as the scene background.',
+					},
+					workflow: {
+						type: 'string',
+						enum: comfyTemplateNames(),
+						description: 'ComfyUI workflow for background generation. Default: txt2img-map (battle-map tuned).',
 					},
 					grid_distance: {
 						type: 'number',
@@ -2182,7 +2214,7 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			case 'read_asset':
 				return await handleReadAsset(args.path)
 			case 'generate_image':
-				return await handleGenerateImage(args.prompt, args.size)
+				return await handleGenerateImage(args)
 			case 'generate_scene':
 				return await handleGenerateScene(args)
 
@@ -2972,9 +3004,16 @@ async function handleUpdateScene(args: Record<string, any>): Promise<string> {
 			newBackground = args.image_path
 		} else if (args.prompt) {
 			const size = args.size || '1792x1024'
-			const imageModel = getSetting('imageModel') || 'openai/dall-e-3'
-			const mapPrompt = `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
-			const result = await openRouterService.generateImage(mapPrompt, imageModel, size)
+			// ComfyUI path: the txt2img-map template carries the battlemap trigger,
+			// so send the raw prompt. Enhanced prompt only for the OpenRouter fallback.
+			const mapPrompt = openRouterService.hasComfy
+				? args.prompt
+				: `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
+			const result = await openRouterService.generateImage(mapPrompt, {
+				size,
+				template: args.workflow || 'txt2img-map',
+				quality: 'medium',
+			})
 
 			const FP: typeof FilePicker = (foundry as any)?.applications?.apps?.FilePicker?.implementation ?? FilePicker
 			const filename = `map-${promptToSlug(args.prompt ?? scene.name)}-${Date.now()}.png`
@@ -5686,12 +5725,25 @@ async function handleReadAsset(assetPath: string): Promise<string> {
 	}
 }
 
-async function handleGenerateImage(prompt: string, size?: string): Promise<string> {
-	console.log(`FoundryAI | generate_image: prompt="${prompt.slice(0, 100)}..."`)
+async function handleGenerateImage(args: Record<string, any>): Promise<string> {
+	const prompt: string = args.prompt
+	console.log(`FoundryAI | generate_image: prompt="${prompt?.slice(0, 100)}...", workflow="${args.workflow || '(default)'}", reference="${args.reference_image || '(none)'}"`)
 
 	try {
-		const imageModel = getSetting('imageModel') || 'openai/dall-e-3'
-		const result = await openRouterService.generateImage(prompt, imageModel, size || '1024x1024')
+		if (args.denoise !== undefined) {
+			const denoise = Number(args.denoise)
+			if (Number.isNaN(denoise) || denoise <= 0 || denoise > 1) {
+				return JSON.stringify({ error: 'denoise must be a number between 0 (exclusive) and 1' })
+			}
+		}
+
+		const result = await openRouterService.generateImage(prompt, {
+			size: args.size || '1024x1024',
+			template: args.workflow,
+			quality: (args.quality as 'low' | 'medium' | 'high') || 'medium',
+			referenceImage: args.reference_image,
+			denoise: args.denoise !== undefined ? Number(args.denoise) : undefined,
+		})
 
 		if (result.url) {
 			// Try to download and save the image to Foundry's storage
@@ -5771,14 +5823,20 @@ async function handleGenerateScene(args: Record<string, any>): Promise<string> {
 		} else if (args.image_path) {
 			imagePath = args.image_path
 		} else if (args.prompt) {
-			// Generate the map image
-			const imageModel = getSetting('imageModel') || 'openai/dall-e-3'
-
-			const mapPrompt = `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
+			// Generate the map image. On the ComfyUI path the txt2img-map template
+			// carries the battlemap trigger/negative itself, so pass the raw prompt;
+			// the enhanced prompt is only for the OpenRouter fallback.
+			const mapPrompt = openRouterService.hasComfy
+				? args.prompt
+				: `Top-down fantasy battle map, grid-friendly, high detail: ${args.prompt}. Style: digital illustration suitable for a tabletop RPG virtual tabletop. No text or labels.`
 
 			let result: { url?: string; b64_json?: string }
 			try {
-				result = await openRouterService.generateImage(mapPrompt, imageModel, mapSize)
+				result = await openRouterService.generateImage(mapPrompt, {
+					size: mapSize,
+					template: args.workflow || 'txt2img-map',
+					quality: 'medium',
+				})
 			} catch (genError: any) {
 				const assetsJson = JSON.parse(await handleListAssets())
 				return JSON.stringify({

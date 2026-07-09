@@ -8,6 +8,28 @@
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
+import { buildComfyPrompt, comfyTemplateNames } from './comfy-workflows'
+
+/** Workflow used when generate_image is called without one. Falls back to the
+ *  first bundled template if the preferred default isn't present. */
+const DEFAULT_COMFY_TEMPLATE = comfyTemplateNames().includes('txt2img-flux')
+	? 'txt2img-flux'
+	: comfyTemplateNames()[0] || 'txt2img-flux'
+
+export interface GenerateImageOptions {
+	/** "WxH", e.g. "1024x1024" */
+	size?: string
+	/** Workflow template name (see comfyTemplateNames()). ComfyUI path only. */
+	template?: string
+	/** Maps to steps via the template's quality_steps (or 8/20/35). ComfyUI path only. */
+	quality?: 'low' | 'medium' | 'high'
+	seed?: number
+	/** Foundry asset path used as the img2img reference (uploaded to ComfyUI). Requires an img2img workflow. */
+	referenceImage?: string
+	/** img2img departure from the reference, 0–1. Only meaningful with referenceImage. */
+	denoise?: number
+}
+
 
 
 // ---- Types ----
@@ -169,10 +191,8 @@ export class OpenRouterService {
 	private vision: ProviderConfig = DEFAULT_PROVIDER
 	private tts: ProviderConfig = DEFAULT_PROVIDER
 	private comfyUrl: string = ''
-	private customWorkflow: Record<string, any> | null = null
 	private defaultModel: string = ''
 	private embeddingModel: string = ''
-	private imageModel: string = ''
 	private visionModel: string = ''
 	private ttsModel: string = ''
 
@@ -183,10 +203,8 @@ export class OpenRouterService {
 		vision?: ProviderConfig
 		tts?: ProviderConfig
 		comfyUrl?: string
-		comfyWorkflow?: string
 		defaultModel?: string
 		embeddingModel?: string
-		imageModel?: string
 		visionModel?: string
 		ttsModel?: string
 	}): void {
@@ -195,20 +213,15 @@ export class OpenRouterService {
 		if (options.image !== undefined) this.image = this.resolve(options.image)
 		if (options.vision !== undefined) this.vision = this.resolve(options.vision)
 		if (options.tts !== undefined) this.tts = this.resolve(options.tts)
-		if (options.comfyUrl !== undefined) this.comfyUrl = options.comfyUrl.trim()
-		if (options.comfyWorkflow !== undefined) {
-			if (!options.comfyWorkflow) {
-				this.customWorkflow = null
-			} else {
-				try { this.customWorkflow = JSON.parse(options.comfyWorkflow) }
-				catch { console.warn('FoundryAI | Invalid comfyWorkflow JSON — workflow not updated') }
-			}
-		}
+		if (options.comfyUrl !== undefined) this.comfyUrl = options.comfyUrl.trim().replace(/\/+$/, '')
 		if (options.defaultModel) this.defaultModel = options.defaultModel
 		if (options.embeddingModel) this.embeddingModel = options.embeddingModel
-		if (options.imageModel) this.imageModel = options.imageModel
 		if (options.visionModel !== undefined) this.visionModel = options.visionModel
 		if (options.ttsModel) this.ttsModel = options.ttsModel
+	}
+
+	get hasComfy(): boolean {
+		return !!this.comfyUrl
 	}
 
 	private resolve(p: ProviderConfig): ProviderConfig {
@@ -522,44 +535,60 @@ export class OpenRouterService {
 
 	// ---- ComfyUI Image Generation ----
 
-	private async generateImageComfy(prompt: string, size?: string): Promise<{ url?: string; b64_json?: string }> {
-		if (!this.customWorkflow) throw new Error('No ComfyUI workflow configured — open Settings and use "Edit Workflow" to paste your workflow JSON.')
-		const workflow = JSON.parse(JSON.stringify(this.customWorkflow))
+	/**
+	 * Fetch a Foundry image asset (same-origin) and push it into ComfyUI's
+	 * input folder so a LoadImage/REFERENCE_IMAGE node can use it. Returns the
+	 * ComfyUI-side stored name.
+	 */
+	private async uploadComfyReference(assetPath: string): Promise<string> {
+		let response = await fetch(assetPath)
+		if (!response.ok) response = await fetch(encodeURI(assetPath))
+		if (!response.ok) {
+			throw new Error(`Could not read reference image "${assetPath}" (HTTP ${response.status}). Use an exact path from list_assets.`)
+		}
+		const blob = await response.blob()
+		const filename = `foundryai-ref-${Date.now()}-${assetPath.split('/').pop() || 'reference.png'}`
 
-		const findNode = (classType: string) => Object.keys(workflow).find(id => workflow[id]?.class_type === classType)
-		const findNodes = (classType: string) => Object.keys(workflow).filter(id => workflow[id]?.class_type === classType)
+		const form = new FormData()
+		form.append('image', blob, filename)
+		form.append('overwrite', 'true')
 
-		// Inject prompt — prefer a PrimitiveStringMultiline (value field), fall back to
-		// any CLIPTextEncode whose text is a plain string (not a node reference array)
-		const primitiveId = findNode('PrimitiveStringMultiline')
-		if (primitiveId) {
-			workflow[primitiveId].inputs.value = prompt
-		} else {
-			for (const id of findNodes('CLIPTextEncode')) {
-				if (typeof workflow[id].inputs.text === 'string') {
-					workflow[id].inputs.text = prompt
-				}
-			}
+		const upload = await fetch(`${this.comfyUrl}/upload/image`, { method: 'POST', body: form })
+		if (!upload.ok) {
+			throw new Error(`ComfyUI reference upload failed (${upload.status}): ${upload.statusText}`)
+		}
+		const data = await upload.json().catch(() => ({}))
+		const storedName = data?.name || filename
+		console.log(`FoundryAI | ComfyUI reference uploaded: "${assetPath}" → "${storedName}"`)
+		return storedName
+	}
+
+	private async generateImageComfy(prompt: string, options: GenerateImageOptions): Promise<{ url?: string; b64_json?: string }> {
+		// With a reference image, default to an img2img workflow instead of txt2img.
+		const templateName = options.template || (options.referenceImage ? 'img2img-restyle' : DEFAULT_COMFY_TEMPLATE)
+		let width: number | undefined
+		let height: number | undefined
+		if (options.size) {
+			const [w, h] = options.size.split('x').map(Number)
+			if (w && h) { width = w; height = h }
 		}
 
-		// Randomise seed
-		const randomNoiseId = findNode('RandomNoise')
-		if (randomNoiseId) workflow[randomNoiseId].inputs.noise_seed = Math.floor(Math.random() * 2 ** 32)
-		const kSamplerId = findNode('KSampler')
-		if (kSamplerId) workflow[kSamplerId].inputs.seed = Math.floor(Math.random() * 2 ** 32)
-
-		// Apply dimensions
-		if (size) {
-			const [w, h] = size.split('x').map(Number)
-			if (w && h) {
-				const latentId = findNode('EmptyLatentImage')
-				if (latentId) { workflow[latentId].inputs.width = w; workflow[latentId].inputs.height = h }
-				const fluxSamplingId = findNode('ModelSamplingFlux')
-				if (fluxSamplingId) { workflow[fluxSamplingId].inputs.width = w; workflow[fluxSamplingId].inputs.height = h }
-			}
+		let referenceName: string | undefined
+		if (options.referenceImage) {
+			referenceName = await this.uploadComfyReference(options.referenceImage)
 		}
 
-		console.log(`FoundryAI | ComfyUI generateImage — prompt: "${prompt.slice(0, 80)}..."`)
+		const workflow = buildComfyPrompt(templateName, {
+			prompt,
+			width,
+			height,
+			quality: options.quality,
+			seed: options.seed,
+			referenceImage: referenceName,
+			denoise: options.denoise,
+		})
+
+		console.log(`FoundryAI | ComfyUI generateImage — workflow: ${templateName}, prompt: "${prompt.slice(0, 80)}..."`)
 
 		const queueRes = await fetch(`${this.comfyUrl}/prompt`, {
 			method: 'POST',
@@ -599,15 +628,18 @@ export class OpenRouterService {
 
 	// ---- Image Generation ----
 
-	async generateImage(prompt: string, model?: string, size?: string): Promise<{ url?: string; b64_json?: string }> {
-		if (this.comfyUrl) return this.generateImageComfy(prompt, size)
+	async generateImage(prompt: string, options: GenerateImageOptions = {}): Promise<{ url?: string; b64_json?: string }> {
+		if (this.comfyUrl) return this.generateImageComfy(prompt, options)
+		if (options.referenceImage) {
+			throw new Error('Reference images (img2img) require a ComfyUI URL — set one in FoundryAI settings.')
+		}
 		if (!this.isConfigured) throw new Error('No API provider configured')
 
 		const body = {
-			model: model || this.imageModel || 'openai/dall-e-3',
+			model: 'openai/dall-e-3',
 			prompt,
 			n: 1,
-			size: size || '1024x1024',
+			size: options.size || '1024x1024',
 		}
 
 		const imageUrl = `${this.image.baseUrl}/images/generations`

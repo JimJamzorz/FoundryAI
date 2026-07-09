@@ -144,10 +144,8 @@ function configureServiceFromSettings() {
 		vision: toConfig(find(getSetting('visionProvider'))),
 		tts: toConfig(find(getSetting('ttsProvider'))),
 		comfyUrl: getSetting('comfyUrl'),
-		comfyWorkflow: getSetting('comfyWorkflow'),
 		defaultModel: getSetting('chatModel'),
 		embeddingModel: getSetting('embeddingModel'),
-		imageModel: getSetting('imageModel'),
 		visionModel: getSetting('visionModel'),
 		ttsModel: getSetting('ttsModel'),
 	})

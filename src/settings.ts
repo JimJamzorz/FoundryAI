@@ -32,10 +32,8 @@ export interface FoundryAISettings {
 	visionProvider: string
 	ttsProvider: string
 	comfyUrl: string
-	comfyWorkflow: string
 	chatModel: string
 	embeddingModel: string
-	imageModel: string
 	visionModel: string
 	ttsModel: string
 	journalFolders: string[]
@@ -138,14 +136,8 @@ export function registerSettings(): void {
 
 	game.settings.register(MODULE_ID, 'comfyUrl', {
 		name: 'ComfyUI URL',
-		hint: 'Base URL of your ComfyUI instance. When set, image generation uses ComfyUI instead of the image provider.',
+		hint: 'Base URL of your ComfyUI instance (e.g. http://localhost:8188). When set, image generation runs on ComfyUI using the bundled workflow templates; the generate_image tool picks the workflow per call.',
 		scope: 'client', config: false, type: String, default: '',
-	})
-
-	game.settings.register(MODULE_ID, 'comfyWorkflow', {
-		name: 'ComfyUI Workflow JSON',
-		hint: 'Custom ComfyUI workflow JSON. Leave empty to use the built-in Flux workflow.',
-		scope: 'world', config: false, type: String, default: '',
 	})
 
 	game.settings.register(MODULE_ID, 'chatModel', {
@@ -169,18 +161,6 @@ export function registerSettings(): void {
 		default: 'openai/text-embedding-3-small',
 		onChange: () => {
 			Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'embeddingModel')
-		},
-	})
-
-	game.settings.register(MODULE_ID, 'imageModel', {
-		name: 'FOUNDRYAI.Settings.ImageModel',
-		hint: 'FOUNDRYAI.Settings.ImageModelHint',
-		scope: 'world',
-		config: false,
-		type: String,
-		default: 'openai/dall-e-3',
-		onChange: () => {
-			Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'imageModel')
 		},
 	})
 

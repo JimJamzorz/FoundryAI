@@ -3,8 +3,7 @@
   import { embeddingService } from '@core/embedding-service';
   import { collectionReader } from '@core/collection-reader';
   import { getSetting, setSetting, type ApiProvider } from '../../settings';
-  import { SvelteApplication } from '../svelte-application';
-  import ComfyWorkflowEditor from './ComfyWorkflowEditor.svelte';
+  import { listComfyTemplates } from '@core/comfy-workflows';
 
   interface Props {
     application?: any;
@@ -47,7 +46,6 @@
   let enableItemTools = $state(true);
   let enableMacroTools = $state(true);
   let enableImageTools = $state(true);
-  let imageModel = $state('openai/dall-e-3');
   let visionModel = $state('');
   let ttsModel = $state('openai/tts-1');
   let systemPromptOverride = $state('');
@@ -60,17 +58,14 @@
 
   let chatModels = $state<ModelInfo[]>([]);
   let embeddingModels = $state<ModelInfo[]>([]);
-  let imageModels = $state<ModelInfo[]>([]);
   let visionModels = $state<ModelInfo[]>([]);
   let ttsModels = $state<ModelInfo[]>([]);
   let chatModelFilter = $state('');
   let embeddingModelFilter = $state('');
-  let imageModelFilter = $state('');
   let visionModelFilter = $state('');
   let ttsModelFilter = $state('');
   let loadingChatModels = $state(false);
   let loadingEmbeddingModels = $state(false);
-  let loadingImageModels = $state(false);
   let loadingVisionModels = $state(false);
   let loadingTtsModels = $state(false);
   let macroFolders = $state<Array<{ id: string; name: string; path: string }>>([]);
@@ -117,7 +112,6 @@
       enableItemTools = getSetting('enableItemTools') ?? true;
       enableMacroTools = getSetting('enableMacroTools') ?? true;
       enableImageTools = getSetting('enableImageTools') ?? true;
-      imageModel = getSetting('imageModel') || 'openai/dall-e-3';
       visionModel = getSetting('visionModel') || '';
       ttsModel = getSetting('ttsModel') || 'openai/tts-1';
       systemPromptOverride = getSetting('systemPromptOverride') || '';
@@ -171,19 +165,19 @@
   // ---- Model Loading (auto on provider change) ----
   const byName = (a: ModelInfo, b: ModelInfo) => (a.name ?? a.id).localeCompare(b.name ?? b.id);
 
-  async function loadModelsForType(type: 'chat' | 'embedding' | 'image' | 'tts', providerId: string) {
+  async function loadModelsForType(type: 'chat' | 'embedding' | 'vision' | 'tts', providerId: string) {
     const provider = providers.find(p => p.id === providerId);
     if (!provider) {
       if (type === 'chat') chatModels = [];
       else if (type === 'embedding') embeddingModels = [];
-      else if (type === 'image') imageModels = [];
+      else if (type === 'vision') visionModels = [];
       else ttsModels = [];
       return;
     }
 
     if (type === 'chat') loadingChatModels = true;
     else if (type === 'embedding') loadingEmbeddingModels = true;
-    else if (type === 'image') loadingImageModels = true;
+    else if (type === 'vision') loadingVisionModels = true;
     else loadingTtsModels = true;
 
     try {
@@ -196,10 +190,6 @@
         embeddingModels = all.filter(m => m.id.includes('embed') || m.architecture?.modality === 'embedding').sort(byName);
         embeddingModelFilter = '';
         if (embeddingModels.length === 0) embeddingModel = '';
-      } else if (type === 'image') {
-        imageModels = all.filter(m => m.architecture?.modality?.includes('image') || m.id.includes('dall-e') || m.id.includes('flux') || m.id.includes('image')).sort(byName);
-        imageModelFilter = '';
-        if (imageModels.length === 0) imageModel = '';
       } else if (type === 'vision') {
         visionModels = all.filter(m => !m.architecture?.modality || m.architecture.modality.includes('text')).sort(byName);
         visionModelFilter = '';
@@ -214,7 +204,7 @@
     } finally {
       if (type === 'chat') loadingChatModels = false;
       else if (type === 'embedding') loadingEmbeddingModels = false;
-      else if (type === 'image') loadingImageModels = false;
+      else if (type === 'vision') loadingVisionModels = false;
       else loadingTtsModels = false;
     }
   }
@@ -252,19 +242,6 @@
     }
   }
 
-  // ---- ComfyUI Workflow Editor ----
-  let comfyEditorApp: SvelteApplication | null = null;
-
-  function openComfyWorkflowEditor() {
-    if (comfyEditorApp?.rendered) { comfyEditorApp.bringToFront(); return; }
-    comfyEditorApp = new SvelteApplication(ComfyWorkflowEditor, {}, {
-      id: 'foundry-ai-comfy-editor',
-      window: { frame: true, positioned: true, title: 'ComfyUI Workflow Editor', icon: 'fas fa-code', minimizable: true, resizable: true, contentTag: 'section', contentClasses: ['foundry-ai-content'] },
-      position: { width: 700, height: 600 },
-    });
-    comfyEditorApp.render(true);
-  }
-
   // ---- Save ----
   async function handleSave() {
     isSaving = true;
@@ -300,7 +277,6 @@
       await setSetting('enableItemTools', enableItemTools);
       await setSetting('enableMacroTools', enableMacroTools);
       await setSetting('enableImageTools', enableImageTools);
-      await setSetting('imageModel', imageModel);
       await setSetting('visionModel', visionModel);
       await setSetting('ttsModel', ttsModel);
       await setSetting('systemPromptOverride', systemPromptOverride);
@@ -320,7 +296,7 @@
         image: toConfig(findProvider(imageProvider)),
         tts: toConfig(findProvider(ttsProvider)),
         comfyUrl,
-        defaultModel: chatModel, embeddingModel, imageModel, visionModel, ttsModel,
+        defaultModel: chatModel, embeddingModel, visionModel, ttsModel,
       });
 
       // Refresh stats display
@@ -500,22 +476,16 @@
         (v) => { embeddingModelFilter = v; }
       )}
 
-      {@render modelProviderSelect(
-        'Image Model', imageModel, imageProvider, loadingImageModels, imageModels, imageModelFilter,
-        'e.g. openai/dall-e-3',
-        (id) => { imageProvider = id; loadModelsForType('image', id); },
-        (v) => { imageModel = v; },
-        (v) => { imageModelFilter = v; }
-      )}
-
       <div class="field comfy-field">
-        <label for="comfy-url">ComfyUI URL <span class="comfy-badge">overrides image provider</span></label>
+        <label for="comfy-url">ComfyUI URL <span class="comfy-badge">image generation</span></label>
         <div class="comfy-url-row">
-          <input id="comfy-url" type="text" bind:value={comfyUrl} placeholder="e.g. http://localhost:8188 — leave blank to use image provider" />
-          <button class="comfy-workflow-btn" onclick={() => openComfyWorkflowEditor()} title="Edit ComfyUI Workflow JSON">
-            <i class="fas fa-code"></i> Edit Workflow
-          </button>
+          <input id="comfy-url" type="text" bind:value={comfyUrl} placeholder="e.g. http://localhost:8188" />
         </div>
+        <p class="comfy-hint">
+          Image generation runs on this ComfyUI instance using the bundled workflows
+          ({listComfyTemplates().map(t => t.name).join(', ') || 'none bundled'}) — the AI picks a workflow per
+          generate_image call. Launch ComfyUI with <code>--enable-cors-header</code> so the browser can reach it.
+        </p>
       </div>
 
       {@render modelProviderSelect(
@@ -1117,6 +1087,16 @@
   }
 
   .comfy-url-row input { flex: 1; }
+
+  .comfy-hint {
+    font-size: 0.78em;
+    opacity: 0.7;
+    margin: 4px 0 0;
+  }
+
+  .comfy-hint code {
+    font-size: 0.95em;
+  }
 
   .comfy-workflow-btn {
     white-space: nowrap;

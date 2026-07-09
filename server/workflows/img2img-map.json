@@ -3,14 +3,14 @@
 		"description": "Image-to-image restyle/variation. Feed a reference image (uploaded via /upload/image) and a prompt; denoise controls how much changes (0.3 = subtle variation, 0.55 = same composition new details, 0.75 = loose inspiration). Uses only core ComfyUI nodes.",
 		"negative_default": "text, watermark, logo, caption, blurry, artifacts, low quality",
 		"defaults": {
-			"model": "waiIllustriousSDXL_v170.safetensors"
+			"model": "dDBattlemapsSDXL10_upscaleV10.safetensors"
 		}
 	},
 	"1": {
 		"_meta": { "title": "MODEL" },
 		"class_type": "CheckpointLoaderSimple",
 		"inputs": {
-			"ckpt_name": "waiIllustriousSDXL_v170.safetensors"
+			"ckpt_name": "dDBattlemapsSDXL10_upscaleV10.safetensors"
 		}
 	},
 	"2": {
