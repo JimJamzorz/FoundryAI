@@ -19,6 +19,7 @@ export const SUBFOLDER_NAMES = {
 	sessions: 'Sessions',
 	actors: 'Actors',
 	pdfs: 'PDFs',
+	players: 'Players',
 } as const
 
 export type SubfolderKey = keyof typeof SUBFOLDER_NAMES

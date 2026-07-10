@@ -22,6 +22,22 @@ export interface ToolPreset {
 	toolNames: string[]
 }
 
+/** A single AI-controlled player character configuration. */
+export interface AIPlayerConfig {
+	id: string
+	name: string
+	/** Foundry Actor ID this AI player controls. */
+	actorId: string
+	/** Cached display name, so the roster still reads sensibly if the actor is deleted. */
+	actorName: string
+	/** API provider ID (references an entry in apiProviders) — lets each player point at a different LLM. */
+	providerId: string
+	model: string
+	/** Optional role/persona prompt. Falls back to the auto-generated actor personality prompt when blank. */
+	systemPromptOverride: string
+	enabled: boolean
+}
+
 export interface FoundryAISettings {
 	mcpBridgeEnabled: boolean
 	mcpServerUrl: string
@@ -71,6 +87,8 @@ export interface FoundryAISettings {
 	captureSessionEvents: boolean
 	sessionEvents: string
 	toolPresets: ToolPreset[]
+	aiPlayers: AIPlayerConfig[]
+	aiPlayerHumanCap: number
 }
 
 export function registerSettings(): void {
@@ -515,6 +533,27 @@ export function registerSettings(): void {
 		config: false,
 		type: String,
 		default: '[]',
+	})
+
+	// ---- AI Players ----
+
+	game.settings.register(MODULE_ID, 'aiPlayers', {
+		name: 'AI Players',
+		hint: 'Configured AI-controlled player characters — linked actor, LLM, and role prompt per character.',
+		scope: 'world',
+		config: false,
+		type: Array,
+		default: [],
+		onChange: () => { Hooks.callAll(`${MODULE_ID}.settingsChanged`, 'aiPlayers') },
+	})
+
+	game.settings.register(MODULE_ID, 'aiPlayerHumanCap', {
+		name: 'AI Player Human-Interaction Cap',
+		hint: 'Max consecutive chat messages from AI players (combined) before they go quiet and wait for a human message to break the streak. Prevents AI players from spiraling into talking only to each other.',
+		scope: 'world',
+		config: false,
+		type: Number,
+		default: 5,
 	})
 
 	// ---- Settings Menu ----

@@ -349,6 +349,39 @@ export function openToolRunnerDialog(component: Component<any>, props: Record<st
 	return toolRunnerInstance
 }
 
+/**
+ * Create and render the AI Player roster manager.
+ */
+let playerManagerInstance: SvelteApplication | null = null
+
+export function openPlayerManagerDialog(component: Component<any>, props: Record<string, any> = {}): SvelteApplication {
+	if (playerManagerInstance?.rendered) {
+		playerManagerInstance.bringToFront()
+		return playerManagerInstance
+	}
+
+	playerManagerInstance = new SvelteApplication(component, props, {
+		id: 'foundry-ai-player-manager',
+		window: {
+			frame: true,
+			positioned: true,
+			title: 'AI Players',
+			icon: 'fas fa-users-cog',
+			minimizable: true,
+			resizable: true,
+			contentTag: 'section',
+			contentClasses: ['foundry-ai-content'],
+		},
+		position: {
+			width: 640,
+			height: 720,
+		},
+	})
+
+	playerManagerInstance.render(true)
+	return playerManagerInstance
+}
+
 /** Close the popout chat if open */
 export function closePopoutChat(): void {
 	if (popoutInstance?.rendered) {

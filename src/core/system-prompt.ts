@@ -51,11 +51,19 @@ export function buildSystemPrompt(): string {
 	return prompt
 }
 
+export interface ActorRoleplayPromptOptions {
+	/** Include the tool-calling procedural rules (search_journals workflow, @UUID citation rules, folder routing, etc). Default true. */
+	includeTools?: boolean
+	/** Include the markdown/@UUID response-formatting rules. Default true. */
+	includeFormatting?: boolean
+}
+
 /**
  * Build a system prompt for an actor roleplay session.
  * The AI will stay in character as the specified actor.
  */
-export function buildActorRoleplayPrompt(actor: ActorRoleplayContext): string {
+export function buildActorRoleplayPrompt(actor: ActorRoleplayContext, options: ActorRoleplayPromptOptions = {}): string {
+	const { includeTools = true, includeFormatting = true } = options
 	console.log(`FoundryAI | Building actor roleplay prompt for: ${actor.actorName} (${actor.actorId})`)
 	const sections: string[] = []
 
@@ -70,12 +78,14 @@ export function buildActorRoleplayPrompt(actor: ActorRoleplayContext): string {
 	}
 
 	// Add tool usage instructions if tools are enabled
-	if (getSetting('enableTools')) {
+	if (includeTools && getSetting('enableTools')) {
 		sections.push(TOOL_INSTRUCTIONS)
 	}
 
 	// Add formatting instructions
-	sections.push(FORMATTING_INSTRUCTIONS)
+	if (includeFormatting) {
+		sections.push(FORMATTING_INSTRUCTIONS)
+	}
 
 	const prompt = sections.join('\n\n')
 	console.log(`FoundryAI | Built actor RP prompt — ${prompt.length} chars, actor: ${actor.actorName}`)

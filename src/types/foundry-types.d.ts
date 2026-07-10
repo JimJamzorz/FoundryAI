@@ -29,6 +29,7 @@ interface Game {
 	packs: Map<string, CompendiumCollection>
 	combat: Combat | null
 	combats: Collection<Combat>
+	messages: Collection<ChatMessage>
 	settings: ClientSettings
 	modules: Map<string, Module>
 	i18n: Localization
@@ -401,6 +402,7 @@ declare namespace ChatMessage {
 		type?: number
 		flags?: Record<string, any>
 	}): Promise<ChatMessage>
+	function getSpeaker(options: { actor?: Actor; alias?: string; token?: any; scene?: any }): Record<string, any>
 }
 
 // ---- Journal Entry Creation ----

@@ -11,11 +11,13 @@ import { sessionRecapManager } from '@core/session-recap-manager'
 import { ensureFoundryAIFolders } from '@core/folder-manager'
 import { registerCampaignHooks } from '@core/campaign-hooks'
 import { registerSessionEventHooks } from '@core/session-event-hooks'
+import { registerAIPlayerHooks } from '@core/ai-player-runtime'
 import { sessionEventBuffer } from '@core/session-event-buffer'
-import { openPopoutChat, openToolRunnerDialog } from '@ui/svelte-application'
+import { openPopoutChat, openToolRunnerDialog, openPlayerManagerDialog } from '@ui/svelte-application'
 import { buildSystemPrompt } from '@core/system-prompt'
 import ChatWindow from '@ui/components/ChatWindow.svelte'
 import ToolRunner from '@ui/components/ToolRunner.svelte'
+import PlayerManager from '@ui/components/PlayerManager.svelte'
 
 // Import styles so Vite bundles them
 import './styles/foundry-ai.scss'
@@ -49,6 +51,9 @@ Hooks.once('ready', async () => {
 	// Load persisted session events and register table event hooks
 	sessionEventBuffer.load()
 	registerSessionEventHooks()
+
+	// AI Players — wakes up configured AI-controlled characters on chat activity
+	registerAIPlayerHooks()
 
 	// Configure OpenRouter service from saved providers
 	configureServiceFromSettings()
@@ -245,6 +250,18 @@ function registerSceneControlButton() {
 					order: 101,
 					onChange: (_event: Event, _active: boolean) => {
 						openToolRunnerDialog(ToolRunner)
+					},
+				}
+
+				// AI Players roster — configure per-character AI-controlled players.
+				tokenGroup.tools[`${MODULE_ID}-players`] = {
+					name: `${MODULE_ID}-players`,
+					title: 'AI Players',
+					icon: 'fas fa-users-cog',
+					button: true,
+					order: 102,
+					onChange: (_event: Event, _active: boolean) => {
+						openPlayerManagerDialog(PlayerManager)
 					},
 				}
 			}

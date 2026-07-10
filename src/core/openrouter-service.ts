@@ -72,6 +72,13 @@ export interface ChatCompletionRequest {
 	top_p?: number
 	frequency_penalty?: number
 	presence_penalty?: number
+	/**
+	 * One-off provider override — used when a caller needs a specific provider/apiKey
+	 * for this single call (e.g. a per-AI-player provider) without touching the shared
+	 * singleton's configured chat provider. Falls back to the configured chat provider
+	 * when omitted. Stripped out before the request body is sent.
+	 */
+	provider?: ProviderConfig
 }
 
 export interface ChatCompletionResponse {
@@ -249,9 +256,12 @@ export class OpenRouterService {
 	 * syntax into the structured `tool_calls` field, leaking the raw tags into `content` or
 	 * `reasoning_content` instead and leaving the turn looking like an empty, natural stop.
 	 * This recovers a tool call from that leaked text so the conversation can continue
-	 * instead of silently dying. Handles two known tag styles:
+	 * instead of silently dying. Handles three known shapes:
 	 *   - `<function=NAME><parameter=KEY>value</parameter>...</function>`
 	 *   - `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` (Hermes-style)
+	 *   - A bare JSON object as the entire message, e.g.
+	 *     `{"type": "function", "name": "...", "parameters": {...}}` — seen from some
+	 *     llama.cpp/LM Studio templates that emit their native call shape untranslated.
 	 */
 	recoverLeakedToolCalls(text: string): ToolCall[] | null {
 		if (!text) return null
@@ -282,6 +292,24 @@ export class OpenRouterService {
 			}
 		}
 
+		// Bare JSON attempt — the whole (trimmed) message is a single object naming a
+		// function and its args, with no wrapper tags at all.
+		try {
+			const parsed = JSON.parse(text.trim())
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.name === 'string') {
+				const args = parsed.parameters ?? parsed.arguments
+				if (args && typeof args === 'object') {
+					return [{
+						id: crypto.randomUUID(),
+						type: 'function',
+						function: { name: parsed.name, arguments: JSON.stringify(args) },
+					}]
+				}
+			}
+		} catch {
+			// not a bare JSON tool call — fall through
+		}
+
 		return null
 	}
 
@@ -303,10 +331,12 @@ export class OpenRouterService {
 	}
 
 	async chatCompletion(request: ChatCompletionRequest, signal?: AbortSignal): Promise<ChatCompletionResponse> {
-		if (!this.isConfigured) throw new Error('No API provider configured')
+		const providerConfig = request.provider ? this.resolve(request.provider) : this.chat
+		if (!request.provider && !this.isConfigured) throw new Error('No API provider configured')
 
+		const { provider: _provider, ...rest } = request
 		const body: ChatCompletionRequest = {
-			...request,
+			...rest,
 			model: request.model || this.defaultModel,
 			stream: false,
 		}
@@ -315,9 +345,9 @@ export class OpenRouterService {
 			`FoundryAI | API chatCompletion — model: ${body.model}, messages: ${body.messages.length}, tools: ${body.tools?.length || 0}`,
 		)
 
-		let response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
+		let response = await fetch(`${providerConfig.baseUrl}/chat/completions`, {
 			method: 'POST',
-			headers: this.headersFor(this.chat),
+			headers: this.headersFor(providerConfig),
 			body: JSON.stringify(body),
 			signal,
 		})
@@ -328,9 +358,9 @@ export class OpenRouterService {
 			if (body.tools?.length && this.isToolTemplateError(response.status, errMsg)) {
 				console.warn(`FoundryAI | Provider rejected tools (no tool template?): "${errMsg}" — retrying without tools`)
 				const { tools: _tools, tool_choice: _toolChoice, ...bareBody } = body
-				response = await fetch(`${this.chat.baseUrl}/chat/completions`, {
+				response = await fetch(`${providerConfig.baseUrl}/chat/completions`, {
 					method: 'POST',
-					headers: this.headersFor(this.chat),
+					headers: this.headersFor(providerConfig),
 					body: JSON.stringify(bareBody),
 					signal,
 				})
