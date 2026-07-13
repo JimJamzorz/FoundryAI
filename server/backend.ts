@@ -17,6 +17,7 @@ import { Logger } from './logger.js';
 import { FoundryClient } from './foundry-client.js';
 
 import { MapGenerationTools } from './tools/map-generation.js';
+import { getChatEventToolDefinitions } from './tools/chat-events.js';
 
 const CONTROL_HOST = '127.0.0.1';
 
@@ -827,6 +828,78 @@ async function processStyledImageInBackend(
   }
 }
 
+/**
+ * wait-for-chat: hold the MCP response open, polling the Foundry module for new
+ * chat messages every couple of seconds, until something arrives or the window
+ * closes. This is what lets a pull-only MCP client (Claude Desktop, Codex) sit
+ * in a listen → react → listen loop against live table chat.
+ */
+async function handleWaitForChatRequest(
+  args: any,
+  foundryClient: any,
+  logger: Logger
+): Promise<any> {
+  // This is deliberately a low-frequency poll. MCP has no push channel back to
+  // the client, but table chat does not need sub-second reactions; checking once
+  // per minute avoids needless bridge traffic while the table is quiet.
+  const POLL_INTERVAL_MS = 60_000;
+  const timeoutSec = Math.min(Math.max(Number(args?.timeout_seconds) || 75, 65), 300);
+  const includeHidden = args?.include_hidden === true;
+  const deadline = Date.now() + timeoutSec * 1000;
+
+  let sinceId: string | null =
+    typeof args?.since_message_id === 'string' && args.since_message_id ? args.since_message_id : null;
+
+  try {
+    // No cursor supplied: arm at "now" — grab the current latest id so we only
+    // ever report messages posted after this call started.
+    if (!sinceId) {
+      const baseline = await foundryClient.query('foundry-ai.tool.get_chat_since', {
+        include_hidden: includeHidden,
+      });
+      sinceId = baseline?.latest_id ?? null;
+    }
+
+    while (Date.now() < deadline) {
+      const result = await foundryClient.query('foundry-ai.tool.get_chat_since', {
+        since_id: sinceId,
+        include_hidden: includeHidden,
+      });
+
+      if (result?.messages?.length) {
+        return {
+          status: 'success',
+          messages: result.messages,
+          latest_id: result.latest_id,
+          note: 'Pass latest_id as since_message_id on your next wait-for-chat call to keep listening.',
+        };
+      }
+
+      // Advance the cursor even when everything new was filtered out (whispers,
+      // empty rolls) so those messages aren't re-scanned every poll.
+      if (result?.latest_id) sinceId = result.latest_id;
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(POLL_INTERVAL_MS, remainingMs)));
+      }
+    }
+
+    return {
+      status: 'timeout',
+      messages: [],
+      latest_id: sinceId,
+      note: 'No new chat within the window — this is normal. Call wait-for-chat again with this latest_id to keep listening.',
+    };
+  } catch (error: any) {
+    logger.error('wait-for-chat failed', { error: error.message });
+    return {
+      status: 'error',
+      message: `wait-for-chat failed: ${error.message}. Is Foundry connected to the MCP server?`,
+    };
+  }
+}
+
 async function handleListImageModelsRequest(comfyuiClient: any, logger: Logger): Promise<any> {
   try {
     const health = await comfyuiClient.checkHealth();
@@ -1403,7 +1476,7 @@ async function startBackend(): Promise<void> {
     backendComfyUIHandlers: (globalThis as any).backendComfyUIHandlers,
   });
 
-  const mapTools = mapGenerationTools.getToolDefinitions();
+  const mapTools = [...mapGenerationTools.getToolDefinitions(), ...getChatEventToolDefinitions()];
 
   // Tools handled locally — all others forward to FoundryAI
   const MAP_JOB_TOOLS = new Set([
@@ -1412,6 +1485,7 @@ async function startBackend(): Promise<void> {
     'check-map-status',
     'cancel-map-job',
     'list-image-models',
+    'wait-for-chat',
   ]);
 
   // Start Foundry connector (WebSocket server that FoundryAI's mcp-bridge.ts connects to)
@@ -1518,6 +1592,10 @@ async function startBackend(): Promise<void> {
 
                   case 'list-image-models':
                     result = await handleListImageModelsRequest(mapGenerationComfyUIClient, logger);
+                    break;
+
+                  case 'wait-for-chat':
+                    result = await handleWaitForChatRequest(args, foundryClient, logger);
                     break;
 
                   case 'generate-styled-image':

@@ -38,7 +38,9 @@
   let recapProgress = $state<RecapProgress | null>(null);
   let isIndexing = $state(false);
   let indexProgress = $state('');
-  let selectedToolGroup = $state<ToolGroupId>('all');
+  // Keep routine chat fast and inexpensive. The user can opt into a preset or
+  // individual tools from the picker when a message actually needs them.
+  let selectedToolGroup = $state<ToolGroupId>('none');
   let customToolNames = $state<string[] | null>(null);
   const activeToolSelection = $derived<ActiveToolSelection>(
     customToolNames ? { custom: customToolNames } : { group: selectedToolGroup },

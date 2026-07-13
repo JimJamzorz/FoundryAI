@@ -89,6 +89,10 @@ export interface FoundryAISettings {
 	toolPresets: ToolPreset[]
 	aiPlayers: AIPlayerConfig[]
 	aiPlayerHumanCap: number
+	aiOrchestrationEnabled: boolean
+	aiKeepSceneMoving: boolean
+	orchestratorProviderId: string
+	orchestratorModel: string
 }
 
 export function registerSettings(): void {
@@ -549,11 +553,47 @@ export function registerSettings(): void {
 
 	game.settings.register(MODULE_ID, 'aiPlayerHumanCap', {
 		name: 'AI Player Human-Interaction Cap',
-		hint: 'Max consecutive chat messages from AI players (combined) before they go quiet and wait for a human message to break the streak. Prevents AI players from spiraling into talking only to each other.',
+		hint: 'Max consecutive automated chat messages (AI players + autonomous DM narration, combined) before things go quiet and wait for a human message to break the streak. Prevents spiraling into talking only to itself.',
 		scope: 'world',
 		config: false,
 		type: Number,
 		default: 5,
+	})
+
+	game.settings.register(MODULE_ID, 'aiOrchestrationEnabled', {
+		name: 'Enable AI Orchestration',
+		hint: 'Opt in to the AI Players trigger loop — a central orchestrator (using your DM Chat Model, or the separate Orchestrator Model below if set) watches table chat and decides whether an AI player should react, the DM should narrate a beat, or nothing should happen. Off by default so it never surprises you with unattended chat messages until you turn it on.',
+		scope: 'world',
+		config: false,
+		type: Boolean,
+		default: false,
+	})
+
+	game.settings.register(MODULE_ID, 'aiKeepSceneMoving', {
+		name: 'Keep the Scene Moving',
+		hint: 'When on, an orchestrator WAIT becomes a DM narration beat instead of silence, and if the DM then declines to narrate, the orchestrator is asked once more to pick a player. The table keeps itself moving until the Human-Interaction Cap is reached or a human speaks. Chattier by design — the cap is the brake.',
+		scope: 'world',
+		config: false,
+		type: Boolean,
+		default: false,
+	})
+
+	game.settings.register(MODULE_ID, 'orchestratorProviderId', {
+		name: 'Orchestrator Provider',
+		hint: 'Optional — API provider for the orchestrator\'s ACTOR/DM/WAIT triage decision, which runs on every chat message. Leave blank to use your DM Chat Model/provider.',
+		scope: 'world',
+		config: false,
+		type: String,
+		default: '',
+	})
+
+	game.settings.register(MODULE_ID, 'orchestratorModel', {
+		name: 'Orchestrator Model',
+		hint: 'Optional — a fast/lightweight model for the orchestrator\'s triage decision, separate from your DM Chat Model. Worth setting if your DM model is a heavy "thinking" model — it can spend more tokens reasoning through this simple decision than a full DM turn needs, adding latency to every chat message. Leave blank to just use your DM Chat Model.',
+		scope: 'world',
+		config: false,
+		type: String,
+		default: '',
 	})
 
 	// ---- Settings Menu ----

@@ -1,48 +1,105 @@
 /* ==========================================================================
-   AI Player Runtime — Trigger Loop
-   Wakes up configured AI players when chat activity happens and lets each
-   one decide, independently, whether their character would speak up right
-   now. Deliberately narrow tool access: journal lookups (search_journals,
-   get_journal — read-only, shared with the DM assistant) plus a personal
-   notes journal each player can read/write for itself. Everything else
-   (world mutation, DM tools) stays out of reach — the AI player is expected
-   to talk in chat like a real player would, not act unilaterally.
+   AI Player Runtime — Orchestrated Trigger Loop
+   A single central orchestrator (the DM's own configured Chat Model) watches
+   table chat and decides what happens next: a specific AI player reacts, the
+   DM narrates a beat, or nothing happens and it waits for a human. This
+   replaces an earlier design where every AI player listened and decided for
+   itself independently — that produced pile-ons (several players deciding to
+   speak at once) and no real sense of pacing or turn-taking. One arbiter with
+   the full picture makes a better call than N models guessing in isolation.
 
    Design notes (see conversation history for the full rationale):
-   - Any chat message from a source OTHER than a given AI player wakes that
-     player up — including messages from other AI players. A player never
-     re-triggers itself off its own message.
-   - Triggers are debounced per player so a burst of messages collapses into
-     one decision instead of one LLM call per line (same pattern as the HP
-     debounce in session-event-hooks.ts).
-   - A hard cap prevents AI players from spiraling into talking only to each
-     other: if the trailing N chat messages were ALL posted by AI players
-     (tracked via a flag on the ChatMessage), further AI turns are suppressed
-     until a human (or DM-posted) message breaks the streak.
+   - Off by default (aiOrchestrationEnabled) — opt in explicitly so nobody is
+     surprised by unattended chat messages after enabling AI players.
+   - Triggers are debounced (one global timer, not per-player) so a burst of
+     messages collapses into one orchestrator decision instead of firing on
+     every line.
+   - AI players get a narrow toolset: read-only journal lookups shared with
+     the DM assistant, plus a personal notes journal each can read/write for
+     itself. Nothing that mutates the world.
+   - The autonomous DM narration branch is even more restricted: read-only
+     journal lookups and nothing else. No combat, damage, token, actor, or
+     world-editing tools — those still require the human DM to actually chat.
+     The narration is the reply TEXT itself (WAIT sentinel to do nothing),
+     posted only after the same meta/leak filter the player turns use. An
+     earlier design required a post_chat_message tool call to count as
+     "acting", but models — including tool-capable ones — reliably write
+     narration as plain content instead of wrapping it in a tool call, so
+     good beats were being generated and then silently discarded.
+   - A hard cap (aiPlayerHumanCap) prevents endless automated chatter: once N
+     consecutive messages are all automated (AI player or autonomous DM,
+     tracked via the "automated" flag on the ChatMessage), the orchestrator
+     suppresses itself until a human message breaks the streak.
    ========================================================================== */
 
 import { getSetting, type AIPlayerConfig, type ApiProvider } from '../settings'
-import { openRouterService, type LLMMessage, type ToolCall, type ToolDefinition } from './openrouter-service'
-import { buildActorRoleplayPrompt } from './system-prompt'
+import { openRouterService, TOOLS_UNSUPPORTED_NOTICE, type LLMMessage, type ToolCall, type ToolDefinition, type ProviderConfig } from './openrouter-service'
+import { buildActorRoleplayPrompt, buildSystemPrompt } from './system-prompt'
 import { getToolsByNames, executeTool } from './tool-system'
 import { getSubfolderId } from './folder-manager'
 
 const MODULE_ID = 'foundry-ai'
 
-/** Quiet window after the last relevant message before a player's turn actually runs. */
-const DEBOUNCE_MS = 4000
+/** Quiet window after the last relevant message before the orchestrator actually runs.
+ *  Humans type slower than models generate — a short window fires mid-typing and the
+ *  orchestrator ends up reacting to half a thought. */
+const DEBOUNCE_MS = 10_000
 
-/** How many recent chat lines to hand the model as context for its decision. */
+/** How many AI turns (player or DM) may run simultaneously. Turns dispatch to
+ *  per-player providers — potentially different machines — so overlapping them is
+ *  fine, but every HUMAN message also spawns its own decision cycle: an active GM
+ *  chatting mid-scene stacks threads fast. Two keeps crosstalk lively without the
+ *  in-flight count skyrocketing when a human joins in. */
+const MAX_CONCURRENT_TURNS = 2
+
+/** turnsInFlight key for the autonomous DM (only one DM narration at a time). */
+const DM_TURN_KEY = '__dm__'
+
+/** How many recent chat lines to hand the model as context. */
 const CONTEXT_MESSAGE_LIMIT = 15
 
-/** Sentinel the model returns when it decides not to speak up. */
+/** Sentinel a called-on player returns when it decides not to speak after all. */
 const PASS_SENTINEL = 'NO_RESPONSE'
 
-/** Bound on tool-call round trips per turn — this is a quick reaction check, not a full agent loop. */
+/** Bound on tool-call round trips per turn — a quick reaction/narration beat, not a full agent loop. */
 const MAX_TOOL_ROUNDS = 3
 
-/** Read-only journal tools reused as-is from the shared tool system. */
-const SHARED_TOOL_NAMES = ['search_journals', 'get_journal']
+/**
+ * Token budget for a player turn / DM narration beat. A short in-character line only
+ * needs a fraction of this, but reasoning-capable local models (Gemma-QAT via LM
+ * Studio, etc.) spend a big chunk of whatever budget they're given on an internal
+ * "thinking" pass before writing the real answer — that reasoning counts against the
+ * same cap. The retry-with-more-budget safety net in openrouter-service.ts catches a
+ * blown budget, but it salvages NOTHING — the first call's entire thought process is
+ * discarded and re-generated from scratch, so every trip through it costs roughly
+ * double. Observed: Qwen-class thinking models spend ~5000 chars (~1300+ tokens)
+ * reasoning per beat, which made the old 1200 cap fail (and pay the double-cost)
+ * on essentially every DM narration. Sized so thought + answer fit on the first
+ * attempt; costs nothing extra for concise/non-reasoning models, since this is a
+ * ceiling, not a target — they still stop at their own natural length.
+ */
+const TURN_MAX_TOKENS = 2500
+
+/**
+ * Token budget for the orchestrator's own ACTOR/DM/WAIT decision. The answer itself is
+ * one short line, but — same as TURN_MAX_TOKENS above — a reasoning-capable model
+ * assigned as the Chat Model spends real tokens "thinking" before it commits to that
+ * line, and 60 wasn't enough headroom even for a fairly short deliberation (seen
+ * hitting the wall at 60/60 with only ~236 chars of reasoning so far). Set generously
+ * enough that the common case succeeds on the first call instead of needing
+ * openrouter-service.ts's retry-with-bigger-budget fallback every single time.
+ */
+const ORCHESTRATOR_MAX_TOKENS = 500
+
+/** Read-only journal tools available to AI players, reused as-is from the shared tool system. */
+const PLAYER_SHARED_TOOL_NAMES = ['search_journals', 'get_journal']
+
+/** Lookup tools for the autonomous DM narration branch — reading only. The narration
+ *  itself is delivered as the reply text, NOT via post_chat_message: models (even
+ *  tool-capable ones) reliably write narration as plain content rather than wrapping
+ *  it in a tool call, and requiring the call meant perfectly good beats were generated
+ *  and then discarded. */
+const DM_LOOKUP_TOOL_NAMES = ['search_journals', 'get_journal']
 
 /** Player-scoped notes tools — handled locally, not through the shared executeTool dispatcher. */
 const PLAYER_NOTES_TOOLS: ToolDefinition[] = [
@@ -72,29 +129,86 @@ const PLAYER_NOTES_TOOLS: ToolDefinition[] = [
 	},
 ]
 
-const DECISION_INSTRUCTIONS = `## Right Now
-You are deciding whether you, specifically, would naturally speak up right now, based on the recent chat log below. This is a quick reaction check, not a full turn.
-
-### Were you the one being talked to?
-Check the most recent message first, before anything else:
-- If it clearly addresses a DIFFERENT character by name, or asks that character a direct question, this is not your moment. Stay quiet (pass) even if you'd have something to say — real players don't jump in and answer for each other. Only override this if you were also named or asked, you have information nobody else has and it's urgent, or the addressed character has gone unanswered for a while and the scene is stalling.
-- If it's addressed to you by name, to the group as a whole, or to no one in particular (general narration, an event happening, an open question), you're free to weigh in normally.
+const PLAYER_TURN_INSTRUCTIONS = `## Your Turn
+The DM has indicated this is a moment for you specifically to react, based on the recent chat below.
 
 ### Tools available
 You have a small toolset — reach for it rarely, not on every turn. A description of an action (a door gets kicked in, someone looks around a room) is NOT a reason to search anything; that's just something you react to in character, the same way a real player would without checking a reference book mid-scene.
 - search_journals / get_journal — only if you genuinely need a specific campaign fact to react accurately, and you don't already know it.
 - read_my_notes / write_my_notes — your own private notes. Jot something down only if this moment is worth remembering later; check your notes only if you need to recall something specific first.
-If you use a tool, use the actual tool-calling mechanism — never write out a function name or JSON as if it were your reply. If you're not going to use a tool (the common case), skip straight to deciding.
+If you use a tool, use the actual tool-calling mechanism — never write out a function name or JSON as if it were your reply.
 
-### Deciding
-- If you'd say or do something in reaction, reply with ONLY the in-character line(s) — dialogue in quotes, brief actions in *italics*, same style as your roleplay guidelines above. Keep it short and natural, like a player chiming in mid-conversation.
-- Otherwise — including "this wasn't directed at me" — reply with EXACTLY: ${PASS_SENTINEL}
-- Don't narrate for other characters. Don't explain your reasoning. Output only your line(s), or the pass sentinel — nothing else.`
+### Responding — CRITICAL
+Whatever you write is posted to the table's chat log VERBATIM, exactly as your character's own message — not shown to anyone as a draft, not summarized, not filtered. Only your character's actual words and actions belong in it.
 
-const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>()
-const inFlight = new Set<string>()
+Never include any of the following — these are not roleplay, they're you narrating about the task instead of doing it, and they will be posted to the table looking exactly as broken as they sound:
+- Planning or thinking out loud ("I'm considering my options...", "Currently considering...")
+- Restating the situation, the chat, or what other characters just said back to yourself
+- A numbered list of choices for what to do next (that's the DM's job, not yours)
+- Any sentence about the act of writing itself — "I will add something", "we need to reply as X", "let's craft a line", "since you need to write down your thought process"
+- Your own character's name as a speaker label in front of your line (e.g. "Kale: ...") — the chat log below is shown to you as "Name: message" so you can tell who said what, but that's a transcript format for your reference only, not something to reproduce. You ARE the character; the chat message already shows who's speaking, don't caption yourself
+- Repeating the same sentence or paragraph more than once
 
-/** Register the createChatMessage hook that drives the AI player trigger loop. GM-only. */
+Good reply: *I grip my wand tight, watching the flickering shapes.* "Careful — I don't think these things are friendly."
+Bad reply (never do this): "Since Kale needs to react to the ghosts, I will write: Kale grips his wand and says..."
+
+- Dialogue in quotes, brief actions in *italics*, same style as your roleplay guidelines above. One or two short beats — a quick reaction, not a paragraph.
+- If, having actually looked at the chat, there's genuinely nothing for your character to add, reply with EXACTLY: ${PASS_SENTINEL}
+- Don't narrate for other characters. Output only your line(s), or the pass sentinel — nothing else.`
+
+/**
+ * DM narration instructions. The reply text itself IS the narration (posted
+ * verbatim after filtering), with an explicit WAIT sentinel for "do nothing" —
+ * tools exist only for looking facts up first. You are NOT taking over the
+ * table: no combat, damage, token, actor, or world-editing capability exists
+ * in this mode; anything like that stays with the human DM.
+ */
+const DM_NARRATION_INSTRUCTIONS = `## Autonomous Narration — Right Now
+You've decided this moment could use a beat of narration or NPC dialogue to keep the scene moving, based on the recent chat below.
+
+### Canon — you narrate this adventure, you do not write it
+This is an established campaign with source material. You must NOT introduce new named locations, NPCs, creatures, factions, items, or plot elements. Every proper noun and every concrete fact in your narration must come from one of: the recent chat, the campaign context above (including any Director's/campaign notes), or a journal you look up right now with search_journals / get_journal.
+- Unsure whether something exists in this campaign? Search FIRST, or don't mention it.
+- When you have no established fact to advance with, stay purely atmospheric — weather, light, sound, smell, mood, body language. Atmosphere needs no canon and is always safe. Tension and dread are yours; new monsters and new places are not.
+- Introducing something genuinely new is the human DM's call, never yours. If the scene seems to need it, that's a WAIT.
+
+Whatever you reply is posted to the table's chat log VERBATIM as DM narration — it is not a draft and nobody filters it.
+- If a short narration beat, environmental detail, or one line of NPC dialogue would genuinely help, reply with ONLY that text. A sentence or two — this is a nudge, not a full scene.
+- If nothing needs to happen — the scene doesn't need advancing, or this is a moment for a human — reply with EXACTLY: WAIT
+- Never explain what you're doing, never describe your reasoning, no speaker labels, no lists, no meta-commentary. Only the narration itself, or WAIT.`
+
+// ---- Trigger loop ----
+
+let debounceTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * Concurrency model: the orchestrator DECISION is serialized (two overlapping
+ * decisions would double-dispatch off the same chat state), but the dispatched
+ * TURNS are not — each AI player runs against its own provider (often its own
+ * machine), so turns fire-and-forget with a per-player guard: a player who is
+ * still generating can't be picked again, and everyone in flight is hidden
+ * from the orchestrator's roster for the next decision.
+ */
+let decisionInFlight = false
+/** A message arrived while a decision was running — re-run once it finishes. */
+let decisionPending = false
+/** Player ids (or DM_TURN_KEY) whose turns are currently generating. */
+const turnsInFlight = new Set<string>()
+
+/**
+ * The AI player dispatched on the immediately preceding orchestration cycle, if that
+ * cycle was an ACTOR dispatch — cleared whenever a DM turn or a WAIT breaks the streak.
+ * Weaker/smaller orchestrator models are prone to anchoring on whoever spoke most
+ * recently (the recent-chat context ends up dominated by that character's own lines,
+ * which reads as "this person is active" rather than "this person just went"), which
+ * left unchecked can hand the same character the mic turn after turn until the human
+ * cap kicks in. This is a hard, model-independent guardrail against that specific
+ * failure — it does not fully replace judgment (see the "Last to speak" hint in
+ * buildOrchestratorPrompt), just backstops it when the model gets it wrong anyway.
+ */
+let lastActorDispatchedId: string | null = null
+
+/** Register the createChatMessage hook that drives the orchestrator. GM-only. */
 export function registerAIPlayerHooks(): void {
 	Hooks.on('createChatMessage', (message: ChatMessage) => {
 		try {
@@ -106,31 +220,276 @@ export function registerAIPlayerHooks(): void {
 	console.log('FoundryAI | ai-player-runtime: registered')
 }
 
+/** Prefix every trace line so the console can be filtered down to just the orchestrator's reasoning. */
+const TRACE = 'FoundryAI | orchestrator trace:'
+
 function handleIncomingMessage(message: ChatMessage): void {
-	if (!game.user?.isGM) return
-
-	const players = getEnabledPlayers()
-	if (players.length === 0) return
-
-	const authorPlayerId = message.getFlag?.(MODULE_ID, 'aiPlayerId')
-
-	for (const player of players) {
-		// Never let a player's own message re-trigger itself — everything else
-		// (humans, the DM, or a *different* AI player) is fair game.
-		if (authorPlayerId && authorPlayerId === player.id) continue
-
-		const existing = debounceTimers.get(player.id)
-		if (existing) clearTimeout(existing)
-
-		const timer = setTimeout(() => {
-			debounceTimers.delete(player.id)
-			considerPlayerTurn(player.id).catch(e =>
-				console.error(`FoundryAI | AI player "${player.name}" turn failed:`, e),
-			)
-		}, DEBOUNCE_MS)
-
-		debounceTimers.set(player.id, timer)
+	if (!game.user?.isGM) {
+		console.debug(`${TRACE} ignoring — this client isn't the GM (orchestration only runs in the GM's browser).`)
+		return
 	}
+	if (!getSetting('aiOrchestrationEnabled')) {
+		console.log(`${TRACE} ignoring createChatMessage — AI Orchestration is turned off (enable it in the AI Players window).`)
+		return
+	}
+
+	console.log(
+		`${TRACE} message received from "${resolveSpeakerName(message)}" — (re)starting ${DEBOUNCE_MS}ms debounce timer.`,
+	)
+
+	if (debounceTimer) clearTimeout(debounceTimer)
+	debounceTimer = setTimeout(() => {
+		debounceTimer = null
+		console.log(`${TRACE} debounce elapsed — considering orchestration now.`)
+		considerOrchestration().catch(e => console.error('FoundryAI | orchestrator turn failed:', e))
+	}, DEBOUNCE_MS)
+}
+
+/**
+ * options.afterDMPass marks the single follow-up cycle that "keep the scene
+ * moving" runs when the DM considered narrating and declined. In that cycle the
+ * orchestrator is nudged to pick a player, DM decisions are treated as WAIT
+ * (the DM just passed), and WAIT is honored as-is — which is what terminates
+ * the loop: WAIT → DM → DM passes → one actor-or-nothing retry → done.
+ */
+async function considerOrchestration(options: { afterDMPass?: boolean } = {}): Promise<void> {
+	if (decisionInFlight) {
+		// Don't lose this cycle — re-run once the current decision resolves.
+		decisionPending = true
+		console.log(`${TRACE} decision already in flight — queued a re-run for when it finishes.`)
+		return
+	}
+
+	const cap = getSetting('aiPlayerHumanCap') || 5
+	const trailing = countTrailingAutomatedMessages()
+	console.log(`${TRACE} ${trailing} trailing automated message(s), cap is ${cap}.`)
+	if (trailing >= cap) {
+		console.log(
+			`FoundryAI | orchestrator suppressed — ${trailing} consecutive automated messages ≥ cap (${cap}); waiting for a human message.`,
+		)
+		return
+	}
+
+	if (turnsInFlight.size >= MAX_CONCURRENT_TURNS) {
+		console.log(`${TRACE} skipping — ${turnsInFlight.size} turn(s) already generating (cap ${MAX_CONCURRENT_TURNS}).`)
+		return
+	}
+
+	const recentChat = getRecentChatLines(CONTEXT_MESSAGE_LIMIT)
+	if (!recentChat) {
+		console.log(`${TRACE} skipping — no recent chat text found (getRecentChatLines returned empty).`)
+		return
+	}
+
+	// Menu construction — the DM is part of the same rotating cast as the
+	// players. Hidden this cycle: whoever spoke in the recent rotation window
+	// (players AND the DM), whoever is mid-generation, and whoever was just
+	// dispatched but may not have posted yet. The parser only accepts names
+	// from the offered menu, so this is enforced, not suggested.
+	const enabled = getEnabledPlayers()
+	const hiddenKeys = getRotationHiddenKeys(enabled)
+	if (lastActorDispatchedId) hiddenKeys.add(lastActorDispatchedId)
+
+	const players = enabled.filter(p => !turnsInFlight.has(p.id) && !hiddenKeys.has(p.id))
+	let dmEligible = !hiddenKeys.has(DM_ROTATION_KEY) && !turnsInFlight.has(DM_TURN_KEY)
+	// Never let the menu go completely empty: if every player is hidden/busy and
+	// the DM is rotation-hidden too, the DM steps back in rather than stalling.
+	if (players.length === 0 && !dmEligible && !turnsInFlight.has(DM_TURN_KEY)) dmEligible = true
+
+	const hiddenNames = [
+		...enabled.filter(p => hiddenKeys.has(p.id)).map(p => p.actorName || p.name),
+		...(hiddenKeys.has(DM_ROTATION_KEY) ? ['DM'] : []),
+	]
+	if (hiddenNames.length > 0) {
+		console.log(`${TRACE} rotation: hiding recent speaker(s) ${hiddenNames.join(', ')} from the menu this cycle.`)
+	}
+	console.log(
+		`${TRACE} menu: ${[...players.map(p => p.actorName || p.name), ...(dmEligible ? ['DM'] : [])].join(', ') || '(nobody available)'}${turnsInFlight.size ? ` — ${turnsInFlight.size} in flight` : ''}`,
+	)
+
+	const pressure = getSpotlightPressure(enabled)
+
+	decisionInFlight = true
+	try {
+		console.log(`${TRACE} calling orchestrator decision model...`)
+		let decision = await runOrchestratorDecision(
+			players,
+			dmEligible,
+			recentChat,
+			options.afterDMPass === true,
+			pressure,
+			enabled,
+			hiddenNames,
+		)
+
+		const keepMoving = getSetting('aiKeepSceneMoving') ?? false
+
+		if (decision.type === 'dm' && options.afterDMPass) {
+			console.log(`${TRACE} orchestrator called for the DM again right after the DM passed — stopping here.`)
+			lastActorDispatchedId = null
+			return
+		}
+
+		if (decision.type === 'wait') {
+			// Keep-scene-moving: WAIT becomes the most sensible eligible dispatch —
+			// the DM if it hasn't narrated recently, otherwise the most overdue
+			// player. (Previously WAIT always became a DM beat, which is exactly how
+			// the table drowned in narration once every player was rotation-hidden.)
+			if (keepMoving && !options.afterDMPass) {
+				if (dmEligible) {
+					console.log(`${TRACE} decision was WAIT — keep-scene-moving converts it into a DM narration beat.`)
+					decision = { type: 'dm' }
+				} else {
+					const fallback = pickMostOverdue(players, pressure)
+					if (fallback) {
+						console.log(
+							`${TRACE} decision was WAIT — keep-scene-moving hands the mic to most-overdue "${fallback.actorName || fallback.name}" (DM has narrated too recently).`,
+						)
+						decision = { type: 'actor', player: fallback }
+					}
+				}
+			}
+			if (decision.type === 'wait') {
+				console.log(`${TRACE} decision was WAIT — doing nothing this round.`)
+				lastActorDispatchedId = null
+				return
+			}
+		}
+
+		if (decision.type === 'actor') {
+			const player = decision.player
+			const displayName = player.actorName || player.name
+			lastActorDispatchedId = player.id
+			turnsInFlight.add(player.id)
+			console.log(`${TRACE} dispatching to AI player "${displayName}" (${turnsInFlight.size} turn(s) now in flight)...`)
+			// Fire-and-forget: the turn runs on the player's own provider, and the
+			// orchestrator is free to make its next decision while it generates.
+			runPlayerTurn(player, recentChat)
+				.catch(e => console.error(`FoundryAI | AI player turn for "${displayName}" failed:`, e))
+				.finally(() => {
+					turnsInFlight.delete(player.id)
+					console.log(`${TRACE} player turn for "${displayName}" finished (${turnsInFlight.size} still in flight).`)
+				})
+			return
+		}
+
+		// DM narration — same fire-and-forget, but only one at a time.
+		if (turnsInFlight.has(DM_TURN_KEY)) {
+			console.log(`${TRACE} decision was DM but a DM narration is already generating — dropping this one.`)
+			return
+		}
+		lastActorDispatchedId = null
+		turnsInFlight.add(DM_TURN_KEY)
+		console.log(`${TRACE} dispatching to autonomous DM narration...`)
+		void (async () => {
+			let posted = false
+			try {
+				posted = await runAutonomousDMNarration(recentChat)
+			} catch (e) {
+				console.error('FoundryAI | autonomous DM narration failed:', e)
+			} finally {
+				turnsInFlight.delete(DM_TURN_KEY)
+				console.log(`${TRACE} autonomous DM narration turn finished.`)
+			}
+			// The DM looked at the moment and passed — under keep-scene-moving that
+			// usually means "this is a player's beat", so give the orchestrator one
+			// follow-up chance to name a player. afterDMPass makes it single-shot.
+			if (!posted && keepMoving && !options.afterDMPass) {
+				console.log(`${TRACE} DM passed — keep-scene-moving asks the orchestrator once more for a player pick.`)
+				considerOrchestration({ afterDMPass: true }).catch(e =>
+					console.error('FoundryAI | keep-scene-moving follow-up cycle failed:', e),
+				)
+			}
+		})()
+	} finally {
+		decisionInFlight = false
+		if (decisionPending) {
+			decisionPending = false
+			console.log(`${TRACE} running the queued decision cycle now.`)
+			// New cycle sees the just-updated turnsInFlight/lastActor state.
+			considerOrchestration().catch(e => console.error('FoundryAI | queued orchestration cycle failed:', e))
+		}
+	}
+}
+
+/** How many recent chat messages to scan when computing spotlight balance. */
+const SPOTLIGHT_WINDOW = 30
+
+interface SpotlightPressure {
+	/** Automated posts per player id within the window. */
+	counts: Map<string, number>
+	/** Players with ZERO recent turns while some other player has had 2+ —
+	 *  i.e. someone else has gone (at least) twice since they last acted. */
+	overdue: AIPlayerConfig[]
+}
+
+/**
+ * Measure who's been hogging the spotlight, from the chat log itself (posts are
+ * stamped with aiPlayerId, so this survives reloads and needs no extra state).
+ * Small orchestrator models anchor hard on whichever character dominates the
+ * recent transcript — this powers both the prompt-side pressure and the hard
+ * redirect that guarantees quiet characters eventually get the mic.
+ */
+function getSpotlightPressure(players: AIPlayerConfig[]): SpotlightPressure {
+	const counts = new Map<string, number>()
+	for (const p of players) counts.set(p.id, 0)
+
+	const all = game.messages?.contents ?? []
+	for (const m of all.slice(-SPOTLIGHT_WINDOW)) {
+		const pid = (m as any).getFlag?.(MODULE_ID, 'aiPlayerId')
+		if (pid && counts.has(pid)) counts.set(pid, (counts.get(pid) || 0) + 1)
+	}
+
+	const maxCount = Math.max(0, ...counts.values())
+	const overdue = maxCount >= 2 ? players.filter(p => (counts.get(p.id) || 0) === 0) : []
+	return { counts, overdue }
+}
+
+/** Rotation key representing the autonomous DM in the unified speaker rotation. */
+const DM_ROTATION_KEY = 'DM'
+
+/**
+ * Hard rotation over a UNIFIED cast: the enabled players AND the autonomous DM
+ * rotate together. The speakers of the last K automated posts (player turns and
+ * DM beats alike) are hidden from the orchestrator's menu, K = half the cast
+ * rounded up, never everyone. Soft prompt pressure demonstrably loses to an
+ * anchored small model, so the favorite simply isn't offered — and because DM
+ * beats count as speaking, a DM that just narrated is off the menu too, which
+ * kills the observed failure where the DM narrated ten beats in a row while two
+ * hidden players never aged out of exclusion (only player posts used to move
+ * the window).
+ *
+ * Returns hidden keys: player ids and/or DM_ROTATION_KEY.
+ */
+function getRotationHiddenKeys(players: AIPlayerConfig[]): Set<string> {
+	const castSize = players.length + 1 // players + DM
+	const excludeMax = Math.min(Math.ceil(castSize / 2), castSize - 1)
+	const hidden = new Set<string>()
+	if (excludeMax <= 0) return hidden
+
+	// Collect the speakers of the last `excludeMax` automated posts (duplicates
+	// count — a dominant voice fills the window alone and only costs themselves).
+	const all = game.messages?.contents ?? []
+	let postsSeen = 0
+	for (let i = all.length - 1; i >= 0 && postsSeen < excludeMax; i--) {
+		const m: any = all[i]
+		const pid = m.getFlag?.(MODULE_ID, 'aiPlayerId')
+		if (typeof pid === 'string' && players.some(p => p.id === pid)) {
+			hidden.add(pid)
+			postsSeen++
+		} else if (m.getFlag?.(MODULE_ID, 'autonomousDM')) {
+			hidden.add(DM_ROTATION_KEY)
+			postsSeen++
+		}
+	}
+	return hidden
+}
+
+/** The eligible player who has spoken least recently — the substitution target
+ *  when the orchestrator names someone who isn't on the menu. */
+function pickMostOverdue(eligible: AIPlayerConfig[], pressure: SpotlightPressure): AIPlayerConfig | null {
+	if (eligible.length === 0) return null
+	return [...eligible].sort((a, b) => (pressure.counts.get(a.id) || 0) - (pressure.counts.get(b.id) || 0))[0]
 }
 
 function getEnabledPlayers(): AIPlayerConfig[] {
@@ -138,43 +497,195 @@ function getEnabledPlayers(): AIPlayerConfig[] {
 	return all.filter(p => p.enabled && p.actorId && p.providerId && p.model)
 }
 
-async function considerPlayerTurn(playerId: string): Promise<void> {
-	if (inFlight.has(playerId)) return
-
-	// Re-fetch fresh config — settings may have changed during the debounce window.
-	const player = getEnabledPlayers().find(p => p.id === playerId)
-	if (!player) return
-
-	const cap = getSetting('aiPlayerHumanCap') || 5
-	const trailing = countTrailingAIMessages()
-	if (trailing >= cap) {
-		console.log(
-			`FoundryAI | AI player "${player.name}" turn suppressed — ${trailing} consecutive AI messages ≥ cap (${cap}); waiting for a human message.`,
-		)
-		return
-	}
-
-	inFlight.add(playerId)
-	try {
-		await runPlayerDecision(player)
-	} finally {
-		inFlight.delete(playerId)
-	}
-}
-
-/** Count trailing chat messages (most recent first) authored by any AI player, stopping at the first non-AI message. */
-function countTrailingAIMessages(): number {
+/** Count trailing chat messages (most recent first) posted by automation (AI player or autonomous DM), stopping at the first human/non-flagged message. */
+function countTrailingAutomatedMessages(): number {
 	const all = game.messages?.contents ?? []
 	let count = 0
 	for (let i = all.length - 1; i >= 0; i--) {
-		const flag = all[i].getFlag?.(MODULE_ID, 'aiPlayerId')
-		if (flag) count++
+		if (all[i].getFlag?.(MODULE_ID, 'automated')) count++
 		else break
 	}
 	return count
 }
 
-async function runPlayerDecision(player: AIPlayerConfig): Promise<void> {
+// ---- Orchestrator decision ----
+
+type OrchestratorDecision = { type: 'actor'; player: AIPlayerConfig } | { type: 'dm' } | { type: 'wait' }
+
+async function runOrchestratorDecision(
+	players: AIPlayerConfig[],
+	dmEligible: boolean,
+	recentChat: string,
+	dmJustPassed = false,
+	pressure: SpotlightPressure = { counts: new Map(), overdue: [] },
+	allEnabled: AIPlayerConfig[] = players,
+	hiddenNames: string[] = [],
+): Promise<OrchestratorDecision> {
+	const { model, provider } = resolveOrchestratorModel()
+	if (!model) {
+		console.log(`${TRACE} no orchestrator model available (set a Chat Model, or an Orchestrator Model override, in Settings) — defaulting to WAIT.`)
+		return { type: 'wait' }
+	}
+	if (!provider && !openRouterService.isConfigured) {
+		console.log(`${TRACE} no chat provider configured (Settings → API Providers) — defaulting to WAIT.`)
+		return { type: 'wait' }
+	}
+
+	try {
+		const response = await openRouterService.chatCompletion({
+			model,
+			...(provider ? { provider } : {}),
+			messages: [
+				{ role: 'system', content: buildOrchestratorPrompt(players, dmEligible, dmJustPassed, hiddenNames) },
+				{ role: 'user', content: `## Recent Chat\n${recentChat}` },
+			],
+			// No temperature: let the serving side decide (e.g. LM Studio's per-model
+			// setting), so the orchestrator model's own tuned config is the truth.
+			max_tokens: ORCHESTRATOR_MAX_TOKENS,
+		})
+
+		const raw = response.choices?.[0]?.message?.content ?? ''
+		const decision = parseOrchestratorDecision(raw, players, dmEligible, allEnabled, pressure)
+		console.log(
+			`FoundryAI | orchestrator decision: ${decision.type}${decision.type === 'actor' ? ` (${decision.player.actorName || decision.player.name})` : ''} — raw: "${raw.trim().slice(0, 80)}"`,
+		)
+		return decision
+	} catch (e) {
+		console.error('FoundryAI | orchestrator decision call failed:', e)
+		return { type: 'wait' }
+	}
+}
+
+/**
+ * Resolve which model (and optionally provider) runs the orchestrator's own triage
+ * decision. Defaults to the DM's Chat Model/provider, same as before — but the
+ * Orchestrator Model setting lets this specific, high-frequency, low-stakes call be
+ * pointed at something fast/lightweight, separate from a heavier "thinking" model
+ * you'd rather reserve for actual DM narration and full chat turns. Only used when
+ * BOTH a provider and a model override are set and the provider still exists; a
+ * lone model override (no provider picked) runs against the default configured chat
+ * provider instead of guessing.
+ */
+function resolveOrchestratorModel(): { model: string; provider?: ProviderConfig } {
+	const overrideModel = getSetting('orchestratorModel')?.trim()
+	const overrideProviderId = getSetting('orchestratorProviderId')?.trim()
+
+	if (overrideProviderId && overrideModel) {
+		const providers = (getSetting('apiProviders') || []) as ApiProvider[]
+		const found = providers.find(p => p.id === overrideProviderId)
+		if (found) {
+			return { model: overrideModel, provider: { baseUrl: found.baseUrl, apiKey: found.apiKey } }
+		}
+		console.warn(
+			`FoundryAI | Orchestrator provider "${overrideProviderId}" not found in API Providers — falling back to the main DM Chat Model/provider.`,
+		)
+	} else if (overrideModel) {
+		return { model: overrideModel }
+	}
+
+	return { model: getSetting('chatModel') || '' }
+}
+
+function buildOrchestratorPrompt(
+	players: AIPlayerConfig[],
+	dmEligible: boolean,
+	dmJustPassed = false,
+	hiddenNames: string[] = [],
+): string {
+	// One unified cast: characters and the DM are entries on the same menu, and
+	// whoever spoke recently (including the DM) simply isn't listed. Anything
+	// not on the menu is an invalid answer — the parser substitutes it away.
+	const cast = [
+		...players.map(p => `- ${p.actorName || p.name}`),
+		...(dmEligible ? ['- DM   (a short beat of scene narration or NPC dialogue)'] : []),
+	].join('\n') || '(nobody is available this round)'
+
+	return `You're quietly watching a tabletop RPG session as an assistant director — you don't post anything yourself, you just decide who acts next based on the recent chat below.
+
+## Cast — who may act next. ONLY these are valid picks:
+${cast}
+${hiddenNames.length > 0 ? `\n(${hiddenNames.join(', ')} spoke recently and ${hiddenNames.length === 1 ? 'is' : 'are'} resting this round — naming them is invalid.)\n` : ''}${dmJustPassed ? `\n**The DM just looked at this moment and declined to narrate** — it needs a character to act, not more scene-setting. Pick a character from the cast if at all plausible; WAIT only if truly nobody fits.\n` : ''}
+## Decide
+Who from the cast would most naturally act or speak next? Prefer a character reacting over DM narration when both are plausible — narration is seasoning, not the meal. If truly nothing should happen (or this is a human's moment), wait.
+
+## Your Answer — respond with EXACTLY ONE line, nothing else:
+- ACTOR: <name>   (one character's exact name from the cast above)
+${dmEligible ? '- DM   (just the word DM, when the DM should narrate a beat)\n' : ''}- WAIT   (just the word WAIT, when nothing should happen)`
+}
+
+function parseOrchestratorDecision(
+	raw: string,
+	players: AIPlayerConfig[],
+	dmEligible = true,
+	allEnabled: AIPlayerConfig[] = players,
+	pressure: SpotlightPressure = { counts: new Map(), overdue: [] },
+): OrchestratorDecision {
+	// Strip leading list markers before parsing: models frequently echo the
+	// answer-format bullet ("- DM", "- WAIT", "- ACTOR: Kale"), which otherwise
+	// only parses correctly by fuzzy-match luck (and "- DM"/"- WAIT" not at all).
+	const firstLine = ((raw || '').trim().split('\n')[0]?.trim() ?? '').replace(/^[-*•\d.)\s]+/, '')
+
+	/**
+	 * The model named someone who exists but isn't on the menu (rotation-hidden),
+	 * or asked for a DM beat the DM can't have. It clearly wants SOMEONE to act —
+	 * honoring that intent with the most overdue eligible entry keeps the scene
+	 * moving; mapping it to WAIT (the old behavior) turned every anchored pick
+	 * into a DM narration beat and drowned the table.
+	 */
+	const substitute = (wantedLabel: string): OrchestratorDecision => {
+		const fallback = pickMostOverdue(players, pressure)
+		if (fallback) {
+			console.log(
+				`FoundryAI | orchestrator named "${wantedLabel}" (not on the menu) — substituting most-overdue "${fallback.actorName || fallback.name}".`,
+			)
+			return { type: 'actor', player: fallback }
+		}
+		if (dmEligible) {
+			console.log(`FoundryAI | orchestrator named "${wantedLabel}" (not on the menu) — no eligible player, substituting DM.`)
+			return { type: 'dm' }
+		}
+		return { type: 'wait' }
+	}
+
+	const matchPlayer = (pool: AIPlayerConfig[], wanted: string): AIPlayerConfig | undefined =>
+		pool.find(p => (p.actorName || p.name).trim().toLowerCase() === wanted) ??
+		pool.find(p => {
+			const name = (p.actorName || p.name).trim().toLowerCase()
+			return name.includes(wanted) || wanted.includes(name)
+		})
+
+	if (/^(the )?(dm|dungeon master|narrator)\b/i.test(firstLine)) {
+		return dmEligible ? { type: 'dm' } : substitute('DM')
+	}
+	if (/^WAIT\b/i.test(firstLine)) return { type: 'wait' }
+
+	// Accept "ACTOR: Name", "NEXT: Name", or a bare name on the first line.
+	const prefixMatch = firstLine.match(/^(?:ACTOR|NEXT)\s*:\s*(.+)$/i)
+	const wanted = (prefixMatch ? prefixMatch[1] : firstLine).trim().toLowerCase()
+	if (!wanted) return { type: 'wait' }
+
+	// Models conflate the answer formats ("ACTOR: DM", "ACTOR: WAIT") — honor intent.
+	if (/^(the )?(dm|dungeon master|narrator)$/.test(wanted)) {
+		return dmEligible ? { type: 'dm' } : substitute('DM')
+	}
+	if (/^(wait|nobody|no ?one|none)$/.test(wanted)) return { type: 'wait' }
+
+	const eligible = matchPlayer(players, wanted)
+	if (eligible) return { type: 'actor', player: eligible }
+
+	// Named a real character who is rotation-hidden → substitute, don't stall.
+	const hidden = matchPlayer(allEnabled, wanted)
+	if (hidden) return substitute(hidden.actorName || hidden.name)
+
+	// Only for prefixed answers do we treat garbage as "wanted a player":
+	// a bare unparseable line could be anything, so wait is safer there.
+	if (prefixMatch) return substitute(prefixMatch[1].trim())
+	return { type: 'wait' }
+}
+
+// ---- AI player turn ----
+
+async function runPlayerTurn(player: AIPlayerConfig, recentChat: string): Promise<void> {
 	const providers = (getSetting('apiProviders') || []) as ApiProvider[]
 	const provider = providers.find(p => p.id === player.providerId)
 	if (!provider) {
@@ -182,10 +693,7 @@ async function runPlayerDecision(player: AIPlayerConfig): Promise<void> {
 		return
 	}
 
-	const recentChat = getRecentChatLines(CONTEXT_MESSAGE_LIMIT)
-	if (!recentChat) return
-
-	const systemPrompt = buildDecisionPrompt(player)
+	const systemPrompt = buildPlayerTurnPrompt(player)
 	const tools = getPlayerToolset()
 
 	const messages: LLMMessage[] = [
@@ -203,7 +711,7 @@ async function runPlayerDecision(player: AIPlayerConfig): Promise<void> {
 			messages,
 			tools: tools.length ? tools : undefined,
 			temperature: 0.85,
-			max_tokens: 500,
+			max_tokens: TURN_MAX_TOKENS,
 		})
 
 		const choice = response.choices?.[0]
@@ -231,25 +739,23 @@ async function runPlayerDecision(player: AIPlayerConfig): Promise<void> {
 	if (!finalRaw) {
 		// Ran out of tokens (or errored quietly) without producing anything — NOT the same as an
 		// intentional pass. Smaller/local models are prone to this when they ramble past their
-		// budget instead of following "output only the line(s), or the sentinel." Surface it as a
-		// warning so it's diagnosable instead of looking identical to a deliberate NO_RESPONSE.
+		// budget instead of following "output only the line(s), or the sentinel."
 		console.warn(
-			`FoundryAI | AI player "${player.name}" produced no content (finish_reason: ${finishReason ?? 'unknown'}) — treating as pass, but this likely means it ran out of tokens rather than deciding to stay quiet. Consider raising max_tokens further or checking the model's output.`,
+			`FoundryAI | AI player "${player.name}" produced no content (finish_reason: ${finishReason ?? 'unknown'}) — likely ran out of tokens rather than having nothing to say.`,
 		)
 		return
 	}
 
-	if (finalRaw.toUpperCase() === PASS_SENTINEL) {
-		console.log(`FoundryAI | AI player "${player.name}" chose not to respond.`)
+	if (isSentinel(finalRaw, PASS_SENTINEL)) {
+		console.log(`FoundryAI | AI player "${player.name}" was called on but chose not to respond.`)
 		return
 	}
 
 	if (looksLikeLeakedToolCallOrMeta(finalRaw)) {
-		// The shared recoverLeakedToolCalls in openrouter-service.ts already converts most
-		// leaked tool-call syntax into real tool_calls before we ever see it — this is a
-		// last-resort net for anything that slips through (or a model narrating *about*
-		// calling a tool instead of actually calling it), so it never gets posted to chat
-		// looking like the character said it.
+		// The shared recoverLeakedToolCalls in openrouter-service.ts already converts most leaked
+		// tool-call syntax into real tool_calls before we ever see it — this is a last-resort net
+		// for anything that slips through (or a model narrating *about* calling a tool instead of
+		// actually calling it), so it never gets posted to chat looking like the character said it.
 		console.warn(
 			`FoundryAI | AI player "${player.name}" produced tool-call-looking or meta text instead of dialogue — discarding: ${finalRaw.slice(0, 200)}`,
 		)
@@ -259,7 +765,30 @@ async function runPlayerDecision(player: AIPlayerConfig): Promise<void> {
 	await postAsPlayer(player, finalRaw)
 }
 
-/** Bare JSON, or text narrating ABOUT calling a function rather than being in-character dialogue. */
+function buildPlayerTurnPrompt(player: AIPlayerConfig): string {
+	// Leaner than the full roleplay prompt on purpose: this uses its own small, purpose-built
+	// toolset (see getPlayerToolset), so the DM-facing tool-calling workflow rules and @UUID
+	// citation/formatting rules (meant for full DM/roleplay turns with the 70+ tool suite) are
+	// dropped to save tokens and avoid confusing smaller/local models with instructions that
+	// describe tools they don't actually have.
+	const persona = buildActorRoleplayPrompt(
+		{ actorId: player.actorId, actorName: player.actorName || player.name },
+		{ includeTools: false, includeFormatting: false },
+	)
+	const extra = player.systemPromptOverride?.trim()
+		? `\n\n## Additional Direction\n${player.systemPromptOverride.trim()}`
+		: ''
+	return `${persona}${extra}\n\n${PLAYER_TURN_INSTRUCTIONS}`
+}
+
+/**
+ * Bare JSON, text narrating ABOUT calling a function, or — the more common failure
+ * with smaller/local models — the model narrating ABOUT writing its reply instead of
+ * just writing it ("Since Kale needs to react, I will write...", numbered lists of
+ * options, self-captioned "Kale: ..." speaker labels, or the same paragraph repeated
+ * several times in a loop). None of that is in-character dialogue and none of it
+ * should ever reach the table, so this is checked before every post.
+ */
 function looksLikeLeakedToolCallOrMeta(text: string): boolean {
 	const trimmed = text.trim()
 
@@ -272,13 +801,61 @@ function looksLikeLeakedToolCallOrMeta(text: string): boolean {
 		}
 	}
 
-	return /\b(call (another |the )?function|function call|tool.?call)\b/i.test(trimmed)
+	if (/\b(call (another |the )?function|function call|tool.?call)\b/i.test(trimmed)) return true
+
+	// The model narrating about the act of replying instead of just replying.
+	if (
+		/\b(we need to reply as|since you need to|your thought process|let'?s craft|i will add something|the decision is yours|make your choice|as (the )?(dm|dungeon master|narrator))\b/i.test(
+			trimmed,
+		)
+	) {
+		return true
+	}
+
+	// A numbered list of 2+ options ("1. Cast a spell ... 2. Try to ...") is the DM
+	// presenting choices, not a single character's own line.
+	if (/\b1\.\s[\s\S]{5,80}?\b2\.\s/.test(trimmed)) return true
+
+	// The character captioning their own line with a speaker label ("Kale: ...")
+	// more than once — a script-format leak, not natural first-person dialogue.
+	const speakerLabelMatches = trimmed.match(/\b[A-Z][a-z]+:\s/g)
+	if (speakerLabelMatches && speakerLabelMatches.length >= 2) return true
+
+	// The same chunk of text repeated verbatim — a local-model repetition loop, not a real reply.
+	if (hasRepeatedChunk(trimmed)) return true
+
+	return false
+}
+
+/** True if any 60-char window of the text recurs verbatim elsewhere in it — a cheap repetition-loop detector. */
+function hasRepeatedChunk(text: string, chunkLen = 60): boolean {
+	if (text.length < chunkLen * 2) return false
+	const seen = new Set<string>()
+	for (let i = 0; i + chunkLen <= text.length; i += chunkLen) {
+		const chunk = text.slice(i, i + chunkLen)
+		if (seen.has(chunk)) return true
+		seen.add(chunk)
+	}
+	return false
+}
+
+async function postAsPlayer(player: AIPlayerConfig, content: string): Promise<void> {
+	const actor = game.actors?.get(player.actorId)
+	const speaker = actor ? ChatMessage.getSpeaker({ actor }) : { alias: player.name }
+
+	await ChatMessage.create({
+		content,
+		speaker,
+		flags: { [MODULE_ID]: { aiPlayerId: player.id, automated: true } },
+	})
+
+	console.log(`FoundryAI | AI player "${player.actorName || player.name}" spoke up.`)
 }
 
 /** Resolve the tool list available to AI players — respects the global "Enable Tool Calling" setting. */
 function getPlayerToolset(): ToolDefinition[] {
 	if (!getSetting('enableTools')) return []
-	return [...getToolsByNames(SHARED_TOOL_NAMES), ...PLAYER_NOTES_TOOLS]
+	return [...getToolsByNames(PLAYER_SHARED_TOOL_NAMES), ...PLAYER_NOTES_TOOLS]
 }
 
 /** Dispatch a tool call — personal notes tools are handled locally; everything else goes through the shared executor. */
@@ -287,7 +864,93 @@ async function executePlayerTool(player: AIPlayerConfig, call: ToolCall): Promis
 	if (name === 'read_my_notes' || name === 'write_my_notes') {
 		return await executeNotesTool(player, name, call.function.arguments)
 	}
-	return await executeTool(call)
+	return await executeTool(call, { playerScoped: true })
+}
+
+// ---- Autonomous DM narration ----
+
+/** Returns true if a narration beat was actually posted, false on a pass/discard. */
+async function runAutonomousDMNarration(recentChat: string): Promise<boolean> {
+	if (!openRouterService.isConfigured) {
+		console.warn('FoundryAI | Autonomous DM narration: no API provider configured — skipping.')
+		return false
+	}
+
+	const model = getSetting('chatModel')
+	if (!model) return false
+
+	const basePrompt = buildSystemPrompt({ includeTools: false, includeFormatting: false })
+	const systemPrompt = `${basePrompt}\n\n${DM_NARRATION_INSTRUCTIONS}`
+	const tools = getSetting('enableTools') ? getToolsByNames(DM_LOOKUP_TOOL_NAMES) : []
+
+	const messages: LLMMessage[] = [
+		{ role: 'system', content: systemPrompt },
+		{ role: 'user', content: `## Recent Chat\n${recentChat}` },
+	]
+
+	let finalRaw = ''
+
+	for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+		const response = await openRouterService.chatCompletion({
+			model,
+			messages,
+			tools: tools.length ? tools : undefined,
+			temperature: getSetting('temperature') ?? 0.8,
+			max_tokens: TURN_MAX_TOKENS,
+		})
+
+		const choice = response.choices?.[0]
+		const message = choice?.message
+
+		// Lookup rounds: execute journal reads and let the model continue.
+		if (message?.tool_calls?.length && round < MAX_TOOL_ROUNDS) {
+			messages.push({ role: 'assistant', content: message.content ?? null, tool_calls: message.tool_calls })
+			for (const call of message.tool_calls) {
+				let result: string
+				try {
+					result = await executeTool(call)
+				} catch (e: any) {
+					result = JSON.stringify({ error: e?.message || 'Tool execution failed' })
+				}
+				messages.push({ role: 'tool', content: result, tool_call_id: call.id })
+			}
+			continue
+		}
+
+		finalRaw = (message?.content ?? '').trim()
+
+		// If the service fell back to a tools-free retry, the in-fiction notice was
+		// prepended for chat-window display — it isn't narration, strip it.
+		if (response._toolsFallback && finalRaw.startsWith(TOOLS_UNSUPPORTED_NOTICE.trim())) {
+			finalRaw = finalRaw.slice(TOOLS_UNSUPPORTED_NOTICE.trim().length).trim()
+		}
+		break
+	}
+
+	if (!finalRaw || isSentinel(finalRaw, 'WAIT')) {
+		console.log('FoundryAI | Autonomous DM: decided not to narrate this round.')
+		return false
+	}
+	if (looksLikeLeakedToolCallOrMeta(finalRaw)) {
+		console.warn(`FoundryAI | Autonomous DM: produced meta/non-narration text — discarding: ${finalRaw.slice(0, 200)}`)
+		return false
+	}
+
+	await ChatMessage.create({
+		content: finalRaw,
+		flags: { [MODULE_ID]: { automated: true, autonomousDM: true } },
+	})
+	console.log('FoundryAI | Autonomous DM: posted a narration beat.')
+	return true
+}
+
+/**
+ * Tolerant sentinel match: models rarely emit a bare sentinel — they wrap it in
+ * quotes, asterisks, or punctuation ("NO_RESPONSE.", *WAIT*). Exact equality
+ * misses those and the wrapper text would get posted to the table as dialogue.
+ */
+function isSentinel(text: string, sentinel: string): boolean {
+	return new RegExp(`^["'\`*\\s]*${sentinel}["'\`*.!\\s]*$`, 'i').test(text.trim())
 }
 
 // ---- Personal Notes Journal ----
@@ -345,46 +1008,27 @@ async function executeNotesTool(player: AIPlayerConfig, toolName: string, argsJs
 	return JSON.stringify({ success: true, message: 'Saved to your personal notes.' })
 }
 
-function buildDecisionPrompt(player: AIPlayerConfig): string {
-	// Leaner than the full roleplay prompt on purpose: this uses its own small, purpose-built
-	// toolset (see getPlayerToolset), so the DM-facing tool-calling workflow rules and @UUID
-	// citation/formatting rules (meant for full DM/roleplay turns with the 70+ tool suite) are
-	// dropped to save tokens and avoid confusing smaller/local models with instructions that
-	// describe tools they don't actually have.
-	const persona = buildActorRoleplayPrompt(
-		{ actorId: player.actorId, actorName: player.actorName || player.name },
-		{ includeTools: false, includeFormatting: false },
-	)
-	const extra = player.systemPromptOverride?.trim()
-		? `\n\n## Additional Direction\n${player.systemPromptOverride.trim()}`
-		: ''
-	return `${persona}${extra}\n\n${DECISION_INSTRUCTIONS}`
-}
-
-async function postAsPlayer(player: AIPlayerConfig, content: string): Promise<void> {
-	const actor = game.actors?.get(player.actorId)
-	const speaker = actor ? ChatMessage.getSpeaker({ actor }) : { alias: player.name }
-
-	await ChatMessage.create({
-		content,
-		speaker,
-		flags: { [MODULE_ID]: { aiPlayerId: player.id } },
-	})
-
-	console.log(`FoundryAI | AI player "${player.name}" spoke up.`)
-}
-
 // ---- Chat log helpers ----
 
 function getRecentChatLines(limit: number): string {
 	const all = game.messages?.contents ?? []
-	const recent = all.slice(-limit)
 	const lines: string[] = []
 
-	for (const m of recent) {
+	// Walk backwards collecting up to `limit` usable lines, so filtered-out
+	// messages (whispers etc.) don't shrink the context window.
+	for (let i = all.length - 1; i >= 0 && lines.length < limit; i--) {
+		const m = all[i]
+
+		// SECURITY: this runs on the GM client, which sees everything — whispers,
+		// GM-only rolls, blind messages. None of that may reach AI player or
+		// orchestrator prompts, or an AI character can "know" (and blurt out)
+		// secrets the DM whispered to someone else.
+		if (((m as any).whisper?.length ?? 0) > 0) continue
+		if ((m as any).blind) continue
+
 		const text = stripHtml(m.content || '').trim()
 		if (!text) continue
-		lines.push(`${resolveSpeakerName(m)}: ${text}`)
+		lines.unshift(`${resolveSpeakerName(m)}: ${text}`)
 	}
 
 	return lines.join('\n')

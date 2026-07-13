@@ -100,6 +100,10 @@ export interface ChatCompletionResponse {
 		total_tokens: number
 		cost?: number
 	}
+	/** Set when the provider rejected the tools and the request was retried without
+	 *  them — callers whose logic depends on tool calls (e.g. the autonomous DM
+	 *  branch) can detect this and switch to a text-mode strategy. */
+	_toolsFallback?: boolean
 }
 
 export interface StreamingChunk {
@@ -188,7 +192,7 @@ const DEFAULT_PROVIDER: ProviderConfig = { baseUrl: OPENROUTER_BASE, apiKey: '' 
  * tool-calling template and LM Studio's Jinja render fails). We retry once
  * without tools and prepend this so the user knows why the AI has no hands.
  */
-const TOOLS_UNSUPPORTED_NOTICE =
+export const TOOLS_UNSUPPORTED_NOTICE =
 	"> ⚠️ *The summoned spirit peers into your enchanted toolbox and shrugs — this model does not understand FoundryAI's tools, so it answers with words alone. Bind a tool-trained model (Qwen, Llama, or Mistral Instruct serve well) to give it hands.*\n\n"
 
 export class OpenRouterService {
@@ -377,12 +381,13 @@ export class OpenRouterService {
 			}
 		}
 
-		const result = await response.json()
-		const message = result.choices?.[0]?.message
+		let result = await response.json()
+		let message = result.choices?.[0]?.message
 
 		if (toolsFallback && message) {
 			// Tools were never offered on the retry, so skip tool-call recovery and
 			// tell the user (in-fiction) why the AI answered without acting.
+			result._toolsFallback = true
 			message.content = TOOLS_UNSUPPORTED_NOTICE + (message.content || '')
 			console.log('FoundryAI | API chatCompletion response (tools-free fallback):', {
 				model: result.model,
@@ -392,9 +397,52 @@ export class OpenRouterService {
 			return result
 		}
 
+		// Reasoning/"thinking" models (Gemma-QAT via LM Studio, DeepSeek-R1 style, etc.) spend
+		// their max_tokens budget on an internal deliberation the API surfaces separately as
+		// reasoning_content — but that deliberation still counts against the same token cap, and
+		// for small budgets (the ~60-500 tokens our decision/turn calls use) the model can burn the
+		// *entire* budget still "thinking" and never emit an actual answer or tool call at all.
+		// That looks identical to "the model had nothing to say," but it isn't — it just ran out of
+		// room mid-thought. Detected as: empty content, no tool calls, finish_reason 'length', and
+		// non-empty reasoning_content/reasoning. Retried once with a much larger budget so the model
+		// gets to actually finish. Only worth retrying if the original budget was small enough that
+		// more room plausibly helps (a model still empty-handed at 2000+ tokens has bigger problems).
+		const finishReason = result.choices?.[0]?.finish_reason
+		const reasoningText: string = message?.reasoning_content || message?.reasoning || ''
+		const isReasoningTruncation =
+			!!message && !message.content && !message.tool_calls?.length && finishReason === 'length' && !!reasoningText.trim()
+		const originalMaxTokens = body.max_tokens || 0
+
+		if (isReasoningTruncation && originalMaxTokens > 0 && originalMaxTokens < 3000) {
+			const retryMaxTokens = Math.min(Math.max(originalMaxTokens * 4, 1500), 4000)
+			console.warn(
+				`FoundryAI | Model spent its entire ${originalMaxTokens}-token budget "thinking" (reasoning_content: ${reasoningText.length} chars) without producing an answer — retrying once with max_tokens: ${retryMaxTokens}`,
+			)
+
+			const retryBody: ChatCompletionRequest = { ...body, max_tokens: retryMaxTokens }
+			const retryResponse = await fetch(`${providerConfig.baseUrl}/chat/completions`, {
+				method: 'POST',
+				headers: this.headersFor(providerConfig),
+				body: JSON.stringify(retryBody),
+				signal,
+			})
+
+			if (retryResponse.ok) {
+				result = await retryResponse.json()
+				message = result.choices?.[0]?.message
+			} else {
+				const retryErrMsg = await this.readErrorMessage(retryResponse)
+				console.warn(`FoundryAI | Reasoning-budget retry failed (${retryResponse.status}): ${retryErrMsg} — falling back to the original (empty) response`)
+			}
+		}
+
 		// Recover tool calls the server failed to structure before we ever log/return —
 		// otherwise this looks identical to the model just giving up with an empty answer.
-		if (message && !message.tool_calls?.length) {
+		// ONLY when the request actually offered tools: on a tool-less request there is
+		// nothing to recover, and the patterns can false-positive on legitimate content
+		// (seen: the orchestrator's bare "DM" answer "recovered" into a phantom tool
+		// call named DM, nulling the real answer).
+		if (body.tools?.length && message && !message.tool_calls?.length) {
 			const recovered = this.recoverLeakedToolCalls(message.content || message.reasoning_content || message.reasoning || '')
 			if (recovered) {
 				console.warn('FoundryAI | Recovered tool call the server failed to structure:', recovered.map(tc => tc.function.name))

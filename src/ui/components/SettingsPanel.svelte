@@ -133,6 +133,17 @@
     embeddingService.getStats().then(stats => {
       if (stats) indexStats = { totalVectors: stats.totalVectors, documents: stats.totalDocuments };
     });
+
+    // Auto-populate the model dropdowns for already-saved providers so the
+    // window opens ready to use — previously the lists only loaded when a
+    // provider dropdown CHANGED, forcing a pointless toggle every time.
+    // setTimeout(0) keeps these state writes out of this effect's tracking.
+    setTimeout(() => {
+      if (chatProvider) loadModelsForType('chat', chatProvider);
+      if (embeddingProvider) loadModelsForType('embedding', embeddingProvider);
+      if (visionProvider) loadModelsForType('vision', visionProvider);
+      if (ttsProvider) loadModelsForType('tts', ttsProvider);
+    }, 0);
   });
 
   // ---- Provider Management ----
@@ -434,7 +445,18 @@
       {#snippet modelProviderSelect(label: string, modelId: string, providerId: string, loading: boolean, models: ModelInfo[], filter: string, placeholder: string, onProviderChange: (id: string) => void, onModelChange: (v: string) => void, onFilterChange: (v: string) => void)}
         <div class="model-row">
           <div class="model-provider-field">
-            <label>{label}</label>
+            <div class="model-label-row">
+              <label>{label}</label>
+              <button
+                type="button"
+                class="model-refresh"
+                title="Reload the model list from this provider"
+                disabled={!providerId || loading}
+                onclick={() => onProviderChange(providerId)}
+              >
+                <i class="fas fa-sync-alt"></i>
+              </button>
+            </div>
             <select value={providerId} onchange={(e) => onProviderChange((e.target as HTMLSelectElement).value)}>
               <option value="">— Provider —</option>
               {#each providers as p (p.id)}
@@ -1087,6 +1109,31 @@
   }
 
   .comfy-url-row input { flex: 1; }
+
+  .model-label-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .model-refresh {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0 4px;
+    width: auto;
+    line-height: 1;
+    opacity: 0.65;
+  }
+
+  .model-refresh:hover:not(:disabled) {
+    opacity: 1;
+  }
+
+  .model-refresh:disabled {
+    opacity: 0.25;
+    cursor: default;
+  }
 
   .comfy-hint {
     font-size: 0.78em;

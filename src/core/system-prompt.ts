@@ -16,11 +16,20 @@ export interface ActorRoleplayContext {
 	actorName: string
 }
 
+export interface SystemPromptOptions {
+	/** Include the tool-calling procedural rules (full 70+ tool workflow, folder routing, @UUID citation rules, etc). Default true. */
+	includeTools?: boolean
+	/** Include the markdown/@UUID response-formatting rules. Default true. */
+	includeFormatting?: boolean
+}
+
 /**
  * Build the full system prompt, injecting campaign context from the current
  * Foundry world state.
  */
-export function buildSystemPrompt(): string {
+export function buildSystemPrompt(options: SystemPromptOptions = {}): string {
+	const { includeTools = true, includeFormatting = true } = options
+
 	// Check for user override
 	const override = getSetting('systemPromptOverride')
 	if (override && override.trim().length > 0) {
@@ -30,19 +39,25 @@ export function buildSystemPrompt(): string {
 
 	const sections: string[] = [BASE_PROMPT]
 
-	// Inject world context
-	const worldContext = getWorldContext()
+	// Inject world context. The full DM indexes (journal/actor inventories, inlined
+	// notes) are only meaningful alongside the tool-calling workflow they're built
+	// for, so they're tied to includeTools — a lean narration-only prompt gets the
+	// small, cheap slice (world/scene/combat/party) and relies on search_journals/
+	// get_journal to look things up on demand instead.
+	const worldContext = getWorldContext({ full: includeTools })
 	if (worldContext) {
 		sections.push(worldContext)
 	}
 
 	// Add tool usage instructions if tools are enabled
-	if (getSetting('enableTools')) {
+	if (includeTools && getSetting('enableTools')) {
 		sections.push(TOOL_INSTRUCTIONS)
 	}
 
 	// Add formatting instructions
-	sections.push(FORMATTING_INSTRUCTIONS)
+	if (includeFormatting) {
+		sections.push(FORMATTING_INSTRUCTIONS)
+	}
 
 	const prompt = sections.join('\n\n')
 	console.log(
@@ -71,8 +86,12 @@ export function buildActorRoleplayPrompt(actor: ActorRoleplayContext, options: A
 	const actorPrompt = buildActorPersonality(actor)
 	sections.push(actorPrompt)
 
-	// Inject world context so the actor knows the campaign
-	const worldContext = getWorldContext()
+	// Inject world context so the actor knows the campaign. Lean by default here too
+	// (see buildSystemPrompt) — full DM indexes (every journal, every actor including
+	// Spoilers, the DM's private notes) are a visibility-wall leak for a player-
+	// perspective actor as much as they are token bloat, so they're gated behind
+	// includeTools same as the DM prompt.
+	const worldContext = getWorldContext({ full: includeTools })
 	if (worldContext) {
 		sections.push(worldContext)
 	}
@@ -230,7 +249,23 @@ export function buildLightSystemPrompt(): string {
 
 // ---- Context Gathering ----
 
-function getWorldContext(): string | null {
+/**
+ * `full=true` includes the DM-oriented indexes (every journal, every actor
+ * including Spoilers-folder content, and the DM's inlined curated notes) —
+ * appropriate for the main DM prompt and full NPC-roleplay-with-tools
+ * sessions, where a human DM is driving and those indexes are what the
+ * tool-calling workflow (search_journals/get_journal/search_actors, etc.)
+ * is built around. `full=false` drops all three: they're both the biggest
+ * chunk of prompt bloat for smaller/local models and, worse, a visibility-
+ * wall leak — an "Available Actors" list includes Spoilers-folder content,
+ * and Campaign Notes are the DM's private plot-state bullets, neither of
+ * which a player-perspective actor should see. Used for AI player turns and
+ * autonomous DM narration beats, both of which lean on search_journals/
+ * get_journal to look something up on demand rather than needing the full
+ * index preloaded.
+ */
+function getWorldContext(options: { full?: boolean } = {}): string | null {
+	const { full = true } = options
 	const parts: string[] = []
 
 	// World info
@@ -280,38 +315,40 @@ function getWorldContext(): string | null {
 		/* ignore */
 	}
 
-	// Available journals inventory
-	try {
-		const journalIndex = getJournalInventory()
-		if (journalIndex) {
-			parts.push(journalIndex)
+	if (full) {
+		// Available journals inventory
+		try {
+			const journalIndex = getJournalInventory()
+			if (journalIndex) {
+				parts.push(journalIndex)
+			}
+		} catch {
+			/* ignore */
 		}
-	} catch {
-		/* ignore */
-	}
 
-	// Available actors inventory — TOOL_INSTRUCTIONS rule 15 and the
-	// list_actors_in_folder guidance both reference this section, so it must
-	// actually be injected here.
-	try {
-		const actorIndex = getActorInventory()
-		if (actorIndex) {
-			parts.push(actorIndex)
+		// Available actors inventory — TOOL_INSTRUCTIONS rule 15 and the
+		// list_actors_in_folder guidance both reference this section, so it must
+		// actually be injected here.
+		try {
+			const actorIndex = getActorInventory()
+			if (actorIndex) {
+				parts.push(actorIndex)
+			}
+		} catch {
+			/* ignore */
 		}
-	} catch {
-		/* ignore */
-	}
 
-	// Campaign notes — short, curated plot-state bullets only (see getNotesContent).
-	// Long entries are listed by name/ID instead of dumped, so a single oversized
-	// note can't blow up every prompt the way a full PDF-derived note used to.
-	try {
-		const notesContent = getNotesContent()
-		if (notesContent) {
-			parts.push(notesContent)
+		// Campaign notes — short, curated plot-state bullets only (see getNotesContent).
+		// Long entries are listed by name/ID instead of dumped, so a single oversized
+		// note can't blow up every prompt the way a full PDF-derived note used to.
+		try {
+			const notesContent = getNotesContent()
+			if (notesContent) {
+				parts.push(notesContent)
+			}
+		} catch {
+			/* ignore */
 		}
-	} catch {
-		/* ignore */
 	}
 
 	if (parts.length === 0) return null

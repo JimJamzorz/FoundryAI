@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { openRouterService, type ModelInfo } from '@core/openrouter-service';
   import { getSetting, setSetting, type ApiProvider, type AIPlayerConfig } from '../../settings';
 
@@ -12,7 +13,16 @@
   let providers = $state<ApiProvider[]>([]);
   let players = $state<AIPlayerConfig[]>([]);
   let humanCap = $state(5);
+  let orchestrationEnabled = $state(false);
+  let keepSceneMoving = $state(false);
   let isSaving = $state(false);
+
+  // Orchestrator model override — optional, separate from the DM's main Chat Model.
+  let orchestratorProviderId = $state('');
+  let orchestratorModel = $state('');
+  let orchestratorModels = $state<ModelInfo[]>([]);
+  let orchestratorFilter = $state('');
+  let orchestratorLoadingModels = $state(false);
 
   // Per-player model browsing state, keyed by player id.
   let modelsByPlayer = $state<Record<string, ModelInfo[]>>({});
@@ -22,13 +32,23 @@
   const byName = (a: ModelInfo, b: ModelInfo) => (a.name ?? a.id).localeCompare(b.name ?? b.id);
 
   // ---- Load current settings ----
-  $effect(() => {
+  onMount(() => {
     try {
       providers = (getSetting('apiProviders') || []) as ApiProvider[];
       const saved = (getSetting('aiPlayers') || []) as AIPlayerConfig[];
       // Clone so in-progress edits don't mutate the stored setting until Save.
       players = saved.map(p => ({ ...p }));
       humanCap = getSetting('aiPlayerHumanCap') ?? 5;
+      orchestrationEnabled = getSetting('aiOrchestrationEnabled') ?? false;
+      keepSceneMoving = getSetting('aiKeepSceneMoving') ?? false;
+      orchestratorProviderId = getSetting('orchestratorProviderId') ?? '';
+      orchestratorModel = getSetting('orchestratorModel') ?? '';
+      if (orchestratorProviderId) loadOrchestratorModels(orchestratorProviderId);
+      // Auto-populate each configured player's model list too, so the window
+      // opens usable without re-toggling every provider dropdown.
+      for (const p of players) {
+        if (p.providerId) loadModelsForPlayer(p.id, p.providerId);
+      }
     } catch (err) {
       console.error('FoundryAI | PlayerManager: failed to load settings', err);
     }
@@ -110,12 +130,37 @@
     }
   }
 
+  async function loadOrchestratorModels(providerId: string) {
+    const provider = providers.find(p => p.id === providerId);
+    if (!provider) {
+      orchestratorModels = [];
+      return;
+    }
+
+    orchestratorLoadingModels = true;
+    try {
+      const all = await openRouterService.listModels({ baseUrl: provider.baseUrl, apiKey: provider.apiKey });
+      orchestratorModels = all
+        .filter(m => (!m.architecture?.modality || m.architecture.modality.includes('text')) && !m.id.includes('embedding'))
+        .sort(byName);
+      orchestratorFilter = '';
+    } catch (err: any) {
+      ui.notifications.error(`Failed to load models: ${err.message}`);
+    } finally {
+      orchestratorLoadingModels = false;
+    }
+  }
+
   // ---- Save ----
   async function handleSave() {
     isSaving = true;
     try {
       await setSetting('aiPlayers', players);
       await setSetting('aiPlayerHumanCap', humanCap);
+      await setSetting('aiOrchestrationEnabled', orchestrationEnabled);
+      await setSetting('aiKeepSceneMoving', keepSceneMoving);
+      await setSetting('orchestratorProviderId', orchestratorProviderId);
+      await setSetting('orchestratorModel', orchestratorModel);
       ui.notifications.info('AI Players saved!');
       application?.close();
     } catch (err: any) {
@@ -129,13 +174,32 @@
 <div class="player-manager">
   <div class="player-scroll">
     <p class="section-hint">
-      Each AI player is a separate persona pointed at one of your player characters. It gets its own LLM and role
-      prompt. Tool scoping and the personal-knowledge journal come later — right now each one just decides, on
-      chat activity, whether to chime in or stay quiet.
+      Each AI player is a separate persona pointed at one of your player characters, with its own LLM, role prompt,
+      and a personal notes journal it can read/write. A central orchestrator (your DM Chat Model) watches table
+      chat and decides whether a player should react, the DM should narrate a beat, or nothing should happen.
     </p>
 
     <section class="player-card global-settings">
-      <div class="field">
+      <label class="enabled-toggle orchestration-toggle">
+        <input type="checkbox" bind:checked={orchestrationEnabled} />
+        Enable AI Orchestration
+      </label>
+      <small class="field-hint-inline block">
+        Off by default. When on, chat activity can trigger AI players and/or autonomous DM narration without you
+        typing anything — worth understanding before flipping it on mid-session.
+      </small>
+
+      <label class="enabled-toggle orchestration-toggle" style="margin-top: 12px;">
+        <input type="checkbox" bind:checked={keepSceneMoving} disabled={!orchestrationEnabled} />
+        Keep the Scene Moving
+      </label>
+      <small class="field-hint-inline block">
+        A WAIT decision becomes a DM narration beat instead of silence, and if the DM declines to narrate, the
+        orchestrator gets one more chance to pick a player. The table drives itself until the cap below is hit or
+        a human speaks — chattier by design, the cap is the brake.
+      </small>
+
+      <div class="field" style="margin-top: 12px;">
         <label for="human-cap">Human-Interaction Cap</label>
         <input
           id="human-cap"
@@ -145,8 +209,79 @@
           bind:value={humanCap}
         />
         <small class="field-hint-inline block">
-          Max consecutive chat messages from AI players (combined, across all of them) before they go quiet and
-          wait for a human message to break the streak. Stops them from spiraling into talking only to each other.
+          Max consecutive automated messages (AI players + autonomous DM narration, combined) before things go
+          quiet and wait for a human message to break the streak.
+        </small>
+      </div>
+
+      <div class="field" style="margin-top: 12px;">
+        <label for="orch-provider">
+          Orchestrator Model <span class="field-hint-inline">(optional — defaults to your DM Chat Model)</span>
+          <button
+            type="button"
+            class="model-refresh"
+            title="Reload the model list from this provider"
+            disabled={!orchestratorProviderId || orchestratorLoadingModels}
+            onclick={(e) => { e.preventDefault(); loadOrchestratorModels(orchestratorProviderId); }}
+          >
+            <i class="fas fa-sync-alt"></i>
+          </button>
+        </label>
+        <div class="model-row">
+          <div class="model-provider-field">
+            <select
+              id="orch-provider"
+              value={orchestratorProviderId}
+              onchange={(e) => {
+                const id = (e.target as HTMLSelectElement).value;
+                orchestratorProviderId = id;
+                if (id) loadOrchestratorModels(id);
+                else orchestratorModels = [];
+              }}
+            >
+              <option value="">— Use DM Chat Model —</option>
+              {#each providers as p (p.id)}
+                <option value={p.id}>{p.name}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="model-id-field">
+            {#if orchestratorLoadingModels}
+              <div class="model-loading"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
+            {:else if orchestratorModels.length > 0}
+              <input
+                class="model-filter"
+                type="text"
+                value={orchestratorFilter}
+                oninput={(e) => { orchestratorFilter = (e.target as HTMLInputElement).value; }}
+                placeholder="Filter models..."
+              />
+              <select
+                value={orchestratorModel}
+                onchange={(e) => { orchestratorModel = (e.target as HTMLSelectElement).value; }}
+              >
+                <option value="">— Use DM Chat Model —</option>
+                {#each orchestratorModels.filter(m => {
+                  const f = orchestratorFilter.toLowerCase();
+                  return !f || m.id === orchestratorModel || (m.name ?? '').toLowerCase().includes(f) || m.id.toLowerCase().includes(f);
+                }) as m (m.id)}
+                  <option value={m.id}>{m.name ?? m.id} {m.name ? `(${m.id})` : ''}</option>
+                {/each}
+              </select>
+            {:else}
+              <input
+                type="text"
+                value={orchestratorModel}
+                oninput={(e) => { orchestratorModel = (e.target as HTMLInputElement).value; }}
+                placeholder="Leave blank to use your DM Chat Model"
+              />
+            {/if}
+          </div>
+        </div>
+        <small class="field-hint-inline block">
+          Runs on every chat message to decide ACTOR/DM/WAIT — worth pointing at something fast. A heavy "thinking"
+          model can spend more tokens reasoning through this one simple decision than a full DM turn needs, adding
+          latency to every message. Leave blank to just use your DM Chat Model.
         </small>
       </div>
     </section>
@@ -156,7 +291,7 @@
     {/if}
 
     {#each players as player (player.id)}
-      <section class="player-card" class:disabled={!player.enabled}>
+      <section class="player-card" class:player-inactive={!player.enabled}>
         <div class="player-card-header">
           <input
             class="player-name-input"
@@ -209,7 +344,18 @@
             </select>
           </div>
           <div class="model-id-field">
-            <label>Model</label>
+            <label>
+              Model
+              <button
+                type="button"
+                class="model-refresh"
+                title="Reload the model list from this provider"
+                disabled={!player.providerId || loadingByPlayer[player.id]}
+                onclick={(e) => { e.preventDefault(); loadModelsForPlayer(player.id, player.providerId); }}
+              >
+                <i class="fas fa-sync-alt"></i>
+              </button>
+            </label>
             {#if loadingByPlayer[player.id]}
               <div class="model-loading"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
             {:else if (modelsByPlayer[player.id]?.length ?? 0) > 0}
@@ -314,7 +460,10 @@
     margin-bottom: 14px;
   }
 
-  .player-card.disabled {
+  /* Named "player-inactive", not "disabled" — Foundry's own core CSS applies
+     pointer-events: none to any element classed "disabled", which would make the
+     whole card (including the "Active" checkbox meant to re-enable it) unclickable. */
+  .player-card.player-inactive {
     opacity: 0.55;
   }
 
@@ -474,6 +623,26 @@
     font-size: 0.85em;
     opacity: 0.6;
     padding: 8px 0;
+  }
+
+  .model-refresh {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0 4px;
+    width: auto;
+    line-height: 1;
+    opacity: 0.65;
+    font-size: 0.9em;
+  }
+
+  .model-refresh:hover:not(:disabled) {
+    opacity: 1;
+  }
+
+  .model-refresh:disabled {
+    opacity: 0.25;
+    cursor: default;
   }
 
   .model-filter {

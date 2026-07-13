@@ -27,13 +27,25 @@ function getFoundryAIFolderIds(): string[] {
 	return ids
 }
 
-function isJournalFolderAllowed(folderId: string | undefined | null): boolean {
+/**
+ * `includeManaged` (default true) controls whether FoundryAI's own bookkeeping
+ * folders (Chat History, Sessions, Notes, PDFs, the FoundryAI root, etc.) are
+ * automatically allowed. That's correct for the DM's own tool calls — the DM
+ * should always be able to search its own session recaps and past chat logs.
+ * It is NOT correct for AI-player-scoped calls: a player-perspective actor has
+ * no business reading the DM's raw chat transcripts or private curated notes,
+ * regardless of what's in the journalFolders allow-list. Pass
+ * `{ includeManaged: false }` for any tool call made on behalf of an AI player.
+ */
+function isJournalFolderAllowed(folderId: string | undefined | null, opts: { includeManaged?: boolean } = {}): boolean {
+	const { includeManaged = true } = opts
 	const allowed = getSetting('journalFolders') || []
 
-	// Always allow FoundryAI-managed folders
 	if (folderId && getFoundryAIFolderIds().includes(folderId)) {
-		console.debug(`FoundryAI | isJournalFolderAllowed: folderId="${folderId}" is a FoundryAI folder, returning true`)
-		return true
+		console.debug(
+			`FoundryAI | isJournalFolderAllowed: folderId="${folderId}" is a FoundryAI folder, includeManaged=${includeManaged}`,
+		)
+		return includeManaged
 	}
 
 	if (allowed.length === 0) {
@@ -1176,6 +1188,64 @@ const COMPENDIUM_TOOLS: ToolDefinition[] = [
 	{
 		type: 'function',
 		function: {
+			name: 'list_compendiums',
+			description:
+				'List all compendium packs with their pack_id, label, document type, and entry count. Use this to find the pack_id for get_compendium_entry, import_from_compendium, or export_to_compendium.',
+			parameters: {
+				type: 'object',
+				properties: {
+					type: {
+						type: 'string',
+						enum: ['Actor', 'Item', 'JournalEntry', 'RollTable', 'Scene', 'Macro'],
+						description: 'Filter by document type. Omit for all packs.',
+					},
+				},
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'create_compendium',
+			description:
+				'Create a new, empty world-level compendium pack for one document type. Returns the pack_id for export_to_compendium. Use for packaging/archiving content — e.g. collecting generated NPCs, the campaign\'s journals, or extracted adventure content into a reusable pack. World documents stay in the world until exported.',
+			parameters: {
+				type: 'object',
+				properties: {
+					label: { type: 'string', description: 'Display name for the pack, e.g. "Crow\'s Rest NPCs"' },
+					type: {
+						type: 'string',
+						enum: ['Actor', 'Item', 'JournalEntry', 'RollTable', 'Scene', 'Macro'],
+						description: 'The document type this pack holds',
+					},
+				},
+				required: ['label', 'type'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'export_to_compendium',
+			description:
+				'COPY world documents into a compendium pack (originals stay in the world untouched). The pack\'s document type must match: actors into an Actor pack, journals into a JournalEntry pack, etc. Get pack_id from list_compendiums or create_compendium; document ids from the usual list/search tools. Respects the same folder permissions as the read tools.',
+			parameters: {
+				type: 'object',
+				properties: {
+					pack_id: { type: 'string', description: 'Target pack id, e.g. "world.crows-rest-npcs"' },
+					document_ids: {
+						type: 'array',
+						items: { type: 'string' },
+						description: 'World document ids to copy into the pack (all must match the pack\'s type)',
+					},
+				},
+				required: ['pack_id', 'document_ids'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
 			name: 'import_from_compendium',
 			description:
 				'Import a document from a compendium into the world. Useful for importing SRD monsters to then place as tokens.',
@@ -1933,9 +2003,10 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	...PDF_TOOLS,
 ]
 
-export type ToolGroupId = 'all' | 'campaign' | 'world' | 'gameplay' | 'automation'
+export type ToolGroupId = 'none' | 'all' | 'campaign' | 'world' | 'gameplay' | 'automation'
 
 export const TOOL_GROUPS: Array<{ id: ToolGroupId; label: string; description: string }> = [
+	{ id: 'none', label: 'No tools', description: 'Send this message without tools' },
 	{ id: 'all', label: 'All tools', description: 'Every enabled tool' },
 	{ id: 'campaign', label: 'Campaign', description: 'Journals, actors, items, and compendiums' },
 	{ id: 'world', label: 'World & assets', description: 'Scenes, maps, images, PDFs, and spatial tools' },
@@ -1948,6 +2019,7 @@ export const TOOL_GROUPS: Array<{ id: ToolGroupId; label: string; description: s
  * document tools are included in every preset so the model can use world context.
  */
 export function getEnabledTools(group: ToolGroupId = 'all'): ToolDefinition[] {
+	if (group === 'none') return []
 	if (!getSetting('enableTools')) return []
 
 	const tools: ToolDefinition[] = [...CORE_TOOLS]
@@ -2037,7 +2109,7 @@ export function resolveActiveTools(selection: ActiveToolSelection): ToolDefiniti
 
 // ---- Tool Execution ----
 
-export async function executeTool(toolCall: ToolCall): Promise<string> {
+export async function executeTool(toolCall: ToolCall, options: { playerScoped?: boolean } = {}): Promise<string> {
 	const funcName = toolCall.function.name
 	let args: Record<string, any>
 
@@ -2068,11 +2140,11 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 
 			// Core tools
 			case 'search_journals':
-				return await handleSearchJournals(args.query, args.max_results)
+				return await handleSearchJournals(args.query, args.max_results, { playerScoped: options.playerScoped })
 			case 'search_actors':
 				return await handleSearchActors(args.query, args.max_results)
 			case 'get_journal':
-				return handleGetJournal(args.journal_id, args.max_length, args.offset)
+				return handleGetJournal(args.journal_id, args.max_length, args.offset, { playerScoped: options.playerScoped })
 			case 'get_actor':
 				return handleGetActor(args.actor_id)
 			case 'list_actors_in_folder':
@@ -2165,6 +2237,12 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 				return await handlePostChatMessage(args.content, args.speaker_name, args.whisper_to)
 
 			// Compendium tools
+			case 'list_compendiums':
+				return handleListCompendiums(args.type)
+			case 'create_compendium':
+				return await handleCreateCompendium(args.label, args.type)
+			case 'export_to_compendium':
+				return await handleExportToCompendium(args.pack_id, args.document_ids)
 			case 'search_compendium':
 				return await handleSearchCompendium(args.query, args.type, args.max_results)
 			case 'get_compendium_entry':
@@ -2254,6 +2332,12 @@ export async function executeTool(toolCall: ToolCall): Promise<string> {
 			// storage (which may not share a filesystem with the server).
 			case 'read_asset':
 				return await handleReadAsset(args.path)
+			// Bridge-only: backs the MCP server's wait-for-chat long-poll. The server
+			// polls this every couple of seconds while holding the MCP response open,
+			// which is how a pull-only MCP client (Claude Desktop, Codex) gets to
+			// "listen" for table chat.
+			case 'get_chat_since':
+				return handleGetChatSince(args)
 			case 'generate_image':
 				return await handleGenerateImage(args)
 			case 'generate_scene':
@@ -2306,9 +2390,13 @@ async function handleCreateCampaignDashboard(args: any): Promise<string> {
 // CORE TOOL HANDLERS
 // ===============================
 
-async function handleSearchJournals(query: string, maxResults?: number): Promise<string> {
-	console.log(`FoundryAI | search_journals: query="${query}", maxResults=${maxResults}`)
-	const results = await embeddingService.search(query, maxResults || 5, { documentType: 'journal' })
+async function handleSearchJournals(query: string, maxResults?: number, opts: { playerScoped?: boolean } = {}): Promise<string> {
+	console.log(`FoundryAI | search_journals: query="${query}", maxResults=${maxResults}${opts.playerScoped ? ' (player-scoped)' : ''}`)
+	// Over-fetch when player-scoped since some results may get filtered out below —
+	// otherwise a search that happens to surface a Chat History log first could come
+	// back with fewer results than requested instead of backfilling from what's allowed.
+	const fetchCount = opts.playerScoped ? (maxResults || 5) * 3 : maxResults || 5
+	const results = await embeddingService.search(query, fetchCount, { documentType: 'journal' })
 	console.log(`FoundryAI | search_journals: found ${results.length} results`)
 
 	if (results.length === 0) {
@@ -2317,12 +2405,25 @@ async function handleSearchJournals(query: string, maxResults?: number): Promise
 
 	// Deduplicate by document ID — multiple chunks may come from the same journal
 	const seenIds = new Set<string>()
-	const uniqueResults: typeof results = []
+	let uniqueResults: typeof results = []
 	for (const r of results) {
 		if (!seenIds.has(r.entry.documentId)) {
 			seenIds.add(r.entry.documentId)
 			uniqueResults.push(r)
 		}
+	}
+
+	// The vector index has no folder access control of its own — it's built from
+	// whatever was indexed, including FoundryAI's own bookkeeping journals (chat
+	// logs, session recaps). For a player-scoped search, re-check each hit's *live*
+	// folder against the same policy get_journal enforces (managed folders excluded)
+	// before it's even offered up as a search result, not just when read in full.
+	if (opts.playerScoped) {
+		uniqueResults = uniqueResults.filter(r => {
+			const entry = game.journal?.get(r.entry.documentId)
+			return !!entry && isJournalFolderAllowed(entry.folder?.id, { includeManaged: false })
+		})
+		uniqueResults = uniqueResults.slice(0, maxResults || 5)
 	}
 
 	// Return brief summaries — the AI should use get_journal for full content
@@ -2454,6 +2555,26 @@ function listJournalPages(entry: JournalEntry) {
 	return Array.from(entry.pages?.values() || []).map((page) => serializeJournalPage(page))
 }
 
+/**
+ * Page structure without the full page text — id/name/type/length only.
+ * get_journal already returns the (truncatable) full text once via its
+ * top-level `content` field; including full per-page content again via
+ * listJournalPages duplicated that text AND bypassed max_length entirely
+ * (a multi-page journal's true size was however big every page summed to,
+ * regardless of what the caller asked for), which is how a single get_journal
+ * call on a large journal — e.g. a raw chat-log transcript — could blow the
+ * context budget even with a small max_length requested.
+ */
+function listJournalPageSummaries(entry: JournalEntry) {
+	return Array.from(entry.pages?.values() || []).map((page) => ({
+		id: page.id,
+		name: page.name,
+		type: page.type,
+		sort: page.sort ?? 0,
+		content_length: getPageTextContent(page).length,
+	}))
+}
+
 function findJournalPageByExactName(entry: JournalEntry, pageName: string): JournalEntryPage | null {
 	const matches = Array.from(entry.pages?.values() || []).filter((page) => page.name === pageName)
 	if (matches.length === 0) return null
@@ -2520,8 +2641,8 @@ function buildUpdateJournalResponse(
 	}
 }
 
-function handleGetJournal(journalId: string, maxLength?: number, offset?: number): string {
-	console.log(`FoundryAI | get_journal: id/name="${journalId}"`)
+function handleGetJournal(journalId: string, maxLength?: number, offset?: number, opts: { playerScoped?: boolean } = {}): string {
+	console.log(`FoundryAI | get_journal: id/name="${journalId}"${opts.playerScoped ? ' (player-scoped)' : ''}`)
 	const entry = resolveJournalEntry(journalId)
 	if (!entry) {
 		console.log(`FoundryAI | get_journal: not found in game.journal`)
@@ -2531,7 +2652,7 @@ function handleGetJournal(journalId: string, maxLength?: number, offset?: number
 		`FoundryAI | get_journal: found "${entry.name}" in folder "${entry.folder?.name || 'root'}" (id: ${entry.folder?.id})`,
 	)
 
-	if (!isJournalFolderAllowed(entry.folder?.id)) {
+	if (!isJournalFolderAllowed(entry.folder?.id, { includeManaged: !opts.playerScoped })) {
 		console.log(`FoundryAI | get_journal: folder not allowed`)
 		return journalFolderDeniedError(entry)
 	}
@@ -2546,7 +2667,7 @@ function handleGetJournal(journalId: string, maxLength?: number, offset?: number
 		id: entry.id,
 		name: entry?.name || 'Unknown',
 		folder: entry?.folder?.name || 'Root',
-		pages: listJournalPages(entry),
+		pages: listJournalPageSummaries(entry),
 		content,
 		total_length: fullContent.length,
 		truncated,
@@ -3926,6 +4047,133 @@ async function handleSearchCompendium(query: string, type?: string, maxResults?:
 	)
 
 	return JSON.stringify({ results, count: results.length })
+}
+
+const COMPENDIUM_DOC_TYPES = new Set(['Actor', 'Item', 'JournalEntry', 'RollTable', 'Scene', 'Macro'])
+
+function handleListCompendiums(type?: string): string {
+	console.log(`FoundryAI | list_compendiums: type="${type || 'all'}"`)
+	if (!game.packs) return JSON.stringify({ error: 'Compendium packs not available' })
+
+	const packs = Array.from((game.packs as any).values())
+		.filter((pack: any) => !type || pack.metadata?.type === type)
+		.map((pack: any) => ({
+			pack_id: pack.collection,
+			label: pack.metadata?.label,
+			type: pack.metadata?.type,
+			package: pack.metadata?.packageName || pack.metadata?.packageType,
+			entries: pack.index?.size ?? 0,
+			locked: pack.locked ?? false,
+		}))
+
+	return JSON.stringify({ packs, count: packs.length })
+}
+
+async function handleCreateCompendium(label: string, type: string): Promise<string> {
+	console.log(`FoundryAI | create_compendium: label="${label}", type="${type}"`)
+	try {
+		if (!label?.trim()) return JSON.stringify({ error: 'label is required' })
+		if (!COMPENDIUM_DOC_TYPES.has(type)) {
+			return JSON.stringify({ error: `Invalid type "${type}". Must be one of: ${[...COMPENDIUM_DOC_TYPES].join(', ')}` })
+		}
+
+		const CC: any =
+			(foundry as any)?.documents?.collections?.CompendiumCollection ?? (globalThis as any).CompendiumCollection
+		if (!CC?.createCompendium) {
+			return JSON.stringify({ error: 'CompendiumCollection.createCompendium is not available in this Foundry version.' })
+		}
+
+		const pack = await CC.createCompendium({
+			label: label.trim(),
+			type,
+			name: promptToSlug(label).slice(0, 60),
+		})
+
+		return JSON.stringify({
+			success: true,
+			pack_id: pack.collection,
+			label: pack.metadata?.label ?? label.trim(),
+			type,
+			message: `Created empty ${type} compendium "${label.trim()}" (${pack.collection}). Copy documents into it with export_to_compendium.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `Failed to create compendium: ${error.message}` })
+	}
+}
+
+/** World collection that holds documents of a given compendium type. */
+function worldCollectionFor(type: string): { collection: any; permit: (doc: any) => boolean } | null {
+	switch (type) {
+		case 'Actor':
+			return { collection: game.actors, permit: (d) => isActorFolderAllowed(d.folder?.id) }
+		case 'JournalEntry':
+			return { collection: game.journal, permit: (d) => isJournalFolderAllowed(d.folder?.id) }
+		case 'Scene':
+			return { collection: game.scenes, permit: (d) => isSceneFolderAllowed(d.folder?.id) }
+		case 'Macro':
+			return { collection: game.macros, permit: (d) => isMacroFolderAllowed(d.folder?.id) }
+		case 'Item':
+			return { collection: game.items, permit: () => true }
+		case 'RollTable':
+			return { collection: game.tables, permit: () => true }
+		default:
+			return null
+	}
+}
+
+async function handleExportToCompendium(packId: string, documentIds: unknown): Promise<string> {
+	console.log(`FoundryAI | export_to_compendium: packId="${packId}"`)
+	try {
+		if (!game.packs) return JSON.stringify({ error: 'Compendium packs not available' })
+		if (!Array.isArray(documentIds) || documentIds.length === 0) {
+			return JSON.stringify({ error: 'document_ids must be a non-empty array of world document ids' })
+		}
+
+		const pack: any = game.packs.get(packId)
+		if (!pack) {
+			return JSON.stringify({ error: `Compendium pack not found: ${packId}. Use list_compendiums to see available pack ids.` })
+		}
+		if (pack.locked) {
+			return JSON.stringify({ error: `Compendium "${packId}" is locked — unlock it in Foundry (right-click the pack → Toggle Edit Lock) before exporting.` })
+		}
+
+		const target = worldCollectionFor(pack.metadata?.type)
+		if (!target?.collection) {
+			return JSON.stringify({ error: `Unsupported pack type "${pack.metadata?.type}" for export.` })
+		}
+
+		const exported: string[] = []
+		const failed: Array<{ id: string; reason: string }> = []
+
+		for (const id of documentIds) {
+			const doc: any = target.collection.get(String(id))
+			if (!doc) {
+				failed.push({ id: String(id), reason: 'not found in world (is it the right document type for this pack?)' })
+				continue
+			}
+			if (!target.permit(doc)) {
+				failed.push({ id: String(id), reason: `folder "${doc.folder?.name || 'Root'}" is not in FoundryAI's allowed folders` })
+				continue
+			}
+			try {
+				await pack.importDocument(doc)
+				exported.push(doc.name)
+			} catch (e: any) {
+				failed.push({ id: String(id), reason: e?.message || 'import failed' })
+			}
+		}
+
+		return JSON.stringify({
+			success: failed.length === 0,
+			pack_id: packId,
+			exported_count: exported.length,
+			exported,
+			...(failed.length > 0 ? { failed } : {}),
+			message: `Copied ${exported.length} document(s) into "${pack.metadata?.label ?? packId}". Originals remain in the world.`,
+		})
+	} catch (error: any) {
+		return JSON.stringify({ error: `Export to compendium failed: ${error.message}` })
+	}
 }
 
 async function handleGetCompendiumEntry(packId: string, entryId: string): Promise<string> {
@@ -5858,6 +6106,54 @@ async function handleUploadGeneratedMap(filename: string, imageData: string, fol
 		return JSON.stringify({ success: false, error: error.message })
 	}
 }
+
+/**
+ * Bridge-only (see the executeTool case comment): return chat messages posted
+ * AFTER the given message id, oldest first. With no since_id, returns nothing
+ * but reports the current latest_id — that's how a listener arms itself without
+ * replaying history. Whispers and blind messages are excluded unless
+ * include_hidden is set, so an external agent seated as a *player* can't read
+ * GM secrets by default.
+ */
+function handleGetChatSince(args: Record<string, any>): string {
+	const all = game.messages?.contents ?? []
+	const includeHidden = args.include_hidden === true
+	const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 50)
+	const latestId = all.length > 0 ? all[all.length - 1].id : null
+
+	let startIdx = all.length // default: nothing new (arming call, or unknown id)
+	if (typeof args.since_id === 'string' && args.since_id) {
+		const idx = all.findIndex((m: any) => m.id === args.since_id)
+		if (idx >= 0) startIdx = idx + 1
+		// Unknown id (deleted message / different world): fall through with startIdx
+		// at the end rather than replaying the entire log at the caller.
+	}
+
+	const messages: Array<Record<string, any>> = []
+	for (let i = startIdx; i < all.length && messages.length < limit; i++) {
+		const m: any = all[i]
+		if (!includeHidden && ((m.whisper?.length ?? 0) > 0 || m.blind)) continue
+		const text = (m.content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+		if (!text) continue
+
+		let speaker = m.speaker?.alias
+		if (!speaker && m.speaker?.actor) speaker = game.actors?.get(m.speaker.actor)?.name
+		if (!speaker) speaker = m.user?.name || 'Someone'
+
+		messages.push({
+			id: m.id,
+			speaker,
+			content: text,
+			automated: !!m.getFlag?.(MODULE_ID_FLAG_SCOPE, 'automated'),
+			timestamp: m.timestamp,
+		})
+	}
+
+	return JSON.stringify({ messages, count: messages.length, latest_id: latestId })
+}
+
+/** Flag scope used by the AI player runtime when stamping automated messages. */
+const MODULE_ID_FLAG_SCOPE = 'foundry-ai'
 
 /**
  * Bridge-only (see the executeTool case comment): fetch a Foundry image asset
