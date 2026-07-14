@@ -6,6 +6,8 @@
 
 import { mount, unmount, type Component } from 'svelte'
 
+const FOUNDRY_AI_SIDEBAR_WIDTH = 700
+
 // ---- SvelteApplication: Popout / floating window ----
 
 export class SvelteApplication extends foundry.applications.api.ApplicationV2 {
@@ -126,6 +128,8 @@ export class SvelteSidebarTab extends foundry.applications.sidebar.AbstractSideb
 	protected svelteComponent: ReturnType<typeof mount> | null = null
 	protected svelteTarget: Component
 	protected svelteProps: Record<string, any>
+	protected previousSidebarWidth: string | null = null
+	protected previousSidebarFlexBasis: string | null = null
 
 	static override tabName = 'foundry-ai'
 
@@ -219,13 +223,226 @@ export class SvelteSidebarTab extends foundry.applications.sidebar.AbstractSideb
 
 	/** Called when sidebar tab becomes active */
 	override _onActivate(): void {
-		// Component is already mounted, no action needed
+		console.log("Sidebar tab activated, expanding sidebar if needed");
+		this.expandSidebarForFoundryAI()
 	}
 
 	/** Called when sidebar tab becomes inactive */
 	override _onDeactivate(): void {
-		// Keep component mounted for state preservation
+		this.restoreSidebarWidth()
 	}
+
+	protected expandSidebarForFoundryAI(): void {
+		const sidebar = document.querySelector<HTMLElement>('#sidebar')
+		if (!sidebar) return
+
+		const currentWidth = sidebar.getBoundingClientRect().width
+		if (currentWidth >= FOUNDRY_AI_SIDEBAR_WIDTH) return
+
+		if (this.previousSidebarWidth === null) this.previousSidebarWidth = sidebar.style.width || ''
+		if (this.previousSidebarFlexBasis === null) this.previousSidebarFlexBasis = sidebar.style.flexBasis || ''
+
+		const target = `${FOUNDRY_AI_SIDEBAR_WIDTH}px`
+		sidebar.style.width = target
+		sidebar.style.flexBasis = target
+	}
+
+	protected restoreSidebarWidth(): void {
+		const sidebar = document.querySelector<HTMLElement>('#sidebar')
+		if (!sidebar) return
+
+		if (this.previousSidebarWidth !== null) {
+			sidebar.style.width = this.previousSidebarWidth
+			this.previousSidebarWidth = null
+		}
+		if (this.previousSidebarFlexBasis !== null) {
+			sidebar.style.flexBasis = this.previousSidebarFlexBasis
+			this.previousSidebarFlexBasis = null
+		}
+	}
+}
+
+/**
+ * Foundry instantiates sidebar tabs itself (`new cls()`) from the `Sidebar.TABS`
+ * registry, so it has no way to pass in a Svelte component/props. This factory
+ * binds them via closure and returns a subclass Foundry can construct directly.
+ */
+export function createSvelteSidebarTabClass(
+	component: Component<any>,
+	props: Record<string, any> = {},
+): new (options?: Partial<ApplicationConfiguration>) => SvelteSidebarTab {
+	return class extends SvelteSidebarTab {
+		constructor(options: Partial<ApplicationConfiguration> = {}) {
+			super(component, props, options)
+		}
+	}
+}
+
+// ---- ChatLogPopoutApplication: real chat log, freely-resizable frame ----
+
+/**
+ * Foundry's own chat-log popout (`ui.chat.renderPopout()`) is not resizable —
+ * the tab's `resizable` window option is hard-coded false in core and there's
+ * no way to override it for the popped-out copy from module code. Rather than
+ * patching Foundry's internal frame (fragile: relies on undocumented
+ * `app.window.resize` wiring and can silently break on core updates), this
+ * builds our own plain ApplicationV2 frame — the same proven pattern as
+ * `SvelteApplication` below, which is natively resizable with no hacks — and
+ * reparents Foundry's real, fully-functional chat log element into it.
+ *
+ * The chat log instance itself (message rendering, rolls, whispers, chat
+ * input, hooks) is untouched; only its outer frame moves, so nothing about
+ * how chat works changes — only the window it lives in.
+ */
+/** Inline styles forced onto the reparented native chat log frame, and kept
+ *  in place any time Foundry tries to write over them (see `forceFrameStyle`). */
+const EMBEDDED_FRAME_STYLE: Record<string, string> = {
+	position: 'static',
+	inset: 'unset',
+	width: '100%',
+	height: '100%',
+	'max-width': 'none',
+	'max-height': 'none',
+	margin: '0',
+	'box-shadow': 'none',
+	border: 'none',
+}
+
+const EMBEDDED_CONTENT_STYLE: Record<string, string> = {
+	height: '100%',
+	flex: '1 1 auto',
+}
+
+export class ChatLogPopoutApplication extends foundry.applications.api.ApplicationV2 {
+	protected nativeChatLog: InstanceType<typeof foundry.applications.sidebar.AbstractSidebarTab> | null = null
+	protected frameObserver: MutationObserver | null = null
+
+	static override DEFAULT_OPTIONS: ApplicationConfiguration = {
+		...foundry.applications.api.ApplicationV2.DEFAULT_OPTIONS,
+		id: 'foundry-ai-chat-log-popout',
+		classes: ['foundry-ai', 'foundry-ai-chat-log-popout'],
+		window: {
+			frame: true,
+			positioned: true,
+			title: 'Chat Log',
+			icon: 'fas fa-comments',
+			minimizable: true,
+			resizable: true,
+			contentTag: 'section',
+			contentClasses: ['foundry-ai-content'],
+		},
+		position: {
+			width: 420,
+			height: 600,
+		},
+	}
+
+	override get title(): string {
+		return 'Chat Log'
+	}
+
+	/** Create the initial frame with a mount point */
+	override async _renderHTML(_context: Record<string, any>, _options: Record<string, any>): Promise<HTMLElement> {
+		const container = document.createElement('div')
+		container.classList.add('foundry-ai-chatlog-root')
+		container.style.width = '100%'
+		container.style.height = '100%'
+		container.style.overflow = 'hidden'
+		container.style.display = 'flex'
+		container.style.flexDirection = 'column'
+		return container
+	}
+
+	/** Replace content and embed the real chat log */
+	override _replaceHTML(result: HTMLElement, content: HTMLElement, _options: Record<string, any>): void {
+		content.replaceChildren(result)
+		void this.embedNativeChatLog(result)
+	}
+
+	/**
+	 * Renders Foundry's real chat log via the public `renderPopout()` API —
+	 * this creates a separate instance from the docked sidebar tab, so the
+	 * sidebar's own chat log keeps working untouched — then reparents its
+	 * whole (internally unmodified) frame element into our container and
+	 * hides its now-redundant header/resize handle in favor of our own.
+	 */
+	protected async embedNativeChatLog(target: HTMLElement): Promise<void> {
+		const popout = await ui.chat.renderPopout()
+		this.nativeChatLog = popout
+
+		const frame = popout.element
+		const winRefs = popout.window
+
+		// Our frame supplies the title bar and resize handle; hide Foundry's.
+		if (winRefs?.header) winRefs.header.style.setProperty('display', 'none', 'important')
+		if (winRefs?.resize) winRefs.resize.style.setProperty('display', 'none', 'important')
+
+		frame.classList.add('foundry-ai-embedded-chat-log')
+
+		// Foundry still thinks it owns this window's position (it's the same
+		// instance that would normally float at a fixed size) and periodically
+		// reasserts its own inline width/height — e.g. via setPosition(), or a
+		// resize observer that fires while typing in the chat box — which wipes
+		// out plain style writes. Neutralize the public entry point...
+		popout.setPosition = () => popout.position
+
+		// ...and back that up with a MutationObserver that re-applies our
+		// forced styles the instant anything else rewrites `style` directly.
+		// The before/after check keeps this from looping: once our values are
+		// in place, re-applying them is a no-op and produces no new mutation.
+		this.forceFrameStyle(frame, winRefs?.content ?? null)
+		this.frameObserver = new MutationObserver(() => this.forceFrameStyle(frame, winRefs?.content ?? null))
+		this.frameObserver.observe(frame, { attributes: true, attributeFilter: ['style'] })
+		if (winRefs?.content) {
+			this.frameObserver.observe(winRefs.content, { attributes: true, attributeFilter: ['style'] })
+		}
+
+		target.appendChild(frame)
+	}
+
+	/** Reapply the forced layout styles, skipping properties that already match. */
+	protected forceFrameStyle(frame: HTMLElement, content: HTMLElement | null): void {
+		for (const [prop, value] of Object.entries(EMBEDDED_FRAME_STYLE)) {
+			if (frame.style.getPropertyValue(prop) !== value || frame.style.getPropertyPriority(prop) !== 'important') {
+				frame.style.setProperty(prop, value, 'important')
+			}
+		}
+		if (!content) return
+		for (const [prop, value] of Object.entries(EMBEDDED_CONTENT_STYLE)) {
+			if (content.style.getPropertyValue(prop) !== value || content.style.getPropertyPriority(prop) !== 'important') {
+				content.style.setProperty(prop, value, 'important')
+			}
+		}
+	}
+
+	/** Tear down the embedded native chat log alongside our own frame */
+	override async close(options?: Record<string, any>): Promise<this> {
+		this.frameObserver?.disconnect()
+		this.frameObserver = null
+		const nativeChatLog = this.nativeChatLog
+		this.nativeChatLog = null
+		if (nativeChatLog?.rendered) {
+			await nativeChatLog.close({ animate: false }).catch(() => {})
+		}
+		return super.close(options)
+	}
+}
+
+let chatLogPopoutInstance: ChatLogPopoutApplication | null = null
+
+/**
+ * Open (or focus) the real Foundry chat log inside our own freely-resizable
+ * window. Replaces the old `enablePopoutResize` hack on `ui.chat.renderPopout()`.
+ */
+export function openChatLogPopout(): ChatLogPopoutApplication {
+	if (chatLogPopoutInstance?.rendered) {
+		chatLogPopoutInstance.bringToFront()
+		return chatLogPopoutInstance
+	}
+
+	chatLogPopoutInstance = new ChatLogPopoutApplication()
+	chatLogPopoutInstance.render(true)
+	return chatLogPopoutInstance
 }
 
 // ---- Factory functions ----

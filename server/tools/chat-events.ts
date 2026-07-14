@@ -11,6 +11,28 @@ import { Tool } from '@modelcontextprotocol/sdk/types.js';
 export function getChatEventToolDefinitions(): Tool[] {
   return [
     {
+      name: 'get-recent-chat',
+      description:
+        'Fetch the most recent messages from the Foundry VTT chat log immediately, without waiting. Returns messages oldest-first in the same shape as wait-for-chat, plus latest_id so you can hand that to wait-for-chat as since_message_id if you want to start listening from here.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          limit: {
+            type: 'number',
+            default: 10,
+            description:
+              'How many recent visible chat messages to return, 1–50. Messages are returned oldest-first.',
+          },
+          include_hidden: {
+            type: 'boolean',
+            default: false,
+            description:
+              'Include whispers and blind/GM-only messages. Leave false when the agent is playing a character — hidden messages are DM secrets.',
+          },
+        },
+      },
+    },
+    {
       name: 'wait-for-chat',
       description:
         'Wait for new messages in the Foundry VTT chat log (long-poll). Blocks until someone posts or the timeout passes, then returns the new messages oldest-first. Build a listen loop: call this → react (e.g. via post_chat_message) → call again passing the returned latest_id as since_message_id. The FIRST call without since_message_id just arms the listener and returns on the NEXT message. status "timeout" with no messages is normal — call again with the same latest_id to keep listening. Each message has an "automated" flag marking AI-generated posts (AI players / autonomous DM) — be deliberate about reacting to those, or two agents will loop off each other until the module\'s automation cap stops them.',

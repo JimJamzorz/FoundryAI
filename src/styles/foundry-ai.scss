@@ -79,7 +79,15 @@
 		}
 	}
 
-	button:not(.header-control) {
+	// Excludes the embedded native chat log (ChatLogPopoutApplication) —
+	// Foundry's real chat log is reparented wholesale into our frame, and its
+	// roll-mode/toolbar buttons rely on their own Font Awesome font-family
+	// (set via the `.fa`/`.fas` class on the button itself, not a child `<i>`).
+	// `revert` doesn't work here since it rolls back ALL author-origin rules
+	// for that property, including Font Awesome's own — the icons still show
+	// as boxes. Scoping the selector so it never matches inside the embedded
+	// log in the first place is the only way to leave FA's rule intact.
+	button:not(.header-control):not(.foundry-ai-embedded-chat-log *) {
 		font-family: 'Signika', sans-serif;
 	}
 }

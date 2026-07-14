@@ -5,6 +5,27 @@
 import { openRouterService } from './openrouter-service'
 import { VectorStore, type VectorEntry, type IndexMeta, type SearchResult } from './vector-store'
 import { collectionReader, type ExtractedDocument } from './collection-reader'
+import { getSetting } from '../settings'
+
+/**
+ * Task prefixes some embedding families REQUIRE to perform as trained —
+ * serving endpoints (LM Studio, plain OpenAI-compatible APIs) do not add
+ * them, so we must. Embedding without them quietly degrades retrieval.
+ *   - nomic-embed-text: "search_document: " for passages, "search_query: " for queries
+ *   - mxbai / bge (en): instruction on the QUERY side only
+ * Prefixes are applied at embed time only — stored chunk text stays clean.
+ * NOTE: adding/changing prefixes changes the vectors → full Reindex required.
+ */
+function embeddingTaskPrefixes(): { doc: string; query: string } {
+	const model = (getSetting('embeddingModel') || '').toLowerCase()
+	if (model.includes('nomic')) {
+		return { doc: 'search_document: ', query: 'search_query: ' }
+	}
+	if (model.includes('mxbai') || model.includes('bge-')) {
+		return { doc: '', query: 'Represent this sentence for searching relevant passages: ' }
+	}
+	return { doc: '', query: '' }
+}
 
 export interface IndexProgress {
 	phase: 'extracting' | 'chunking' | 'embedding' | 'storing' | 'complete' | 'error'
@@ -16,9 +37,19 @@ export interface IndexProgress {
 
 export type ProgressCallback = (progress: IndexProgress) => void
 
-const CHUNK_SIZE = 500 // ~500 tokens per chunk
-const CHUNK_OVERLAP = 50 // overlap in chars for context continuity
-const EMBEDDING_BATCH_SIZE = 20 // documents per API call
+// Chunk sizing is in CHARACTERS (≈4 chars per token). These were previously
+// 500/50 with a comment claiming "~500 tokens" — actually ~125 tokens, far too
+// small to carry coherent lore context (a chunk was a sentence and a half),
+// and 4x the embedding calls for a large book. ~400 real tokens per chunk is
+// the sweet spot for setting/adventure prose. NOTE: changing these requires a
+// full Reindex for existing worlds.
+const CHUNK_SIZE = 1600 // chars ≈ 400 tokens per chunk
+const CHUNK_OVERLAP = 200 // chars carried into the next chunk for continuity
+const EMBEDDING_BATCH_SIZE = 20 // chunks per embeddings API call
+
+/** How many dense candidates to over-fetch before the keyword rerank. */
+const RERANK_CANDIDATE_MULTIPLIER = 5
+const RERANK_MIN_CANDIDATES = 25
 
 export class EmbeddingService {
 	private vectorStore: VectorStore | null = null
@@ -82,9 +113,10 @@ export class EmbeddingService {
 				message: `Generating embeddings for ${allChunks.length} chunks...`,
 			})
 
+			const prefixes = embeddingTaskPrefixes()
 			for (let i = 0; i < allChunks.length; i += EMBEDDING_BATCH_SIZE) {
 				const batch = allChunks.slice(i, i + EMBEDDING_BATCH_SIZE)
-				const texts = batch.map((c) => c.text)
+				const texts = batch.map((c) => prefixes.doc + c.text)
 
 				const embeddingResponse = await openRouterService.generateEmbeddings(texts)
 
@@ -152,12 +184,18 @@ export class EmbeddingService {
 		if (!this.vectorStore) throw new Error('EmbeddingService not initialized')
 		if (!openRouterService.isConfigured) throw new Error('OpenRouter not configured')
 
-		// Generate embedding for the query
-		const embeddingResponse = await openRouterService.generateEmbeddings(query)
+		// Generate embedding for the query (with the model family's query prefix)
+		const embeddingResponse = await openRouterService.generateEmbeddings(embeddingTaskPrefixes().query + query)
 		const queryVector = embeddingResponse.data[0].embedding
 
-		// Search the vector store
-		return this.vectorStore.search(queryVector, topK, filter)
+		// Hybrid retrieval: over-fetch dense candidates by cosine, then rerank
+		// with an exact-term boost. Pure dense search on small embedding models
+		// is unreliable for proper nouns — and TTRPG queries are mostly proper
+		// nouns ("Ketgrinn", "Skitterdeep Mine", "the Weasel Hag") that the
+		// embedding space has no meaningful neighborhood for.
+		const candidateCount = Math.max(topK * RERANK_CANDIDATE_MULTIPLIER, RERANK_MIN_CANDIDATES)
+		const candidates = await this.vectorStore.search(queryVector, candidateCount, filter)
+		return rerankWithKeywordBoost(query, candidates, topK)
 	}
 
 	// ---- Build context for LLM from search results ----
@@ -276,7 +314,8 @@ export class EmbeddingService {
 				return
 			}
 
-			const embeddingResponse = await openRouterService.generateEmbeddings(chunks)
+			const prefixes = embeddingTaskPrefixes()
+			const embeddingResponse = await openRouterService.generateEmbeddings(chunks.map((c) => prefixes.doc + c))
 
 			const vectorEntries: VectorEntry[] = chunks.map((text, idx) => ({
 				id: `${doc.type}:${doc.id}:${idx}`,
@@ -362,6 +401,52 @@ export class EmbeddingService {
 		this.vectorStore?.close()
 		this.vectorStore = null
 	}
+}
+
+// ---- Hybrid rerank helpers ----
+
+/** Common words that carry no retrieval signal — kept deliberately small so we
+ *  never accidentally filter a campaign term. */
+const QUERY_STOPWORDS = new Set([
+	'the', 'a', 'an', 'of', 'in', 'on', 'and', 'or', 'to', 'is', 'are', 'was', 'were',
+	'what', 'who', 'where', 'when', 'how', 'why', 'tell', 'me', 'about', 'for', 'with',
+	'at', 'it', 'this', 'that', 'do', 'does', 'did', 'can', 'you', 'i', 'we', 'they',
+])
+
+/** Meaningful search terms from a natural-language query. */
+function extractQueryTerms(query: string): string[] {
+	const tokens = query.toLowerCase().match(/[a-z][a-z'’-]{2,}/g) || []
+	return [...new Set(tokens.filter(t => !QUERY_STOPWORDS.has(t)))]
+}
+
+/**
+ * Boost dense-retrieval candidates that literally contain the query's terms.
+ * Weights are calibrated so keyword hits act as a tiebreaker/booster on top of
+ * cosine (typical spread ~0.2–0.6), not a replacement for it: full term
+ * coverage adds up to +0.15, and a term matching the DOCUMENT NAME (asking
+ * about "the Weasel Hag" should surface the Weasel Hag's own entry above a
+ * passing mention) adds +0.05 more.
+ */
+function rerankWithKeywordBoost(query: string, candidates: SearchResult[], topK: number): SearchResult[] {
+	const terms = extractQueryTerms(query)
+	if (terms.length === 0 || candidates.length === 0) return candidates.slice(0, topK)
+
+	for (const candidate of candidates) {
+		const name = candidate.entry.documentName.toLowerCase()
+		const haystack = `${name} ${candidate.entry.text.toLowerCase()}`
+
+		let hits = 0
+		let nameHit = false
+		for (const term of terms) {
+			if (haystack.includes(term)) hits++
+			if (name.includes(term)) nameHit = true
+		}
+
+		candidate.score += (hits / terms.length) * 0.15 + (nameHit ? 0.05 : 0)
+	}
+
+	candidates.sort((a, b) => b.score - a.score)
+	return candidates.slice(0, topK)
 }
 
 export const embeddingService = new EmbeddingService()

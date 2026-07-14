@@ -900,6 +900,40 @@ async function handleWaitForChatRequest(
   }
 }
 
+/**
+ * get-recent-chat: immediate snapshot of the latest visible chat messages in
+ * the same shape as wait-for-chat, but without long-polling.
+ */
+async function handleGetRecentChatRequest(
+  args: any,
+  foundryClient: any,
+  logger: Logger
+): Promise<any> {
+  const limit = Math.min(Math.max(Number(args?.limit) || 10, 1), 50);
+  const includeHidden = args?.include_hidden === true;
+
+  try {
+    const result = await foundryClient.query('foundry-ai.tool.get_recent_chat', {
+      limit,
+      include_hidden: includeHidden,
+    });
+
+    return {
+      status: 'success',
+      messages: result?.messages ?? [],
+      count: Number(result?.count) || 0,
+      latest_id: result?.latest_id ?? null,
+      note: 'Pass latest_id as since_message_id to wait-for-chat if you want to start listening from this point.',
+    };
+  } catch (error: any) {
+    logger.error('get-recent-chat failed', { error: error.message });
+    return {
+      status: 'error',
+      message: `get-recent-chat failed: ${error.message}. Is Foundry connected to the MCP server?`,
+    };
+  }
+}
+
 async function handleListImageModelsRequest(comfyuiClient: any, logger: Logger): Promise<any> {
   try {
     const health = await comfyuiClient.checkHealth();
@@ -1485,6 +1519,7 @@ async function startBackend(): Promise<void> {
     'check-map-status',
     'cancel-map-job',
     'list-image-models',
+    'get-recent-chat',
     'wait-for-chat',
   ]);
 
@@ -1592,6 +1627,10 @@ async function startBackend(): Promise<void> {
 
                   case 'list-image-models':
                     result = await handleListImageModelsRequest(mapGenerationComfyUIClient, logger);
+                    break;
+
+                  case 'get-recent-chat':
+                    result = await handleGetRecentChatRequest(args, foundryClient, logger);
                     break;
 
                   case 'wait-for-chat':

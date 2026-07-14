@@ -222,6 +222,8 @@
   .message-content {
     line-height: 1.5;
     font-size: 0.9em;
+    user-select: text;
+    -webkit-user-select: text;
   }
 
   .message-content :global(p) {

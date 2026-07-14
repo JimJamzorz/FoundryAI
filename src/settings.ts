@@ -33,6 +33,10 @@ export interface AIPlayerConfig {
 	/** API provider ID (references an entry in apiProviders) — lets each player point at a different LLM. */
 	providerId: string
 	model: string
+	/** The ONE journal this player can read and write — their entire world
+	 *  knowledge beyond live chat and their character sheet. Everything else
+	 *  is blocked. Empty = an auto-created private notes journal. */
+	journalId: string
 	/** Optional role/persona prompt. Falls back to the auto-generated actor personality prompt when blank. */
 	systemPromptOverride: string
 	enabled: boolean
@@ -91,6 +95,7 @@ export interface FoundryAISettings {
 	aiPlayerHumanCap: number
 	aiOrchestrationEnabled: boolean
 	aiKeepSceneMoving: boolean
+	aiIncludeDMModel: boolean
 	orchestratorProviderId: string
 	orchestratorModel: string
 }
@@ -576,6 +581,15 @@ export function registerSettings(): void {
 		config: false,
 		type: Boolean,
 		default: false,
+	})
+
+	game.settings.register(MODULE_ID, 'aiIncludeDMModel', {
+		name: 'Include DM Model In AI Orchestration',
+		hint: 'When on, the orchestrator may choose the DM for an autonomous narration beat. Turn it off to keep the trigger loop limited to AI players only, even when Keep the Scene Moving is enabled.',
+		scope: 'world',
+		config: false,
+		type: Boolean,
+		default: true,
 	})
 
 	game.settings.register(MODULE_ID, 'orchestratorProviderId', {

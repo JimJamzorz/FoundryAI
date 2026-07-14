@@ -507,8 +507,13 @@ export class CollectionReader {
 
 		const addChildren = (parentId: string) => {
 			for (const folder of game.folders.values()) {
-				// Foundry V12+ uses folder.folder for parent, older versions use folder.parent
-				const folderParentId = (folder as any).folder?.id ?? folder.parent?.id
+				// Depending on the Foundry version and serialization path, the parent
+				// can be a Folder document, its ID, or a parent document.
+				const rawFolderParent = (folder as any).folder
+				const folderParentId =
+					(typeof rawFolderParent === 'string' ? rawFolderParent : rawFolderParent?.id) ??
+					(folder as any).parentId ??
+					folder.parent?.id
 				if (folderParentId === parentId && !result.has(folder.id)) {
 					console.log(
 						`FoundryAI | resolveWithChildren: found child "${folder.name}" (${folder.id}) of parent ${parentId}`,

@@ -14,9 +14,13 @@
    - Triggers are debounced (one global timer, not per-player) so a burst of
      messages collapses into one orchestrator decision instead of firing on
      every line.
-   - AI players get a narrow toolset: read-only journal lookups shared with
-     the DM assistant, plus a personal notes journal each can read/write for
-     itself. Nothing that mutates the world.
+   - AI players have a HARD knowledge boundary: exactly one journal each
+     (GM-assigned via journalId, or an auto-created private one) that they can
+     read and write — and nothing else. No shared search, no world lookups.
+     If it isn't in the chat, their sheet, or their journal, the character
+     doesn't know it. An earlier design gave players search_journals over the
+     whole index, which let a character semantically search the GM's adventure
+     text and "recall" module secrets.
    - The autonomous DM narration branch is even more restricted: read-only
      journal lookups and nothing else. No combat, damage, token, actor, or
      world-editing tools — those still require the human DM to actually chat.
@@ -91,9 +95,6 @@ const TURN_MAX_TOKENS = 2500
  */
 const ORCHESTRATOR_MAX_TOKENS = 500
 
-/** Read-only journal tools available to AI players, reused as-is from the shared tool system. */
-const PLAYER_SHARED_TOOL_NAMES = ['search_journals', 'get_journal']
-
 /** Lookup tools for the autonomous DM narration branch — reading only. The narration
  *  itself is delivered as the reply text, NOT via post_chat_message: models (even
  *  tool-capable ones) reliably write narration as plain content rather than wrapping
@@ -101,27 +102,35 @@ const PLAYER_SHARED_TOOL_NAMES = ['search_journals', 'get_journal']
  *  and then discarded. */
 const DM_LOOKUP_TOOL_NAMES = ['search_journals', 'get_journal']
 
-/** Player-scoped notes tools — handled locally, not through the shared executeTool dispatcher. */
-const PLAYER_NOTES_TOOLS: ToolDefinition[] = [
+/**
+ * The ONLY tools an AI player has: read/write access to their one designated
+ * journal (AIPlayerConfig.journalId, or an auto-created private one). This is
+ * a hard knowledge boundary, not a suggestion — players used to carry
+ * search_journals/get_journal over the whole index, which meant a character
+ * could semantically search the GM's adventure text and "recall" module
+ * secrets. Now: if it isn't in the chat, their sheet, or their journal, the
+ * character doesn't know it. Handled locally, never through executeTool.
+ */
+const PLAYER_JOURNAL_TOOLS: ToolDefinition[] = [
 	{
 		type: 'function',
 		function: {
-			name: 'read_my_notes',
+			name: 'read_my_journal',
 			description:
-				"Read your personal notes journal — things you've previously written down for yourself. Private to you; use it if you need to recall something before reacting.",
+				"Read your character's journal — everything they know beyond the current conversation: memories, lore they'd plausibly know, and things they've written down. Take a moment to check it whenever something rings a bell (a name, a place, a symbol).",
 			parameters: { type: 'object', properties: {}, required: [] },
 		},
 	},
 	{
 		type: 'function',
 		function: {
-			name: 'write_my_notes',
+			name: 'write_my_journal',
 			description:
-				"Add a short note to your personal notes journal — something you learned, witnessed, or want to remember later. Private to you; nobody else reads this unless they specifically open your journal.",
+				'Write a short entry in your journal — something learned, witnessed, promised, or worth remembering later. It will be there next time you read your journal.',
 			parameters: {
 				type: 'object',
 				properties: {
-					content: { type: 'string', description: 'The note text to add (plain text or simple HTML).' },
+					content: { type: 'string', description: 'The entry text to add (plain text or simple HTML).' },
 				},
 				required: ['content'],
 			},
@@ -129,14 +138,28 @@ const PLAYER_NOTES_TOOLS: ToolDefinition[] = [
 	},
 ]
 
+/** Character cap for read_my_journal — a GM-assigned lore journal can be long. */
+const PLAYER_JOURNAL_READ_MAX = 8000
+
+/** Page within the designated journal where the character's own writing goes,
+ *  so GM-authored lore pages are never modified. */
+const PLAYER_WRITE_PAGE_NAME = 'Character Notes'
+
 const PLAYER_TURN_INSTRUCTIONS = `## Your Turn
 The DM has indicated this is a moment for you specifically to react, based on the recent chat below.
 
-### Tools available
-You have a small toolset — reach for it rarely, not on every turn. A description of an action (a door gets kicked in, someone looks around a room) is NOT a reason to search anything; that's just something you react to in character, the same way a real player would without checking a reference book mid-scene.
-- search_journals / get_journal — only if you genuinely need a specific campaign fact to react accurately, and you don't already know it.
-- read_my_notes / write_my_notes — your own private notes. Jot something down only if this moment is worth remembering later; check your notes only if you need to recall something specific first.
+### Your Journal
+You have exactly one tool pair: read_my_journal and write_my_journal — your character's own journal. It holds everything your character knows beyond this conversation: memories, lore they'd plausibly know, things they've chosen to write down.
+- Taking a second to check your journal before reacting is fine and encouraged whenever something rings a bell — a name, a place, a symbol, a promise.
+- Write down what's worth remembering later: discoveries, debts, grudges, clues.
+- That journal is your entire knowledge of the world. If it isn't in the chat, your journal, or your character sheet, your character does not know it — react with honest uncertainty instead of inventing facts.
 If you use a tool, use the actual tool-calling mechanism — never write out a function name or JSON as if it were your reply.
+
+### Move Things Forward
+You are a doer, not a commentator. Your turn should CHANGE something — commit to an action, take the step, open the door, follow the plan, make the offer. Observing, speculating, or asking yet another question about the same thing is how scenes die.
+- If another character proposed doing something (moving on, a plan, a direction), ENGAGE with it: agree and act on it, or push back with a concrete alternative of your own. Never leave a proposal hanging while you examine scenery.
+- Investigating something once is good play. Investigating the same thing the group has already looked at is a wasted turn — draw a conclusion from what's known and act on it.
+- When in doubt, be bold and wrong rather than careful and still. Consequences are the fun part; your character's mistakes make the story.
 
 ### Responding — CRITICAL
 Whatever you write is posted to the table's chat log VERBATIM, exactly as your character's own message — not shown to anyone as a draft, not summarized, not filtered. Only your character's actual words and actions belong in it.
@@ -152,7 +175,7 @@ Never include any of the following — these are not roleplay, they're you narra
 Good reply: *I grip my wand tight, watching the flickering shapes.* "Careful — I don't think these things are friendly."
 Bad reply (never do this): "Since Kale needs to react to the ghosts, I will write: Kale grips his wand and says..."
 
-- Dialogue in quotes, brief actions in *italics*, same style as your roleplay guidelines above. One or two short beats — a quick reaction, not a paragraph.
+- Dialogue in quotes, brief actions in *italics*, same style as your roleplay guidelines above. Keep it short: usually one sentence, or two brief sentences at most. One or two short beats — a quick reaction, not a paragraph.
 - If, having actually looked at the chat, there's genuinely nothing for your character to add, reply with EXACTLY: ${PASS_SENTINEL}
 - Don't narrate for other characters. Output only your line(s), or the pass sentinel — nothing else.`
 
@@ -174,6 +197,7 @@ This is an established campaign with source material. You must NOT introduce new
 
 Whatever you reply is posted to the table's chat log VERBATIM as DM narration — it is not a draft and nobody filters it.
 - If a short narration beat, environmental detail, or one line of NPC dialogue would genuinely help, reply with ONLY that text. A sentence or two — this is a nudge, not a full scene.
+- If the party is STALLING — circling the same spot, re-investigating what they've already examined, nobody committing to a direction — apply pressure with pure atmosphere: a sound drawing nearer, the light failing, the cold deepening, something changed because time passed. Make waiting cost something and give them a reason to move. (This needs no canon — time and weather are always yours.)
 - If nothing needs to happen — the scene doesn't need advancing, or this is a moment for a human — reply with EXACTLY: WAIT
 - Never explain what you're doing, never describe your reasoning, no speaker labels, no lists, no meta-commentary. Only the narration itself, or WAIT.`
 
@@ -281,24 +305,26 @@ async function considerOrchestration(options: { afterDMPass?: boolean } = {}): P
 		return
 	}
 
+	const includeDMModel = getSetting('aiIncludeDMModel') ?? true
+
 	// Menu construction — the DM is part of the same rotating cast as the
 	// players. Hidden this cycle: whoever spoke in the recent rotation window
 	// (players AND the DM), whoever is mid-generation, and whoever was just
 	// dispatched but may not have posted yet. The parser only accepts names
 	// from the offered menu, so this is enforced, not suggested.
 	const enabled = getEnabledPlayers()
-	const hiddenKeys = getRotationHiddenKeys(enabled)
+	const hiddenKeys = getRotationHiddenKeys(enabled, includeDMModel)
 	if (lastActorDispatchedId) hiddenKeys.add(lastActorDispatchedId)
 
 	const players = enabled.filter(p => !turnsInFlight.has(p.id) && !hiddenKeys.has(p.id))
-	let dmEligible = !hiddenKeys.has(DM_ROTATION_KEY) && !turnsInFlight.has(DM_TURN_KEY)
+	let dmEligible = includeDMModel && !hiddenKeys.has(DM_ROTATION_KEY) && !turnsInFlight.has(DM_TURN_KEY)
 	// Never let the menu go completely empty: if every player is hidden/busy and
 	// the DM is rotation-hidden too, the DM steps back in rather than stalling.
-	if (players.length === 0 && !dmEligible && !turnsInFlight.has(DM_TURN_KEY)) dmEligible = true
+	if (includeDMModel && players.length === 0 && !dmEligible && !turnsInFlight.has(DM_TURN_KEY)) dmEligible = true
 
 	const hiddenNames = [
 		...enabled.filter(p => hiddenKeys.has(p.id)).map(p => p.actorName || p.name),
-		...(hiddenKeys.has(DM_ROTATION_KEY) ? ['DM'] : []),
+		...(includeDMModel && hiddenKeys.has(DM_ROTATION_KEY) ? ['DM'] : []),
 	]
 	if (hiddenNames.length > 0) {
 		console.log(`${TRACE} rotation: hiding recent speaker(s) ${hiddenNames.join(', ')} from the menu this cycle.`)
@@ -461,8 +487,8 @@ const DM_ROTATION_KEY = 'DM'
  *
  * Returns hidden keys: player ids and/or DM_ROTATION_KEY.
  */
-function getRotationHiddenKeys(players: AIPlayerConfig[]): Set<string> {
-	const castSize = players.length + 1 // players + DM
+function getRotationHiddenKeys(players: AIPlayerConfig[], includeDMModel = true): Set<string> {
+	const castSize = players.length + (includeDMModel ? 1 : 0)
 	const excludeMax = Math.min(Math.ceil(castSize / 2), castSize - 1)
 	const hidden = new Set<string>()
 	if (excludeMax <= 0) return hidden
@@ -477,7 +503,7 @@ function getRotationHiddenKeys(players: AIPlayerConfig[]): Set<string> {
 		if (typeof pid === 'string' && players.some(p => p.id === pid)) {
 			hidden.add(pid)
 			postsSeen++
-		} else if (m.getFlag?.(MODULE_ID, 'autonomousDM')) {
+		} else if (includeDMModel && m.getFlag?.(MODULE_ID, 'autonomousDM')) {
 			hidden.add(DM_ROTATION_KEY)
 			postsSeen++
 		}
@@ -855,16 +881,23 @@ async function postAsPlayer(player: AIPlayerConfig, content: string): Promise<vo
 /** Resolve the tool list available to AI players — respects the global "Enable Tool Calling" setting. */
 function getPlayerToolset(): ToolDefinition[] {
 	if (!getSetting('enableTools')) return []
-	return [...getToolsByNames(PLAYER_SHARED_TOOL_NAMES), ...PLAYER_NOTES_TOOLS]
+	return PLAYER_JOURNAL_TOOLS
 }
 
-/** Dispatch a tool call — personal notes tools are handled locally; everything else goes through the shared executor. */
+/** Dispatch a player tool call. ONLY the journal pair exists — nothing routes
+ *  to the shared executor, so a hallucinated tool name can't become a world
+ *  search. The error names what's actually available. */
 async function executePlayerTool(player: AIPlayerConfig, call: ToolCall): Promise<string> {
 	const name = call.function.name
-	if (name === 'read_my_notes' || name === 'write_my_notes') {
-		return await executeNotesTool(player, name, call.function.arguments)
+	if (name === 'read_my_journal' || name === 'write_my_journal') {
+		return await executeJournalTool(player, name, call.function.arguments)
 	}
-	return await executeTool(call, { playerScoped: true })
+	// Old configs / stubborn models may still try the previous tool names.
+	if (name === 'read_my_notes') return await executeJournalTool(player, 'read_my_journal', call.function.arguments)
+	if (name === 'write_my_notes') return await executeJournalTool(player, 'write_my_journal', call.function.arguments)
+	return JSON.stringify({
+		error: `You don't have a tool called "${name}". Your only tools are read_my_journal and write_my_journal — your character's own journal.`,
+	})
 }
 
 // ---- Autonomous DM narration ----
@@ -955,11 +988,23 @@ function isSentinel(text: string, sentinel: string): boolean {
 
 // ---- Personal Notes Journal ----
 
-/** Find or create this player's personal notes journal, inside FoundryAI/Players. */
-async function getOrCreatePlayerJournal(player: AIPlayerConfig): Promise<JournalEntry | null> {
+/**
+ * Resolve this player's designated journal: the GM-assigned one (journalId) if
+ * set and still existing, otherwise their auto-created private journal inside
+ * FoundryAI/Players (created on first use).
+ */
+async function resolvePlayerJournal(player: AIPlayerConfig): Promise<JournalEntry | null> {
+	if (player.journalId) {
+		const assigned = game.journal?.get(player.journalId)
+		if (assigned) return assigned
+		console.warn(
+			`FoundryAI | ai-player-runtime: assigned journal ${player.journalId} for "${player.name}" no longer exists — falling back to their private journal.`,
+		)
+	}
+
 	const folderId = getSubfolderId('players')
 	if (!folderId) {
-		console.warn('FoundryAI | ai-player-runtime: Players folder not ready yet — cannot access personal notes.')
+		console.warn('FoundryAI | ai-player-runtime: Players folder not ready yet — cannot access journal.')
 		return null
 	}
 
@@ -967,29 +1012,46 @@ async function getOrCreatePlayerJournal(player: AIPlayerConfig): Promise<Journal
 	if (existing) return existing
 
 	const journal = await JournalEntry.create({
-		name: `${player.actorName || player.name} — Notes`,
+		name: `${player.actorName || player.name} — Journal`,
 		folder: folderId,
-		pages: [{ name: 'Notes', type: 'text', text: { content: '', format: 1 } }],
+		pages: [{ name: PLAYER_WRITE_PAGE_NAME, type: 'text', text: { content: '', format: 1 } }],
 		flags: { [MODULE_ID]: { aiPlayerId: player.id } },
 	})
 
-	console.log(`FoundryAI | Created personal notes journal for "${player.name}" (${journal.id})`)
+	console.log(`FoundryAI | Created private journal for "${player.name}" (${journal.id})`)
 	return journal
 }
 
-async function executeNotesTool(player: AIPlayerConfig, toolName: string, argsJson: string): Promise<string> {
-	const journal = await getOrCreatePlayerJournal(player)
-	if (!journal) return JSON.stringify({ error: 'Could not access personal notes journal.' })
+async function executeJournalTool(player: AIPlayerConfig, toolName: string, argsJson: string): Promise<string> {
+	const journal = await resolvePlayerJournal(player)
+	if (!journal) return JSON.stringify({ error: 'Could not access your journal.' })
 
-	const page = journal.pages?.contents?.[0]
-	if (!page) return JSON.stringify({ error: 'Personal notes journal has no page.' })
+	if (toolName === 'read_my_journal') {
+		// Read EVERY text page — a GM-assigned journal may hold multiple lore
+		// pages plus the character's own notes page.
+		const pages: any[] = (journal.pages as any)?.contents ?? []
+		const parts: string[] = []
+		for (const page of pages) {
+			if (page.type !== 'text') continue
+			const text = stripHtml(page.text?.content || '')
+			if (!text) continue
+			parts.push(pages.length > 1 ? `## ${page.name}\n${text}` : text)
+		}
 
-	if (toolName === 'read_my_notes') {
-		const content = stripHtml(page.text?.content || '')
-		return JSON.stringify({ notes: content || '(nothing written yet)' })
+		let content = parts.join('\n\n')
+		let truncated = false
+		if (content.length > PLAYER_JOURNAL_READ_MAX) {
+			content = content.slice(0, PLAYER_JOURNAL_READ_MAX)
+			truncated = true
+		}
+		return JSON.stringify({
+			journal: journal.name,
+			content: content || '(nothing written yet)',
+			...(truncated ? { truncated: true, note: 'Journal too long to show in full.' } : {}),
+		})
 	}
 
-	// write_my_notes
+	// write_my_journal — appends to the character's own page, never a GM lore page.
 	let args: { content?: string } = {}
 	try {
 		args = JSON.parse(argsJson)
@@ -999,13 +1061,23 @@ async function executeNotesTool(player: AIPlayerConfig, toolName: string, argsJs
 	const note = (args.content || '').trim()
 	if (!note) return JSON.stringify({ error: 'No content provided.' })
 
+	const pages: any[] = (journal.pages as any)?.contents ?? []
+	let page = pages.find((p) => p.type === 'text' && p.name === PLAYER_WRITE_PAGE_NAME)
+	if (!page) {
+		const created = await (journal as any).createEmbeddedDocuments('JournalEntryPage', [
+			{ name: PLAYER_WRITE_PAGE_NAME, type: 'text', text: { content: '', format: 1 } },
+		])
+		page = created?.[0]
+	}
+	if (!page) return JSON.stringify({ error: 'Could not find or create your notes page.' })
+
 	const existing = page.text?.content || ''
 	const timestamp = new Date().toLocaleString()
 	const entry = `<p><em>${timestamp}</em> — ${note}</p>`
 	const updated = existing ? `${existing}\n${entry}` : entry
 
 	await page.update({ text: { content: updated } })
-	return JSON.stringify({ success: true, message: 'Saved to your personal notes.' })
+	return JSON.stringify({ success: true, message: 'Written in your journal.' })
 }
 
 // ---- Chat log helpers ----

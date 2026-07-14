@@ -84,6 +84,16 @@ function isActorFolderAllowed(folderId: string | undefined | null): boolean {
 	return isAllowed
 }
 
+/** Return a folder ID for both hydrated Foundry documents and serialized IDs. */
+function getDocumentFolderId(folder: unknown): string | undefined {
+	if (typeof folder === 'string') return folder
+	if (folder && typeof folder === 'object' && 'id' in folder) {
+		const id = (folder as { id?: unknown }).id
+		return typeof id === 'string' ? id : undefined
+	}
+	return undefined
+}
+
 function isSceneFolderAllowed(folderId: string | undefined | null): boolean {
 	const allowed = getSetting('sceneFolders') || []
 	if (allowed.length === 0) {
@@ -665,6 +675,7 @@ const SCENE_TOOLS: ToolDefinition[] = [
 					},
 					grid_distance: { type: 'number', description: 'Grid square distance value (e.g. 5 for 5ft squares)' },
 					grid_units: { type: 'string', description: 'Grid distance units (e.g. "ft")' },
+					grid_opacity: { type: 'number', description: 'Grid opacity from 0 (fully transparent) to 1 (fully opaque)' },
 					darkness: { type: 'number', description: 'Scene darkness level from 0 (fully lit) to 1 (pitch black). E.g. 0 for daytime, 0.5 for dusk, 0.85 for night.' },
 				},
 				required: ['scene_id'],
@@ -1107,6 +1118,27 @@ const AUDIO_TOOLS: ToolDefinition[] = [
 
 // == Chat & Narration Tools ==
 const CHAT_TOOLS: ToolDefinition[] = [
+	{
+		type: 'function',
+		function: {
+			name: 'read_table_chat',
+			description:
+				"Read the most recent messages from the TABLE's chat log (the Foundry chat sidebar where players and AI players talk) — NOT this assistant conversation. Use it to catch up on what has happened at the table before reacting: e.g. when the GM asks you to read what the AI players said and respond, pair this with post_chat_message to deliver the DM reply. Each message includes its speaker and an \"automated\" flag marking AI-player/autonomous-DM posts.",
+			parameters: {
+				type: 'object',
+				properties: {
+					limit: {
+						type: 'number',
+						description: 'How many recent messages to return, 1–50 (default 15). Returned oldest-first.',
+					},
+					include_hidden: {
+						type: 'boolean',
+						description: 'Include whispers and GM-only messages (default false). Fine to enable — this assistant serves the GM.',
+					},
+				},
+			},
+		},
+	},
 	{
 		type: 'function',
 		function: {
@@ -2233,6 +2265,8 @@ export async function executeTool(toolCall: ToolCall, options: { playerScoped?: 
 				return await handlePlayTrack(args.playlist_id, args.track_name)
 
 			// Chat tools
+			case 'read_table_chat':
+				return handleGetRecentChat({ limit: args.limit ?? 15, include_hidden: args.include_hidden })
 			case 'post_chat_message':
 				return await handlePostChatMessage(args.content, args.speaker_name, args.whisper_to)
 
@@ -2338,6 +2372,10 @@ export async function executeTool(toolCall: ToolCall, options: { playerScoped?: 
 			// "listen" for table chat.
 			case 'get_chat_since':
 				return handleGetChatSince(args)
+			// Bridge-only: immediate snapshot companion to get_chat_since / wait-for-chat.
+			// Returns the latest visible chat lines right now instead of blocking.
+			case 'get_recent_chat':
+				return handleGetRecentChat(args)
 			case 'generate_image':
 				return await handleGenerateImage(args)
 			case 'generate_scene':
@@ -2706,6 +2744,12 @@ function handleListActorsInFolder(folderId: string): string {
 	if (!game.actors) {
 		return JSON.stringify({ error: 'Actor collection not available' })
 	}
+	const folder = game.folders?.get(folderId)
+	if (!folder || (folder as any).type !== 'Actor') {
+		return JSON.stringify({
+			error: `Folder not found: "${folderId}". folder_id must be an actor folder ID — call list_folders to get the correct ID.`,
+		})
+	}
 
 	if (!isActorFolderAllowed(folderId)) {
 		console.log(`FoundryAI | list_actors_in_folder: folder not allowed`)
@@ -2716,12 +2760,11 @@ function handleListActorsInFolder(folderId: string): string {
 
 	const actors: Array<{ id: string; name: string; type: string; img: string | null }> = []
 	for (const actor of game.actors.values()) {
-		if (actor.folder?.id === folderId) {
+		if (getDocumentFolderId(actor.folder) === folderId) {
 			actors.push({ id: actor.id, name: actor.name, type: actor.type, img: actor.img || null })
 		}
 	}
 
-	const folder = game.folders?.get(folderId)
 	return JSON.stringify({
 		folder: folder?.name || 'Unknown',
 		actors,
@@ -3023,7 +3066,8 @@ function handleListFolders(type: string): string {
 
 	if (type === 'actor' || type === 'all') {
 		const all = collectionReader.getActorFolders()
-		result.actorFolders = allowedActorIds.length > 0 ? all.filter((f) => allowedActorIds.includes(f.id)) : all
+		const accessibleActorIds = allowedActorIds.length > 0 ? collectionReader.resolveWithChildren(allowedActorIds) : null
+		result.actorFolders = accessibleActorIds ? all.filter((f) => accessibleActorIds.includes(f.id)) : all
 	}
 
 	if (type === 'scene' || type === 'all') {
@@ -3082,6 +3126,9 @@ async function handleCreateFolder(
 	}
 
 	const allowed = getSetting(settingKey) || []
+	// An empty allow-list means this document type is unrestricted, so writing a
+	// single ID would accidentally restrict access to every other folder. When
+	// restrictions are active, always grant the newly created folder explicitly.
 	if (created && folder?.id && allowed.length > 0 && !allowed.includes(folder.id)) {
 		await setSetting(settingKey, [...allowed, folder.id])
 		console.log(`FoundryAI | create_folder: granted access to new ${type} folder "${trimmedName}" (${folder.id})`)
@@ -3264,9 +3311,34 @@ function handleViewScene(sceneId: string): string {
 	if (!scene) return JSON.stringify({ error: `Scene not found: ${sceneId}` })
 	if (!isSceneFolderAllowed(scene.folder?.id)) return JSON.stringify({ error: `Scene not found: ${sceneId}` })
 
-	const details = collectionReader.getSceneDetails(sceneId)
-	if (!details) return JSON.stringify({ error: `Scene not found: ${sceneId}` })
-	return details
+	// MCP tool responses are decoded as JSON. Do not return the collection reader's
+	// human-readable, multi-line scene summary here.
+	const sceneData = scene as any
+	return JSON.stringify({
+		id: scene.id,
+		name: scene.name,
+		active: scene.active,
+		navigation: scene.navigation,
+		folder: scene.folder?.name ?? null,
+		img: scene.background?.src ?? sceneData.img ?? null,
+		width: sceneData.width ?? scene.dimensions?.sceneWidth ?? scene.dimensions?.width ?? null,
+		height: sceneData.height ?? scene.dimensions?.sceneHeight ?? scene.dimensions?.height ?? null,
+		grid: scene.grid ?? null,
+		tokens: Array.from(scene.tokens?.values() ?? []).map((token: any) => ({
+			id: token.id,
+			name: token.name,
+			actorId: token.actorId,
+			x: token.x,
+			y: token.y,
+			hidden: token.hidden,
+		})),
+		notes: Array.from(scene.notes?.values() ?? []).map((note: any) => ({
+			id: note.id,
+			x: note.x,
+			y: note.y,
+			text: note.text,
+		})),
+	})
 }
 
 async function handleActivateScene(sceneId: string): Promise<string> {
@@ -3291,8 +3363,13 @@ async function handleUpdateScene(args: Record<string, any>): Promise<string> {
 
 		if (args.name) updates.name = args.name
 
-		if (args.grid_distance || args.grid_units) {
-			updates.grid = { ...scene.grid, ...(args.grid_distance ? { distance: args.grid_distance } : {}), ...(args.grid_units ? { units: args.grid_units } : {}) }
+		if (args.grid_distance !== undefined || args.grid_units !== undefined || args.grid_opacity !== undefined) {
+			updates.grid = {
+				...scene.grid,
+				...(args.grid_distance !== undefined ? { distance: args.grid_distance } : {}),
+				...(args.grid_units !== undefined ? { units: args.grid_units } : {}),
+				...(args.grid_opacity !== undefined ? { alpha: Math.max(0, Math.min(1, args.grid_opacity)) } : {}),
+			}
 		}
 
 		if (args.darkness !== undefined) {
@@ -6152,6 +6229,41 @@ function handleGetChatSince(args: Record<string, any>): string {
 	return JSON.stringify({ messages, count: messages.length, latest_id: latestId })
 }
 
+/**
+ * Bridge-only sibling to get_chat_since: return the last N visible chat
+ * messages immediately, oldest first, plus the current latest_id so an MCP
+ * client can pivot straight into wait-for-chat from that point.
+ */
+function handleGetRecentChat(args: Record<string, any>): string {
+	const all = game.messages?.contents ?? []
+	const includeHidden = args.include_hidden === true
+	const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50)
+	const latestId = all.length > 0 ? all[all.length - 1].id : null
+
+	const visible: Array<Record<string, any>> = []
+	for (let i = all.length - 1; i >= 0 && visible.length < limit; i--) {
+		const m: any = all[i]
+		if (!includeHidden && ((m.whisper?.length ?? 0) > 0 || m.blind)) continue
+		const text = (m.content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+		if (!text) continue
+
+		let speaker = m.speaker?.alias
+		if (!speaker && m.speaker?.actor) speaker = game.actors?.get(m.speaker.actor)?.name
+		if (!speaker) speaker = m.user?.name || 'Someone'
+
+		visible.push({
+			id: m.id,
+			speaker,
+			content: text,
+			automated: !!m.getFlag?.(MODULE_ID_FLAG_SCOPE, 'automated'),
+			timestamp: m.timestamp,
+		})
+	}
+
+	visible.reverse()
+	return JSON.stringify({ messages: visible, count: visible.length, latest_id: latestId })
+}
+
 /** Flag scope used by the AI player runtime when stamping automated messages. */
 const MODULE_ID_FLAG_SCOPE = 'foundry-ai'
 
@@ -6351,10 +6463,11 @@ async function handleGenerateScene(args: Record<string, any>): Promise<string> {
 				size: 100,
 				distance: args.grid_distance || 5,
 				units: args.grid_units || 'ft',
-			},
-			padding: 0,
-			navigation: true,
-		}
+		},
+		padding: 0,
+		backgroundColor: '#000000',
+		navigation: true,
+	}
 
 		if (sceneFolderId) sceneData.folder = sceneFolderId
 

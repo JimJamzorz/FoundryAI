@@ -40,6 +40,7 @@ interface Game {
 interface FoundryAIApi {
 	chat: (message: string) => Promise<string>
 	openChat: () => void
+	popoutChatLog: () => foundry.applications.api.ApplicationV2
 	reindex: () => Promise<void>
 	generateSessionRecap: () => Promise<void>
 	getMCPBridge: () => Promise<import('../core/mcp-bridge').MCPBridge | null>

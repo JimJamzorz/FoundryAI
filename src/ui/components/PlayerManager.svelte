@@ -15,6 +15,7 @@
   let humanCap = $state(5);
   let orchestrationEnabled = $state(false);
   let keepSceneMoving = $state(false);
+  let includeDMModel = $state(true);
   let isSaving = $state(false);
 
   // Orchestrator model override — optional, separate from the DM's main Chat Model.
@@ -41,6 +42,7 @@
       humanCap = getSetting('aiPlayerHumanCap') ?? 5;
       orchestrationEnabled = getSetting('aiOrchestrationEnabled') ?? false;
       keepSceneMoving = getSetting('aiKeepSceneMoving') ?? false;
+      includeDMModel = getSetting('aiIncludeDMModel') ?? true;
       orchestratorProviderId = getSetting('orchestratorProviderId') ?? '';
       orchestratorModel = getSetting('orchestratorModel') ?? '';
       if (orchestratorProviderId) loadOrchestratorModels(orchestratorProviderId);
@@ -71,6 +73,18 @@
 
   const availableActors = $derived.by(() => getAvailableActors());
 
+  // ---- Journals (for the per-player knowledge journal picker) ----
+  function getAvailableJournals(): Array<{ id: string; name: string; folder: string }> {
+    if (!game.journal) return [];
+    const journals: Array<{ id: string; name: string; folder: string }> = [];
+    for (const j of game.journal.values()) {
+      journals.push({ id: j.id, name: j.name, folder: (j as any).folder?.name ?? '' });
+    }
+    return journals.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  const availableJournals = $derived.by(() => getAvailableJournals());
+
   // ---- Roster actions ----
   function addPlayer() {
     const id = crypto.randomUUID();
@@ -83,6 +97,7 @@
         actorName: '',
         providerId: '',
         model: '',
+        journalId: '',
         systemPromptOverride: '',
         enabled: true,
       },
@@ -159,6 +174,7 @@
       await setSetting('aiPlayerHumanCap', humanCap);
       await setSetting('aiOrchestrationEnabled', orchestrationEnabled);
       await setSetting('aiKeepSceneMoving', keepSceneMoving);
+      await setSetting('aiIncludeDMModel', includeDMModel);
       await setSetting('orchestratorProviderId', orchestratorProviderId);
       await setSetting('orchestratorModel', orchestratorModel);
       ui.notifications.info('AI Players saved!');
@@ -197,6 +213,15 @@
         A WAIT decision becomes a DM narration beat instead of silence, and if the DM declines to narrate, the
         orchestrator gets one more chance to pick a player. The table drives itself until the cap below is hit or
         a human speaks — chattier by design, the cap is the brake.
+      </small>
+
+      <label class="enabled-toggle orchestration-toggle" style="margin-top: 12px;">
+        <input type="checkbox" bind:checked={includeDMModel} disabled={!orchestrationEnabled} />
+        Include DM Model
+      </label>
+      <small class="field-hint-inline block">
+        Lets the orchestrator pick the DM for autonomous narration beats. Turn this off if you want the trigger loop
+        limited to AI players only.
       </small>
 
       <div class="field" style="margin-top: 12px;">
@@ -323,6 +348,25 @@
               <option value={actor.id}>{actor.name}</option>
             {/each}
           </select>
+        </div>
+
+        <div class="field">
+          <label for={`journal-${player.id}`}>Journal</label>
+          <select
+            id={`journal-${player.id}`}
+            value={player.journalId ?? ''}
+            onchange={(e) => updatePlayer(player.id, { journalId: (e.target as HTMLSelectElement).value })}
+          >
+            <option value="">— Auto: private journal (created on first use) —</option>
+            {#each availableJournals as j (j.id)}
+              <option value={j.id}>{j.name}{j.folder ? ` — ${j.folder}` : ''}</option>
+            {/each}
+          </select>
+          <small class="field-hint-inline block">
+            This character's entire world knowledge: the ONE journal they can read and write. Everything else —
+            adventure text, spoilers, other journals — is invisible to them. Their own entries land on a
+            "Character Notes" page inside it.
+          </small>
         </div>
 
         <div class="model-row">

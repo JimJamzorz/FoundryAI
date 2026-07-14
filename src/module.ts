@@ -13,7 +13,7 @@ import { registerCampaignHooks } from '@core/campaign-hooks'
 import { registerSessionEventHooks } from '@core/session-event-hooks'
 import { registerAIPlayerHooks } from '@core/ai-player-runtime'
 import { sessionEventBuffer } from '@core/session-event-buffer'
-import { openPopoutChat, openToolRunnerDialog, openPlayerManagerDialog } from '@ui/svelte-application'
+import { openPopoutChat, openToolRunnerDialog, openPlayerManagerDialog, createSvelteSidebarTabClass, openChatLogPopout } from '@ui/svelte-application'
 import { buildSystemPrompt } from '@core/system-prompt'
 import ChatWindow from '@ui/components/ChatWindow.svelte'
 import ToolRunner from '@ui/components/ToolRunner.svelte'
@@ -37,6 +37,17 @@ Hooks.once('init', () => {
 
 	// Register scene control button (must be before first render)
 	registerSceneControlButton()
+
+	// Register the sidebar tab (must be before first render)
+	if (getSetting('showSidebarTab')) {
+		foundry.applications.sidebar.Sidebar.TABS[MODULE_ID] = {
+			id: MODULE_ID,
+			icon: 'fas fa-brain',
+			label: 'FoundryAI',
+			cls: createSvelteSidebarTabClass(ChatWindow),
+			order: 100,
+		}
+	}
 })
 
 Hooks.once('ready', async () => {
@@ -98,6 +109,7 @@ Hooks.once('ready', async () => {
 	game.foundryAI = {
 		chat: publicChat,
 		openChat: () => openPopoutChat(ChatWindow),
+		popoutChatLog: () => openChatLogPopout(),
 		reindex: publicReindex,
 		generateSessionRecap: publicGenerateRecap,
 		getMCPBridge: () => import('@core/mcp-bridge').then(m => m.mcpBridge),
@@ -236,6 +248,18 @@ function registerSceneControlButton() {
 				order: 100,
 				onChange: (_event: Event, _active: boolean) => {
 					openPopoutChat(ChatWindow)
+				},
+			}
+
+			// Pop the native Foundry chat log out into its own freely-resizable window.
+			tokenGroup.tools[`${MODULE_ID}-popout-chat`] = {
+				name: `${MODULE_ID}-popout-chat`,
+				title: 'Pop Out Chat Log',
+				icon: 'fas fa-comments',
+				button: true,
+				order: 103,
+				onChange: (_event: Event, _active: boolean) => {
+					openChatLogPopout()
 				},
 			}
 
