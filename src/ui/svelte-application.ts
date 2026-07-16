@@ -599,6 +599,37 @@ export function openPlayerManagerDialog(component: Component<any>, props: Record
 	return playerManagerInstance
 }
 
+/**
+ * Open a private GM ↔ AI-player interview ("Table Talk") window. One window
+ * per player — talking to a second player opens alongside the first.
+ */
+export function openPlayerInterviewDialog(
+	component: Component<any>,
+	props: { player: { id: string; name: string; actorName?: string } } & Record<string, any>,
+): SvelteApplication {
+	const displayName = props.player.actorName || props.player.name
+	const app = new SvelteApplication(component, props, {
+		id: `foundry-ai-table-talk-${props.player.id}`,
+		window: {
+			frame: true,
+			positioned: true,
+			title: `Table Talk — ${displayName}`,
+			icon: 'fas fa-comments',
+			minimizable: true,
+			resizable: true,
+			contentTag: 'section',
+			contentClasses: ['foundry-ai-content'],
+		},
+		position: {
+			width: 520,
+			height: 640,
+		},
+	})
+
+	app.render(true)
+	return app
+}
+
 /** Close the popout chat if open */
 export function closePopoutChat(): void {
 	if (popoutInstance?.rendered) {

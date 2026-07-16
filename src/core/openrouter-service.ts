@@ -788,8 +788,10 @@ export class OpenRouterService {
 
 	// ---- Text-to-Speech ----
 
-	async generateSpeech(input: string, voice?: string, model?: string): Promise<ArrayBuffer> {
-		if (!this.isConfigured) throw new Error('No API provider configured')
+	async generateSpeech(input: string, voice?: string, model?: string, speed?: number): Promise<ArrayBuffer> {
+		if (!this.tts.apiKey && this.tts.baseUrl === OPENROUTER_BASE) {
+			throw new Error('No TTS provider configured')
+		}
 
 		const selectedVoice = voice || 'nova'
 		const selectedModel = model || this.ttsModel || 'openai/gpt-4o-mini-tts'
@@ -797,6 +799,40 @@ export class OpenRouterService {
 		console.log(
 			`FoundryAI | API generateSpeech — model: ${selectedModel}, voice: ${selectedVoice}, input length: ${input.length}`,
 		)
+
+		// OpenRouter serves audio as base64 chunks inside a streamed chat completion.
+		// Local TTS servers (including Kokoro-FastAPI) and OpenAI's native API instead
+		// implement the standard OpenAI POST /audio/speech endpoint, which returns the
+		// audio bytes directly. Keep OpenRouter's established path while allowing either
+		// kind of OpenAI-compatible local TTS provider to be selected independently.
+		if (this.tts.baseUrl !== OPENROUTER_BASE) {
+			const response = await fetch(`${this.tts.baseUrl}/audio/speech`, {
+				method: 'POST',
+				headers: this.headersFor(this.tts),
+				body: JSON.stringify({
+					model: selectedModel,
+					input,
+					voice: selectedVoice,
+					response_format: 'wav',
+					...(typeof speed === 'number' ? { speed } : {}),
+				}),
+			})
+
+			if (!response.ok) {
+				const raw = await response.text()
+				let message = raw || response.statusText
+				try {
+					const error = JSON.parse(raw)
+					message = error.message || error.error?.message || error.detail || message
+				} catch { /* retain non-JSON error body */ }
+				throw new Error(`TTS error (${response.status}): ${message}`)
+			}
+
+			const audio = await response.arrayBuffer()
+			if (audio.byteLength === 0) throw new Error('No audio data received from TTS model')
+			console.log(`FoundryAI | TTS audio generated: ${audio.byteLength} bytes from OpenAI-compatible speech endpoint`)
+			return audio
+		}
 
 		const body = {
 			model: selectedModel,

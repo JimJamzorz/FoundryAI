@@ -4,6 +4,7 @@
   import { collectionReader } from '@core/collection-reader';
   import { getSetting, setSetting, type ApiProvider } from '../../settings';
   import { listComfyTemplates } from '@core/comfy-workflows';
+  import { playTTS } from '@core/tts-service';
 
   interface Props {
     application?: any;
@@ -19,6 +20,7 @@
   let visionProvider = $state('');
   let ttsProvider = $state('');
   let comfyUrl = $state('');
+  let uiFontSize = $state(0);
   let providerTesting = $state<Record<string, boolean>>({});
   let providerTestResults = $state<Record<string, {success: boolean; message: string} | null>>({});
 
@@ -42,6 +44,7 @@
   let enableSpatialTools = $state(true);
   let enableTTS = $state(true);
   let ttsVoice = $state('nova');
+	let ttsSpeed = $state(1);
   let enableActorTools = $state(true);
   let enableItemTools = $state(true);
   let enableMacroTools = $state(true);
@@ -88,6 +91,7 @@
       visionProvider = getSetting('visionProvider') || '';
       ttsProvider = getSetting('ttsProvider') || '';
       comfyUrl = getSetting('comfyUrl') || '';
+      uiFontSize = getSetting('uiFontSize') ?? 0;
       chatModel = getSetting('chatModel') || 'anthropic/claude-sonnet-4';
       embeddingModel = getSetting('embeddingModel') || 'openai/text-embedding-3-small';
       temperature = getSetting('temperature') ?? 0.8;
@@ -108,6 +112,7 @@
       enableSpatialTools = getSetting('enableSpatialTools') ?? true;
       enableTTS = getSetting('enableTTS') ?? true;
       ttsVoice = getSetting('ttsVoice') || 'nova';
+		ttsSpeed = getSetting('ttsSpeed') ?? 1;
       enableActorTools = getSetting('enableActorTools') ?? true;
       enableItemTools = getSetting('enableItemTools') ?? true;
       enableMacroTools = getSetting('enableMacroTools') ?? true;
@@ -264,6 +269,7 @@
       await setSetting('visionProvider', visionProvider);
       await setSetting('ttsProvider', ttsProvider);
       await setSetting('comfyUrl', comfyUrl);
+      await setSetting('uiFontSize', uiFontSize);
       await setSetting('chatModel', chatModel);
       await setSetting('embeddingModel', embeddingModel);
       await setSetting('temperature', temperature);
@@ -284,6 +290,7 @@
       await setSetting('enableSpatialTools', enableSpatialTools);
       await setSetting('enableTTS', enableTTS);
       await setSetting('ttsVoice', ttsVoice);
+		await setSetting('ttsSpeed', ttsSpeed);
       await setSetting('enableActorTools', enableActorTools);
       await setSetting('enableItemTools', enableItemTools);
       await setSetting('enableMacroTools', enableMacroTools);
@@ -320,6 +327,13 @@
     } finally {
       isSaving = false;
     }
+  }
+
+  function testTTS(event: MouseEvent) {
+    const button = event.currentTarget as HTMLElement;
+    playTTS('Welcome, adventurers. Your local text to speech is ready.', button, ttsVoice).catch((err: any) => {
+      ui.notifications.error(`TTS failed: ${err.message}`);
+    });
   }
 
   function toggleFolder(list: string[], folderId: string): string[] {
@@ -510,6 +524,15 @@
         </p>
       </div>
 
+      <div class="field">
+        <label for="ui-font-size">UI Font Size <span class="field-hint-inline">(px — just you, not other players)</span></label>
+        <input id="ui-font-size" type="number" min="0" max="32" step="1" bind:value={uiFontSize} />
+        <p class="comfy-hint">
+          Scales nearly all Foundry text (chat, sidebar, windows) without zooming the canvas. 0 = Foundry default
+          (16). Try 18–20. Applies when you save.
+        </p>
+      </div>
+
       {@render modelProviderSelect(
         'Vision Model', visionModel, visionProvider, loadingVisionModels, visionModels, visionModelFilter,
         'optional — falls back to chat model',
@@ -642,13 +665,36 @@
       <div class="field" style="margin-left: 1.5rem;">
         <label for="tts-voice">TTS Voice</label>
         <select id="tts-voice" bind:value={ttsVoice}>
-          <option value="alloy">Alloy</option>
-          <option value="echo">Echo</option>
-          <option value="fable">Fable</option>
-          <option value="onyx">Onyx</option>
-          <option value="nova">Nova</option>
-          <option value="shimmer">Shimmer</option>
+          <optgroup label="OpenAI / OpenRouter">
+            <option value="alloy">Alloy</option>
+            <option value="echo">Echo</option>
+            <option value="fable">Fable</option>
+            <option value="onyx">Onyx</option>
+            <option value="nova">Nova</option>
+            <option value="shimmer">Shimmer</option>
+          </optgroup>
+          <optgroup label="Kokoro">
+            <option value="af_bella">Bella (American English)</option>
+            <option value="af_sky">Sky (American English)</option>
+            <option value="af_nicole">Nicole (American English)</option>
+            <option value="af_sarah">Sarah (American English)</option>
+            <option value="am_adam">Adam (American English)</option>
+            <option value="am_michael">Michael (American English)</option>
+            <option value="bf_emma">Emma (British English)</option>
+            <option value="bm_george">George (British English)</option>
+          </optgroup>
         </select>
+        <div class="tts-setting-actions">
+          <p class="comfy-hint">For a local Kokoro server, choose a Kokoro voice and set its provider URL to <code>http://localhost:8880/v1</code>.</p>
+          <button type="button" class="inline-btn" onclick={testTTS} title="Generate a short test line with the selected TTS voice">
+            <i class="fas fa-volume-up"></i> Test Voice
+          </button>
+        </div>
+      </div>
+      <div class="field" style="margin-left: 1.5rem;">
+        <label for="tts-speed">Speech Speed: {ttsSpeed.toFixed(2)}×</label>
+        <input id="tts-speed" type="range" min="0.5" max="2" step="0.05" bind:value={ttsSpeed} />
+        <p class="comfy-hint">1.0× is natural pace. Try 0.85× for deliberate narration or 1.15× for quicker table talk.</p>
       </div>
       {/if}
     </section>
@@ -1143,6 +1189,16 @@
 
   .comfy-hint code {
     font-size: 0.95em;
+  }
+
+  .tts-setting-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .tts-setting-actions .comfy-hint {
+    flex: 1;
   }
 
   .comfy-workflow-btn {

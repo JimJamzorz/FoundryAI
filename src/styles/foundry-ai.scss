@@ -117,6 +117,44 @@ nav.tabs [data-tab='foundry-ai'] {
 	}
 }
 
+// ---- Native Chat Log TTS ----
+.foundry-ai-tts-chat-message {
+	align-items: center;
+	background: transparent;
+	border: 0;
+	border-radius: 3px;
+	color: var(--color-text-dark-5, #999);
+	cursor: pointer;
+	display: inline-flex;
+	font-size: 0.9em;
+	justify-content: center;
+	margin-left: 0.35rem;
+	padding: 0.15rem 0.3rem;
+
+	&:hover {
+		background: rgba(139, 92, 246, 0.18);
+		color: var(--color-text-light-0, #fff);
+	}
+}
+
+.foundry-ai-tts-segment {
+	background: transparent;
+	border: 0;
+	color: var(--color-text-dark-5, #999);
+	font-size: 0.75em;
+	margin-left: auto;
+	max-width: 10rem;
+	padding: 0.1rem;
+}
+
+.foundry-ai-stop-tts,
+.foundry-ai-orchestration-toggle {
+	&.active {
+		color: var(--color-warm-1, #f0b000);
+		text-shadow: 0 0 6px rgba(240, 176, 0, 0.5);
+	}
+}
+
 // ---- Scrollbar Styling ----
 .foundry-ai {
 	* {

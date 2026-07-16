@@ -33,6 +33,10 @@ export interface AIPlayerConfig {
 	/** API provider ID (references an entry in apiProviders) — lets each player point at a different LLM. */
 	providerId: string
 	model: string
+	/** Optional voice for this player's messages. Empty uses the global TTS voice. */
+	ttsVoice?: string
+	/** Speak the player's table posts automatically through the local TTS queue. */
+	autoSpeak?: boolean
 	/** The ONE journal this player can read and write — their entire world
 	 *  knowledge beyond live chat and their character sheet. Everything else
 	 *  is blocked. Empty = an auto-created private notes journal. */
@@ -56,6 +60,7 @@ export interface FoundryAISettings {
 	embeddingModel: string
 	visionModel: string
 	ttsModel: string
+	ttsSpeed: number
 	journalFolders: string[]
 	actorFolders: string[]
 	sceneFolders: string[]
@@ -95,6 +100,7 @@ export interface FoundryAISettings {
 	aiPlayerHumanCap: number
 	aiOrchestrationEnabled: boolean
 	aiKeepSceneMoving: boolean
+	uiFontSize: number
 	aiIncludeDMModel: boolean
 	orchestratorProviderId: string
 	orchestratorModel: string
@@ -504,6 +510,15 @@ export function registerSettings(): void {
 		default: 'nova',
 	})
 
+	game.settings.register(MODULE_ID, 'ttsSpeed', {
+		name: 'TTS Speed',
+		hint: 'Speech rate for OpenAI-compatible local TTS providers such as Kokoro. 1.0 is natural pace.',
+		scope: 'world',
+		config: false,
+		type: Number,
+		default: 1,
+	})
+
 	// ---- Context Management ----
 
 	game.settings.register(MODULE_ID, 'contextSummarizeThreshold', {
@@ -574,6 +589,16 @@ export function registerSettings(): void {
 		default: false,
 	})
 
+	game.settings.register(MODULE_ID, 'uiFontSize', {
+		name: 'UI Font Size',
+		hint: "Base font size in pixels for the whole Foundry interface (Foundry's UI is rem-based, so this scales nearly all text without zooming the canvas). 0 = Foundry default (16px). Per-user setting.",
+		scope: 'client',
+		config: false,
+		type: Number,
+		default: 0,
+		onChange: (value: number) => applyUiFontSize(value),
+	})
+
 	game.settings.register(MODULE_ID, 'aiKeepSceneMoving', {
 		name: 'Keep the Scene Moving',
 		hint: 'When on, an orchestrator WAIT becomes a DM narration beat instead of silence, and if the DM then declines to narrate, the orchestrator is asked once more to pick a player. The table keeps itself moving until the Human-Interaction Cap is reached or a human speaks. Chattier by design — the cap is the brake.',
@@ -623,6 +648,18 @@ export function registerSettings(): void {
 }
 
 // ---- Settings Accessor ----
+
+/**
+ * Apply the UI font-size preference to the document root. Foundry's interface
+ * sizes in rem, so setting the root font-size scales nearly all text (chat,
+ * sidebars, windows, this module's UI) while leaving the canvas alone.
+ * Clamped to a sane range; 0/empty restores Foundry's default (16px).
+ */
+export function applyUiFontSize(px?: number): void {
+	const value = px ?? (getSetting('uiFontSize') || 0)
+	const valid = typeof value === 'number' && value >= 10 && value <= 32
+	document.documentElement.style.fontSize = valid && value !== 0 ? `${value}px` : ''
+}
 
 export function getSetting<K extends keyof FoundryAISettings>(key: K): FoundryAISettings[K] {
 	return game.settings.get(MODULE_ID, key) as FoundryAISettings[K]

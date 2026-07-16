@@ -2,6 +2,9 @@
   import { onMount } from 'svelte';
   import { openRouterService, type ModelInfo } from '@core/openrouter-service';
   import { getSetting, setSetting, type ApiProvider, type AIPlayerConfig } from '../../settings';
+  import { openPlayerInterviewDialog } from '../svelte-application';
+  import PlayerInterview from './PlayerInterview.svelte';
+  import { playTTS } from '@core/tts-service';
 
   interface Props {
     application?: any;
@@ -97,6 +100,8 @@
         actorName: '',
         providerId: '',
         model: '',
+		ttsVoice: '',
+		autoSpeak: false,
         journalId: '',
         systemPromptOverride: '',
         enabled: true,
@@ -333,7 +338,66 @@
             />
             Active
           </label>
+          <button
+            class="inline-btn"
+            title="Table Talk — private chat with this player (they see recent table chat + their journal; nothing posts to the table)"
+            disabled={!player.actorId || !player.providerId || !player.model}
+            onclick={() => openPlayerInterviewDialog(PlayerInterview, { player })}
+          >
+            <i class="fas fa-comments"></i>
+          </button>
           <button class="inline-btn danger" onclick={() => removePlayer(player.id)} title="Remove">×</button>
+        </div>
+
+        <div class="field">
+          <label for={`tts-voice-${player.id}`}>TTS Voice</label>
+          <select
+            id={`tts-voice-${player.id}`}
+            value={player.ttsVoice ?? ''}
+            onchange={(e) => updatePlayer(player.id, { ttsVoice: (e.target as HTMLSelectElement).value })}
+          >
+            <option value="">— Use global TTS voice —</option>
+            <optgroup label="Kokoro">
+              <option value="af_bella">Bella (American English)</option>
+              <option value="af_sky">Sky (American English)</option>
+              <option value="af_nicole">Nicole (American English)</option>
+              <option value="af_sarah">Sarah (American English)</option>
+              <option value="am_adam">Adam (American English)</option>
+              <option value="am_michael">Michael (American English)</option>
+              <option value="bf_emma">Emma (British English)</option>
+              <option value="bm_george">George (British English)</option>
+            </optgroup>
+            <optgroup label="OpenAI / OpenRouter">
+              <option value="alloy">Alloy</option>
+              <option value="echo">Echo</option>
+              <option value="fable">Fable</option>
+              <option value="onyx">Onyx</option>
+              <option value="nova">Nova</option>
+              <option value="shimmer">Shimmer</option>
+            </optgroup>
+          </select>
+          <small class="field-hint-inline block">Used by the read-aloud button on this AI player's Chat Log messages.</small>
+          <div class="tts-player-actions">
+            <label class="enabled-toggle">
+              <input
+                type="checkbox"
+                checked={player.autoSpeak ?? false}
+                onchange={(e) => updatePlayer(player.id, { autoSpeak: (e.target as HTMLInputElement).checked })}
+              />
+              Auto-speak new table messages
+            </label>
+            <button
+              type="button"
+              class="inline-btn"
+              title="Preview this player's selected voice"
+              onclick={(e) => {
+                const button = e.currentTarget as HTMLElement;
+                playTTS(`Greetings. I am ${player.actorName || player.name}.`, button, player.ttsVoice).catch((err: any) => ui.notifications.error(`TTS failed: ${err.message}`));
+              }}
+            >
+              <i class="fas fa-volume-up"></i> Preview
+            </button>
+          </div>
         </div>
 
         <div class="field">
@@ -566,6 +630,13 @@
     display: block;
     margin-top: 5px;
     line-height: 1.4;
+  }
+
+  .tts-player-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
   }
 
   .global-settings {

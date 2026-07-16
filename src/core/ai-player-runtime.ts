@@ -37,6 +37,7 @@
    ========================================================================== */
 
 import { getSetting, type AIPlayerConfig, type ApiProvider } from '../settings'
+import { queueTTS } from './tts-service'
 import { openRouterService, TOOLS_UNSUPPORTED_NOTICE, type LLMMessage, type ToolCall, type ToolDefinition, type ProviderConfig } from './openrouter-service'
 import { buildActorRoleplayPrompt, buildSystemPrompt } from './system-prompt'
 import { getToolsByNames, executeTool } from './tool-system'
@@ -197,6 +198,7 @@ This is an established campaign with source material. You must NOT introduce new
 
 Whatever you reply is posted to the table's chat log VERBATIM as DM narration — it is not a draft and nobody filters it.
 - If a short narration beat, environmental detail, or one line of NPC dialogue would genuinely help, reply with ONLY that text. A sentence or two — this is a nudge, not a full scene.
+- Format chat output with simple Foundry-safe HTML when emphasis helps: use <em>italic text</em>, <strong>bold text</strong>, <p>paragraphs</p>, and <br> for line breaks. Do NOT use Markdown syntax at all — never use *, **, ***, _, #, blockquotes, or Markdown lists. Plain text is preferred when no formatting is needed.
 - If the party is STALLING — circling the same spot, re-investigating what they've already examined, nobody committing to a direction — apply pressure with pure atmosphere: a sound drawing nearer, the light failing, the cold deepening, something changed because time passed. Make waiting cost something and give them a reason to move. (This needs no canon — time and weather are always yours.)
 - If nothing needs to happen — the scene doesn't need advancing, or this is a moment for a human — reply with EXACTLY: WAIT
 - Never explain what you're doing, never describe your reasoning, no speaker labels, no lists, no meta-commentary. Only the narration itself, or WAIT.`
@@ -649,7 +651,32 @@ function parseOrchestratorDecision(
 	// Strip leading list markers before parsing: models frequently echo the
 	// answer-format bullet ("- DM", "- WAIT", "- ACTOR: Kale"), which otherwise
 	// only parses correctly by fuzzy-match luck (and "- DM"/"- WAIT" not at all).
-	const firstLine = ((raw || '').trim().split('\n')[0]?.trim() ?? '').replace(/^[-*•\d.)\s]+/, '')
+	let firstLine = ((raw || '').trim().split('\n')[0]?.trim() ?? '').replace(/^[-*•\d.)\s]+/, '')
+
+	// Llama-family models sometimes answer in their function-call dialects even
+	// when NO tools were offered — {"name": "Meeris", "parameters": {}} or
+	// <function=Meeris> — treating "pick who acts" as a call where the function
+	// IS the character. Unwrap the name and parse it like any other answer.
+	// A structured answer is always an explicit pick, so unmatched names get
+	// the substitution treatment rather than silently becoming WAIT.
+	let structuredAnswer = false
+	const jsonCandidate = firstLine.startsWith('{') ? firstLine : (raw || '').trim()
+	if (jsonCandidate.startsWith('{')) {
+		try {
+			const parsed = JSON.parse(jsonCandidate)
+			if (typeof parsed?.name === 'string' && parsed.name.trim()) {
+				firstLine = parsed.name.trim()
+				structuredAnswer = true
+			}
+		} catch {
+			/* not JSON — parse as-is */
+		}
+	}
+	const fnWrap = firstLine.match(/^<function=([^>]+)>/i)
+	if (fnWrap) {
+		firstLine = fnWrap[1].trim()
+		structuredAnswer = true
+	}
 
 	/**
 	 * The model named someone who exists but isn't on the menu (rotation-hidden),
@@ -703,9 +730,10 @@ function parseOrchestratorDecision(
 	const hidden = matchPlayer(allEnabled, wanted)
 	if (hidden) return substitute(hidden.actorName || hidden.name)
 
-	// Only for prefixed answers do we treat garbage as "wanted a player":
-	// a bare unparseable line could be anything, so wait is safer there.
-	if (prefixMatch) return substitute(prefixMatch[1].trim())
+	// Only for prefixed/structured answers do we treat an unmatched name as
+	// "wanted a player" and substitute: the model explicitly picked SOMEONE.
+	// A bare unparseable line could be anything, so wait is safer there.
+	if (prefixMatch || structuredAnswer) return substitute(prefixMatch ? prefixMatch[1].trim() : wanted)
 	return { type: 'wait' }
 }
 
@@ -868,12 +896,19 @@ function hasRepeatedChunk(text: string, chunkLen = 60): boolean {
 async function postAsPlayer(player: AIPlayerConfig, content: string): Promise<void> {
 	const actor = game.actors?.get(player.actorId)
 	const speaker = actor ? ChatMessage.getSpeaker({ actor }) : { alias: player.name }
+	const playerFlags: Record<string, unknown> = { aiPlayerId: player.id, automated: true }
+	if (player.ttsVoice) playerFlags.ttsVoice = player.ttsVoice
 
 	await ChatMessage.create({
 		content,
 		speaker,
-		flags: { [MODULE_ID]: { aiPlayerId: player.id, automated: true } },
+		flags: { [MODULE_ID]: playerFlags },
 	})
+	if (player.autoSpeak) {
+		void queueTTS(content, { voice: player.ttsVoice }).catch((error) => {
+			console.error(`FoundryAI | Auto-speak failed for AI player "${player.actorName || player.name}":`, error)
+		})
+	}
 
 	console.log(`FoundryAI | AI player "${player.actorName || player.name}" spoke up.`)
 }
@@ -903,7 +938,7 @@ async function executePlayerTool(player: AIPlayerConfig, call: ToolCall): Promis
 // ---- Autonomous DM narration ----
 
 /** Returns true if a narration beat was actually posted, false on a pass/discard. */
-async function runAutonomousDMNarration(recentChat: string): Promise<boolean> {
+async function runAutonomousDMNarration(recentChat: string, automated = true): Promise<boolean> {
 	if (!openRouterService.isConfigured) {
 		console.warn('FoundryAI | Autonomous DM narration: no API provider configured — skipping.')
 		return false
@@ -969,11 +1004,15 @@ async function runAutonomousDMNarration(recentChat: string): Promise<boolean> {
 		return false
 	}
 
+	const flags: Record<string, unknown> = automated
+		? { automated: true, autonomousDM: true }
+		: { manualDMBeat: true }
+
 	await ChatMessage.create({
 		content: finalRaw,
-		flags: { [MODULE_ID]: { automated: true, autonomousDM: true } },
+		flags: { [MODULE_ID]: flags },
 	})
-	console.log('FoundryAI | Autonomous DM: posted a narration beat.')
+	console.log(`FoundryAI | ${automated ? 'Autonomous' : 'Manual'} DM: posted a narration beat.`)
 	return true
 }
 
@@ -984,6 +1023,110 @@ async function runAutonomousDMNarration(recentChat: string): Promise<boolean> {
  */
 function isSentinel(text: string, sentinel: string): boolean {
 	return new RegExp(`^["'\`*\\s]*${sentinel}["'\`*.!\\s]*$`, 'i').test(text.trim())
+}
+
+// ---- Manual DM beat ----
+
+/**
+ * GM-triggered "read the table and respond" — one autonomous-DM narration
+ * turn on demand. It shares the autonomous-DM's canon and safety rules but
+ * its resulting chat message is deliberately treated as a manual GM action:
+ * it is not marked automated, so it can wake the AI-player orchestrator.
+ */
+export async function triggerDMBeat(): Promise<void> {
+	if (!game.user?.isGM) return
+	if (turnsInFlight.has(DM_TURN_KEY)) {
+		ui.notifications?.warn('FoundryAI: the DM is already composing a beat.')
+		return
+	}
+
+	const recentChat = getRecentChatLines(CONTEXT_MESSAGE_LIMIT)
+	if (!recentChat) {
+		ui.notifications?.warn('FoundryAI: no table chat to respond to yet.')
+		return
+	}
+
+	console.log(`${TRACE} manual DM beat requested by GM.`)
+	turnsInFlight.add(DM_TURN_KEY)
+	try {
+		const posted = await runAutonomousDMNarration(recentChat, false)
+		if (!posted) {
+			ui.notifications?.info('FoundryAI: the DM read the scene and chose not to add anything.')
+		}
+	} catch (e: any) {
+		console.error('FoundryAI | manual DM beat failed:', e)
+		ui.notifications?.error(`FoundryAI: DM beat failed — ${e?.message || e}`)
+	} finally {
+		turnsInFlight.delete(DM_TURN_KEY)
+	}
+}
+
+// ---- GM ↔ Player Interview ("Table Talk") ----
+
+const INTERVIEW_INSTRUCTIONS = `## Table Talk — Private Side Chat With Your GM
+The GM has pulled you aside for a one-on-one conversation. This is NOT the table chat — nothing said here is heard by the other characters, and your replies are not posted anywhere. Speak plainly and conversationally.
+- Stay in character, but with an actor's self-awareness: if the GM asks why you did something, explain your reasoning honestly as the character. You may discuss your own decisions candidly.
+- Your journal tools work here (read_my_journal / write_my_journal). If this conversation produces anything worth remembering at the table — guidance from the GM, a decision, a correction, a promise, a plan — WRITE IT IN YOUR JOURNAL so future-you acts on it. If the GM explicitly asks you to remember something, ALWAYS write it down.
+- The recent table chat is included below so you know exactly where things stand in the game.`
+
+/**
+ * One turn of a private GM↔player conversation (the "Table Talk" window).
+ * Same persona, same provider/model, same journal-only toolset, and the same
+ * recent-chat context the player's table turns see — so "why did you just do
+ * that?" is answerable, and anything worth keeping can be written to their
+ * journal where their future table turns will find it. Output is returned to
+ * the interview window only; nothing is posted to the table.
+ */
+export async function runPlayerInterviewTurn(player: AIPlayerConfig, conversation: LLMMessage[]): Promise<string> {
+	const providers = (getSetting('apiProviders') || []) as ApiProvider[]
+	const provider = providers.find(p => p.id === player.providerId)
+	if (!provider) {
+		return '(This player has no valid API provider configured — pick one in the AI Players window and save.)'
+	}
+
+	const persona = buildActorRoleplayPrompt(
+		{ actorId: player.actorId, actorName: player.actorName || player.name },
+		{ includeTools: false, includeFormatting: false },
+	)
+	const extra = player.systemPromptOverride?.trim()
+		? `\n\n## Additional Direction\n${player.systemPromptOverride.trim()}`
+		: ''
+	const recentChat = getRecentChatLines(CONTEXT_MESSAGE_LIMIT)
+	const systemPrompt = `${persona}${extra}\n\n${INTERVIEW_INSTRUCTIONS}\n\n## Recent Table Chat\n${recentChat || '(the table has been quiet)'}`
+
+	const tools = getPlayerToolset()
+	const messages: LLMMessage[] = [{ role: 'system', content: systemPrompt }, ...conversation]
+
+	for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+		const response = await openRouterService.chatCompletion({
+			model: player.model,
+			provider: { baseUrl: provider.baseUrl, apiKey: provider.apiKey },
+			messages,
+			tools: tools.length ? tools : undefined,
+			temperature: 0.85,
+			max_tokens: TURN_MAX_TOKENS,
+		})
+
+		const message = response.choices?.[0]?.message
+
+		if (message?.tool_calls?.length && round < MAX_TOOL_ROUNDS) {
+			messages.push({ role: 'assistant', content: message.content ?? null, tool_calls: message.tool_calls })
+			for (const call of message.tool_calls) {
+				let result: string
+				try {
+					result = await executePlayerTool(player, call)
+				} catch (e: any) {
+					result = JSON.stringify({ error: e?.message || 'Tool execution failed' })
+				}
+				messages.push({ role: 'tool', content: result, tool_call_id: call.id })
+			}
+			continue
+		}
+
+		return (message?.content ?? '').trim() || '(no response — the model returned empty content)'
+	}
+
+	return '(no response — ran out of tool rounds)'
 }
 
 // ---- Personal Notes Journal ----

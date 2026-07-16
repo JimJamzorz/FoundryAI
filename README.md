@@ -12,7 +12,7 @@ FoundryAI adds an intelligent chat assistant to your Foundry game that can read 
 - **Actor Roleplay** — Start a dedicated chat session where the AI roleplays as a specific actor, using their biography, personality traits, abilities, and equipment
 - **Session Chat History** — Conversations are saved as journal entries in the organized `FoundryAI/` folder hierarchy
 - **Session Recaps** — Generate polished narrative summaries of your sessions with AI
-- **Text-to-Speech** — Click to hear NPC dialogue read aloud via OpenRouter TTS
+- **Text-to-Speech** — Click to hear NPC dialogue read aloud via OpenRouter or a local OpenAI-compatible TTS server
 - **Organized Journal Folders** — Automatic `FoundryAI/` folder structure: Notes, Chat History, Sessions, Actors
 - **Per-Category Tool Toggles** — Enable or disable tool categories (scene, dice, token, combat, audio, chat, compendium, spatial, actor, item, macro, image/PDF) individually
 - **OpenRouter Integration** — Access any model available on OpenRouter (GPT-4o, Claude, Llama, Mistral, etc.)
@@ -76,6 +76,8 @@ Click **Generate Recap** to create a polished narrative summary from your chat s
 ### Text-to-Speech
 
 When TTS is enabled, NPC dialogue in AI responses will show a speaker button. Click it to hear the line read aloud.
+
+For local speech, add a provider with the base URL `http://localhost:8880/v1`, select it as the **TTS Provider**, select model `kokoro`, and choose a Kokoro voice such as `af_bella`. FoundryAI uses the standard OpenAI-compatible `/audio/speech` endpoint for non-OpenRouter TTS providers, including Kokoro-FastAPI.
 
 ## Tools
 

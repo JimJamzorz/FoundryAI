@@ -5,6 +5,7 @@
   import { chatSessionManager } from '@core/chat-session-manager';
   import { sessionRecapManager, type RecapProgress } from '@core/session-recap-manager';
   import { embeddingService } from '@core/embedding-service';
+  import { triggerDMBeat } from '@core/ai-player-runtime';
   import { resolveActiveTools, TOOL_GROUPS, executeTool, type ToolGroupId, type ActiveToolSelection } from '@core/tool-system';
   import { buildSystemPrompt, buildActorRoleplayPrompt, type ActorRoleplayContext } from '@core/system-prompt';
   import { estimateTokens, getModelContextLimit } from '@core/token-estimator';
@@ -879,6 +880,19 @@ IMPORTANT: You already have all the information you need about this character fr
     });
   }
 
+  // ---- Manual DM beat ----
+  let dmBeatRunning = $state(false);
+
+  async function handleDMBeat() {
+    if (dmBeatRunning) return;
+    dmBeatRunning = true;
+    try {
+      await triggerDMBeat();
+    } finally {
+      dmBeatRunning = false;
+    }
+  }
+
   // ---- Reindexing ----
   async function handleReindex() {
     if (isIndexing) return;
@@ -1045,6 +1059,14 @@ IMPORTANT: You already have all the information you need about this character fr
 
     <div class="toolbar-right">
       <ContextIndicator used={contextUsed} total={modelContextLength} isEstimate={contextIsEstimate} />
+      <button
+        class="toolbar-btn"
+        onclick={handleDMBeat}
+        disabled={dmBeatRunning}
+        title="DM beat: read the table chat and post a narration response"
+      >
+        <i class="fas fa-feather-pointed" class:fa-fade={dmBeatRunning}></i>
+      </button>
       <button
         class="toolbar-btn"
         onclick={handleSummarize}

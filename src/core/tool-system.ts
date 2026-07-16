@@ -1144,13 +1144,13 @@ const CHAT_TOOLS: ToolDefinition[] = [
 		function: {
 			name: 'post_chat_message',
 			description:
-				'Post a message to the Foundry VTT chat log visible to all players. Use for narration, NPC dialogue, or announcements.',
+				'Post a message to the Foundry VTT chat log visible to all players. Use for narration, NPC dialogue, or announcements. Use simple HTML (<em>, <strong>, <p>, <br>) for formatting; never Markdown syntax.',
 			parameters: {
 				type: 'object',
 				properties: {
 					content: {
 						type: 'string',
-						description: 'The HTML/text content of the message',
+						description: 'The message content. Use Foundry-safe HTML (<em>, <strong>, <p>, <br>) when formatting is useful; do not use Markdown.',
 					},
 					speaker_name: {
 						type: 'string',

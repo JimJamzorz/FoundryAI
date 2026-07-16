@@ -3,7 +3,7 @@
    Registers hooks, settings, sidebar tab, and exposes the public API.
    ========================================================================== */
 
-import { DEFAULT_MCP_SERVER_URL, registerSettings, getSetting } from './settings'
+import { DEFAULT_MCP_SERVER_URL, registerSettings, getSetting, setSetting, applyUiFontSize } from './settings'
 import { openRouterService } from '@core/openrouter-service'
 import { embeddingService } from '@core/embedding-service'
 import { chatSessionManager } from '@core/chat-session-manager'
@@ -11,8 +11,9 @@ import { sessionRecapManager } from '@core/session-recap-manager'
 import { ensureFoundryAIFolders } from '@core/folder-manager'
 import { registerCampaignHooks } from '@core/campaign-hooks'
 import { registerSessionEventHooks } from '@core/session-event-hooks'
-import { registerAIPlayerHooks } from '@core/ai-player-runtime'
+import { registerAIPlayerHooks, triggerDMBeat } from '@core/ai-player-runtime'
 import { sessionEventBuffer } from '@core/session-event-buffer'
+import { playTTS, stopTTS } from '@core/tts-service'
 import { openPopoutChat, openToolRunnerDialog, openPlayerManagerDialog, createSvelteSidebarTabClass, openChatLogPopout } from '@ui/svelte-application'
 import { buildSystemPrompt } from '@core/system-prompt'
 import ChatWindow from '@ui/components/ChatWindow.svelte'
@@ -37,6 +38,8 @@ Hooks.once('init', () => {
 
 	// Register scene control button (must be before first render)
 	registerSceneControlButton()
+	registerChatLogDMBeatButton()
+	registerChatMessageTTSButton()
 
 	// Register the sidebar tab (must be before first render)
 	if (getSetting('showSidebarTab')) {
@@ -53,6 +56,11 @@ Hooks.once('init', () => {
 Hooks.once('ready', async () => {
 	console.log('FoundryAI | Module ready.')
 
+	// TTS controls are available in every user's chat log. Configure the local
+	// provider before the GM-only startup work so each client can use its own
+	// TTS provider settings.
+	configureServiceFromSettings()
+
 	// Only proceed for GM
 	if (!game.user?.isGM) {
 		console.log('FoundryAI | Non-GM user, skipping initialization.')
@@ -65,9 +73,6 @@ Hooks.once('ready', async () => {
 
 	// AI Players — wakes up configured AI-controlled characters on chat activity
 	registerAIPlayerHooks()
-
-	// Configure OpenRouter service from saved providers
-	configureServiceFromSettings()
 
 	// Initialize embedding service
 	try {
@@ -141,6 +146,9 @@ Hooks.once('ready', async () => {
 
 	// Create/update the hotbar macro for easy access
 	await ensureChatMacro()
+
+	// Apply the per-user UI font-size preference
+	applyUiFontSize()
 
 	// Notification
 	ui.notifications.info('FoundryAI is ready! Use the hotbar macro or scene controls brain icon to chat.')
@@ -291,6 +299,153 @@ function registerSceneControlButton() {
 			}
 		}
 	})
+}
+
+/**
+ * Add a quill button to Foundry's chat sidebar controls: one click = one
+ * autonomous-DM beat ("read the table, respond"). GM-only.
+ */
+function registerChatLogDMBeatButton() {
+	Hooks.on('renderChatLog', (_app: any, html: any) => {
+		if (!game.user?.isGM) return
+		const root: HTMLElement | undefined = html instanceof HTMLElement ? html : html?.[0]
+		if (!root) return
+		// Chat control bar location differs across v12/v13 layouts — try known homes.
+		const controls =
+			root.querySelector('#chat-controls .control-buttons') ??
+			root.querySelector('.chat-controls .control-buttons') ??
+			root.querySelector('#chat-controls') ??
+			root.querySelector('.chat-controls')
+		if (!controls) {
+			console.debug('FoundryAI | chat log DM-beat button: no chat controls element found to attach to.')
+			return
+		}
+
+		if (!root.querySelector('.foundry-ai-dm-beat')) {
+			const btn = document.createElement('a')
+			btn.classList.add('foundry-ai-dm-beat')
+			btn.dataset.tooltip = 'FoundryAI: read the table and post a DM beat'
+			btn.setAttribute('role', 'button')
+			btn.innerHTML = '<i class="fas fa-feather-pointed"></i>'
+			btn.addEventListener('click', (e) => {
+				e.preventDefault()
+				void triggerDMBeat()
+			})
+			controls.appendChild(btn)
+		}
+
+		if (!root.querySelector('.foundry-ai-stop-tts')) {
+			const stop = document.createElement('a')
+			stop.classList.add('foundry-ai-stop-tts')
+			stop.dataset.tooltip = 'FoundryAI: stop speech and clear the voice queue'
+			stop.setAttribute('role', 'button')
+			stop.innerHTML = '<i class="fas fa-volume-xmark"></i>'
+			stop.addEventListener('click', (e) => {
+				e.preventDefault()
+				stopTTS()
+			})
+			controls.appendChild(stop)
+		}
+
+		if (!root.querySelector('.foundry-ai-orchestration-toggle')) {
+			const toggle = document.createElement('a')
+			toggle.classList.add('foundry-ai-orchestration-toggle')
+			const refresh = () => {
+				const enabled = getSetting('aiOrchestrationEnabled') === true
+				toggle.classList.toggle('active', enabled)
+				toggle.dataset.tooltip = enabled
+					? 'FoundryAI: AI orchestration is on — click to pause'
+					: 'FoundryAI: AI orchestration is paused — click to resume'
+				toggle.innerHTML = `<i class="fas fa-${enabled ? 'robot' : 'pause'}"></i>`
+			}
+			refresh()
+			toggle.addEventListener('click', async (e) => {
+				e.preventDefault()
+				await setSetting('aiOrchestrationEnabled', !getSetting('aiOrchestrationEnabled'))
+				refresh()
+			})
+			controls.appendChild(toggle)
+		}
+	})
+}
+
+/**
+ * Add a read-aloud control to every rendered message in Foundry's native chat
+ * log. This covers messages posted by AI players and `post_chat_message`, not
+ * just the assistant's own conversation panel.
+ */
+function registerChatMessageTTSButton() {
+	Hooks.on('renderChatMessage', (message: ChatMessage, html: HTMLElement | { 0?: HTMLElement }) => {
+		if (!getSetting('enableTTS')) return
+
+		const root: HTMLElement | undefined = html instanceof HTMLElement ? html : html?.[0]
+		if (!root || root.querySelector('.foundry-ai-tts-chat-message')) return
+
+		const textContainer = document.createElement('div')
+		textContainer.innerHTML = message.content || ''
+		const text = textContainer.textContent?.replace(/\s+/g, ' ').trim() || ''
+		if (!text) return
+		const segments = getTTSMessageSegments(textContainer, text)
+
+		const selector = document.createElement('select')
+		selector.classList.add('foundry-ai-tts-segment')
+		selector.title = 'Choose which part of this message to read aloud'
+		segments.forEach((segment, index) => {
+			const option = document.createElement('option')
+			option.value = String(index)
+			option.textContent = segment.label
+			selector.appendChild(option)
+		})
+
+		const button = document.createElement('button')
+		button.type = 'button'
+		button.classList.add('foundry-ai-tts-chat-message')
+		button.title = 'Read the selected chat text aloud'
+		button.setAttribute('aria-label', 'Read the selected chat text aloud')
+		button.innerHTML = '<i class="fas fa-volume-up"></i>'
+		button.addEventListener('click', (event) => {
+			event.preventDefault()
+			event.stopPropagation()
+			const segment = segments[Number(selector.value)] || segments[0]
+			const configuredVoice = (message as any).getFlag?.(MODULE_ID, 'ttsVoice')
+			const voice = typeof configuredVoice === 'string' ? configuredVoice : undefined
+			playTTS(segment.text, button, voice).catch((err: any) => {
+				console.error('FoundryAI | Chat log TTS failed:', err)
+				ui.notifications.error(`TTS failed: ${err.message}`)
+			})
+		})
+
+		const header = root.querySelector('.message-header')
+		if (header) {
+			header.appendChild(selector)
+			header.appendChild(button)
+		} else {
+			root.appendChild(selector)
+			root.appendChild(button)
+		}
+	})
+}
+
+function getTTSMessageSegments(content: HTMLElement, fullText: string): Array<{ label: string; text: string }> {
+	const segments: Array<{ label: string; text: string }> = [{ label: 'Entire message', text: fullText }]
+	const seen = new Set([fullText])
+	const add = (label: string, text: string) => {
+		const normalized = text.replace(/\s+/g, ' ').trim()
+		if (!normalized || seen.has(normalized)) return
+		seen.add(normalized)
+		segments.push({ label, text: normalized })
+	}
+
+	Array.from(content.querySelectorAll('p, li, blockquote')).forEach((element, index) => {
+		add(`Paragraph ${index + 1}: ${element.textContent?.trim().slice(0, 48) || ''}`, element.textContent || '')
+	})
+
+	const sentences = typeof Intl.Segmenter === 'function'
+		? Array.from(new Intl.Segmenter(undefined, { granularity: 'sentence' }).segment(fullText), item => item.segment)
+		: fullText.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || []
+	sentences.slice(0, 20).forEach((sentence, index) => add(`Sentence ${index + 1}: ${sentence.trim().slice(0, 48)}`, sentence))
+
+	return segments
 }
 
 // ---- Public API Implementation ----
