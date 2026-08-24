@@ -404,20 +404,42 @@ export class OpenRouterService {
 		// *entire* budget still "thinking" and never emit an actual answer or tool call at all.
 		// That looks identical to "the model had nothing to say," but it isn't — it just ran out of
 		// room mid-thought. Detected as: empty content, no tool calls, finish_reason 'length', and
-		// non-empty reasoning_content/reasoning. Retried once with a much larger budget so the model
-		// gets to actually finish. Only worth retrying if the original budget was small enough that
-		// more room plausibly helps (a model still empty-handed at 2000+ tokens has bigger problems).
+		// non-empty reasoning_content/reasoning.
 		const finishReason = result.choices?.[0]?.finish_reason
 		const reasoningText: string = message?.reasoning_content || message?.reasoning || ''
-		const isReasoningTruncation =
-			!!message && !message.content && !message.tool_calls?.length && finishReason === 'length' && !!reasoningText.trim()
-		const originalMaxTokens = body.max_tokens || 0
+		const hasToolCalls = !!message?.tool_calls?.length
+		const wasCutOff = finishReason === 'length'
+		const isReasoningTruncation = !!message && !message.content && !hasToolCalls && wasCutOff && !!reasoningText.trim()
 
-		if (isReasoningTruncation && originalMaxTokens > 0 && originalMaxTokens < 3000) {
-			const retryMaxTokens = Math.min(Math.max(originalMaxTokens * 4, 1500), 4000)
-			console.warn(
-				`FoundryAI | Model spent its entire ${originalMaxTokens}-token budget "thinking" (reasoning_content: ${reasoningText.length} chars) without producing an answer — retrying once with max_tokens: ${retryMaxTokens}`,
-			)
+		// A second flavor of the same failure: the model produces real, visible content —
+		// often narrating a tool call it's about to make ("writing up the journal now...") —
+		// and gets cut off by max_tokens before it actually emits that tool call. To the rest
+		// of the app this looks exactly like a normal finished text reply (there's content,
+		// finish_reason just says the stream ended), so nothing previously caught it: the turn
+		// silently ended with the model having announced an action it never took. Only applies
+		// when tools were actually offered — otherwise there's no "action" to have been cut off
+		// from, and a plain text answer running long is not a bug.
+		const isActionTruncation = !!message && !!message.content && !hasToolCalls && wasCutOff && !!body.tools?.length
+
+		const originalMaxTokens = body.max_tokens || 0
+		// Only worth retrying if the original budget was small enough that more room
+		// plausibly helps (a model still empty-handed at several thousand tokens has bigger
+		// problems). Action truncation gets a higher ceiling than pure-reasoning truncation
+		// since it's already spent tokens on real content plus a large tool-call payload
+		// (e.g. a full journal entry) can legitimately need more room than default budgets give it.
+		const truncationCeiling = isActionTruncation ? 6000 : 3000
+
+		if ((isReasoningTruncation || isActionTruncation) && originalMaxTokens > 0 && originalMaxTokens < truncationCeiling) {
+			const retryMaxTokens = Math.min(Math.max(originalMaxTokens * (isActionTruncation ? 3 : 4), 1500), 8000)
+			if (isReasoningTruncation) {
+				console.warn(
+					`FoundryAI | Model spent its entire ${originalMaxTokens}-token budget "thinking" (reasoning_content: ${reasoningText.length} chars) without producing an answer — retrying once with max_tokens: ${retryMaxTokens}`,
+				)
+			} else {
+				console.warn(
+					`FoundryAI | Model's reply was cut off by the ${originalMaxTokens}-token budget before it could act (finish_reason: length, content present, no tool_calls) — it likely announced a tool call it never made. Retrying once with max_tokens: ${retryMaxTokens}`,
+				)
+			}
 
 			const retryBody: ChatCompletionRequest = { ...body, max_tokens: retryMaxTokens }
 			const retryResponse = await fetch(`${providerConfig.baseUrl}/chat/completions`, {
@@ -432,7 +454,7 @@ export class OpenRouterService {
 				message = result.choices?.[0]?.message
 			} else {
 				const retryErrMsg = await this.readErrorMessage(retryResponse)
-				console.warn(`FoundryAI | Reasoning-budget retry failed (${retryResponse.status}): ${retryErrMsg} — falling back to the original (empty) response`)
+				console.warn(`FoundryAI | Truncation retry failed (${retryResponse.status}): ${retryErrMsg} — falling back to the original (cut-off) response`)
 			}
 		}
 
@@ -521,6 +543,13 @@ export class OpenRouterService {
 		const reader = response.body.getReader()
 		const decoder = new TextDecoder()
 		let buffer = ''
+		// Tracks whether the stream delivered ANY usable output. A stream that
+		// ends without content or tool calls is almost always a reasoning model
+		// that burned its entire token budget "thinking" — the non-streaming
+		// path has a retry net for that, but streams didn't: the user just saw
+		// a blank message. When it happens, recoverEmptyStream re-runs the
+		// request non-streaming (with the net) and emits the result as chunks.
+		let emittedAny = false
 
 		try {
 			while (true) {
@@ -537,7 +566,11 @@ export class OpenRouterService {
 					if (!trimmed.startsWith('data: ')) continue
 
 					const data = trimmed.slice(6)
-					if (data === '[DONE]') { onChunk({ done: true }); return }
+					if (data === '[DONE]') {
+						if (!emittedAny) return await this.recoverEmptyStream(body, onChunk, signal)
+						onChunk({ done: true })
+						return
+					}
 
 					try {
 						const chunk: StreamingChunk = JSON.parse(data)
@@ -553,10 +586,15 @@ export class OpenRouterService {
 							console.debug('FoundryAI | Stream tool_call delta:', JSON.stringify(choice.delta.tool_calls))
 						}
 
+						if (choice?.delta?.content || choice?.delta?.tool_calls?.length) emittedAny = true
+
 						onChunk({
 							content: choice?.delta?.content || undefined,
 							toolCalls: choice?.delta?.tool_calls || undefined,
-							done: choice?.finish_reason != null,
+							// Suppress `done` on an empty stream's final chunk so the
+							// consumer doesn't finalize a blank message before the
+							// recovery below has a chance to run.
+							done: choice?.finish_reason != null && emittedAny,
 							usage: chunk.usage || undefined,
 						})
 					} catch {
@@ -569,7 +607,39 @@ export class OpenRouterService {
 		}
 
 		console.debug('FoundryAI | Stream ended (no [DONE] received)')
+		if (!emittedAny) return await this.recoverEmptyStream(body, onChunk, signal)
 		onChunk({ done: true })
+	}
+
+	/**
+	 * Fallback for a stream that produced neither content nor tool calls: rerun
+	 * the request non-streaming — which applies the reasoning-budget retry —
+	 * and replay the result through the stream callback. Tool calls carry an
+	 * `index` so the consumer's delta accumulator treats each as one complete
+	 * call.
+	 */
+	private async recoverEmptyStream(
+		body: ChatCompletionRequest,
+		onChunk: StreamCallback,
+		signal?: AbortSignal,
+	): Promise<void> {
+		console.warn(
+			'FoundryAI | Stream ended with no content or tool calls (reasoning model likely spent its whole budget thinking) — re-running non-streaming with the retry safety net.',
+		)
+		try {
+			const result = await this.chatCompletion({ ...body, stream: false }, signal)
+			const message = result.choices?.[0]?.message
+			if (message?.tool_calls?.length) {
+				onChunk({ toolCalls: message.tool_calls.map((tc, i) => ({ ...tc, index: i }) as any), done: false })
+			}
+			if (message?.content) {
+				onChunk({ content: message.content, done: false })
+			}
+			onChunk({ done: true, usage: result.usage })
+		} catch (e: any) {
+			console.error('FoundryAI | Empty-stream recovery failed:', e)
+			onChunk({ done: true, error: e?.message || String(e) })
+		}
 	}
 
 	// ---- Embeddings ----

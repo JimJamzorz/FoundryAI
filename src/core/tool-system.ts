@@ -4075,19 +4075,26 @@ async function handleSearchCompendium(query: string, type?: string, maxResults?:
 	if (!game.packs) return JSON.stringify({ error: 'Compendium packs not available' })
 
 	const max = maxResults || 10
-	const queryLower = query.toLowerCase()
-	const results: Array<Record<string, any>> = []
+	const queryLower = query.toLowerCase().trim()
+	// Term matching instead of whole-phrase substring: "goblin race" should
+	// still find "Goblin", and results are ranked by how many terms hit, with
+	// exact and prefix name matches first.
+	const terms = queryLower.split(/\s+/).filter(Boolean)
 	const typeFilter = type ? type.toLowerCase() : null
 
 	console.log(`FoundryAI | search_compendium: query="${query}", type="${type}", typeFilter="${typeFilter}"`)
-	console.log(`FoundryAI | search_compendium: ${game.packs.size} packs available`)
 
 	let packsSearched = 0
 	let entriesSearched = 0
+	const scored: Array<{ score: number; result: Record<string, any> }> = []
 
-	for (const [packId, pack] of game.packs) {
+	// NOTE: Foundry Collections iterate their VALUES, not [key, value] pairs
+	// like a Map — the previous `for (const [packId, pack] of game.packs)`
+	// destructured every pack into undefined and silently searched NOTHING.
+	// This tool returned 0 results for every query since it was written.
+	const allPacks: any[] = Array.from((game.packs as any).values())
+	for (const pack of allPacks) {
 		if (!pack) continue
-		// Convert type to lowercase for comparison
 		const packType = pack.documentName?.toLowerCase()
 		if (typeFilter && typeFilter !== 'all' && packType !== typeFilter) continue
 
@@ -4100,27 +4107,38 @@ async function handleSearchCompendium(query: string, type?: string, maxResults?:
 			continue
 		}
 
-		for (const [, entry] of pack.index) {
+		const indexEntries: any[] = Array.from((pack.index as any).values())
+		for (const entry of indexEntries) {
 			entriesSearched++
-			if (entry.name?.toLowerCase().includes(queryLower)) {
-				results.push({
-					pack_id: packId,
+			const name = (entry.name || '').toLowerCase()
+			if (!name) continue
+
+			const hits = terms.filter((t) => name.includes(t)).length
+			if (hits === 0) continue
+
+			let score = hits / terms.length
+			if (name === queryLower) score += 2
+			else if (name.startsWith(queryLower) || terms.some((t) => name === t)) score += 1
+
+			scored.push({
+				score,
+				result: {
+					pack_id: pack.collection,
 					entry_id: entry._id,
 					name: entry.name,
 					type: pack.documentName,
 					pack_label: pack.metadata.label,
 					img: entry.img || null,
-				})
-
-				if (results.length >= max) break
-			}
+				},
+			})
 		}
-
-		if (results.length >= max) break
 	}
 
+	scored.sort((a, b) => b.score - a.score)
+	const results = scored.slice(0, max).map((s) => s.result)
+
 	console.log(
-		`FoundryAI | search_compendium: searched ${packsSearched} packs, ${entriesSearched} entries, found ${results.length} matches`,
+		`FoundryAI | search_compendium: searched ${packsSearched} packs, ${entriesSearched} entries, found ${scored.length} matches (returning ${results.length})`,
 	)
 
 	return JSON.stringify({ results, count: results.length })
@@ -4325,12 +4343,21 @@ async function handleImportFromCompendium(packId: string, entryId: string, folde
 	}
 	console.log(`FoundryAI | import_from_compendium: found pack "${pack.metadata.label}" (type: ${pack.documentName})`)
 
-	try {
-		const doc = await pack.getDocument(entryId)
-		if (!doc) return JSON.stringify({ error: `Entry not found: ${entryId}` })
+	// NOTE: CompendiumCollection#importDocument goes the OTHER direction — it takes a
+	// WORLD document and writes it INTO the compendium, which is exactly why this threw
+	// "You may not update documents in the locked compendium ...": it was trying to
+	// import the doc back into itself. Pulling a document OUT of a compendium and INTO
+	// the world is done via the matching WORLD collection (game.actors, game.items,
+	// game.journal, ...) — game.collections maps documentName -> that world collection.
+	const worldCollection = (game as any).collections?.get(pack.documentName)
+	if (!worldCollection) {
+		return JSON.stringify({ error: `No world collection found for document type: ${pack.documentName}` })
+	}
 
-		const importData: Record<string, any> = { folder: folderId || null }
-		const imported = await pack.importDocument(doc, importData)
+	try {
+		const importData: Record<string, any> = folderId ? { folder: folderId } : {}
+		const imported = await worldCollection.importFromCompendium(pack, entryId, importData)
+		if (!imported) return JSON.stringify({ error: `Entry not found: ${entryId}` })
 
 		return JSON.stringify({
 			success: true,
